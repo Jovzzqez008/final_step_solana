@@ -1,1 +1,5 @@
 solana==0.32.0
+python-telegram-bot[ext]
+asyncpg
+httpx
+python-dotenv
