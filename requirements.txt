@@ -1,5 +1,5 @@
 solana==0.32.0
-python-telegram-bot[ext]
+python-telegram-bot[ext]==21.0.1
 asyncpg
 httpx
 python-dotenv
