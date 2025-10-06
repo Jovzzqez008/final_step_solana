@@ -236,7 +236,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
         
     await update.message.reply_text(
-        "👋 **Bot de Caza v16.0 (Optimizado)**\n\n"
+        "👋 **Bot de Caza v16.1 (Corregido)**\n\n"
         "Este bot monitorea DexScreener en busca de nuevos tokens en Solana (1-24h de antigüedad) que alcancen un umbral de liquidez.\n\n"
         "**Comandos:**\n"
         "/cazar - Inicia todas las tareas de monitoreo.\n"
@@ -336,25 +336,38 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(message, parse_mode='Markdown')
 
 
-# --- 🚀 PUNTO DE ENTRADA PRINCIPAL ---
+# --- 🚀 PUNTO DE ENTRADA PRINCIPAL (CORREGIDO) ---
+
+async def post_shutdown(application: Application):
+    """Función que se ejecuta después de que el bot se apaga para limpiar recursos."""
+    global DB_POOL
+    if DB_POOL:
+        await DB_POOL.close()
+        logger.info("Pool de conexiones a la base de datos cerrado correctamente.")
+
 async def main():
+    """Función principal que configura e inicia el bot."""
     global DB_POOL
     try:
         DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
         logger.info("Pool de conexiones a la base de datos creado exitosamente.")
     except Exception as e:
         logger.critical(f"No se pudo conectar a la base de datos al iniciar: {e}")
-        # DB_POOL permanecerá como None
+        return # Salir si no hay base de datos
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
-    # Compartir el pool de conexiones con todos los handlers a través de bot_data
+    # Compartir el pool de conexiones con todos los handlers
     application.bot_data['db_pool'] = DB_POOL
 
-    if DB_POOL:
-        await setup_database(DB_POOL)
+    # Registrar nuestra función de limpieza para que se ejecute al apagar.
+    # Esta es la corrección clave para evitar el conflicto de event loop.
+    application.post_shutdown = post_shutdown
 
-    # Añadir handlers
+    # Verificar/crear las tablas de la BD después de establecer la conexión
+    await setup_database(DB_POOL)
+
+    # Añadir handlers de comandos
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("cazar", hunt_command))
     application.add_handler(CommandHandler("parar", stop_command))
@@ -364,12 +377,12 @@ async def main():
     
     logger.info("--- El bot está listo para recibir comandos ---")
     
-    try:
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
-    finally:
-        if DB_POOL:
-            await DB_POOL.close()
-            logger.info("Pool de conexiones a la base de datos cerrado.")
+    # run_polling es una función bloqueante que maneja su propio ciclo de vida.
+    # Se ejecutará hasta que detengas el bot (ej. con Ctrl+C).
+    # Al detenerse, llamará automáticamente a nuestra función `post_shutdown`.
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == '__main__':
+    # asyncio.run() inicia el ciclo de eventos y ejecuta nuestra corrutina main.
     asyncio.run(main())
