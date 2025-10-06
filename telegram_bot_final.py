@@ -35,10 +35,10 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# FILTROS MÁS ESTRICTOS
-MIN_LIQUIDITY = 5000  # $5,000 mínimo
-MAX_AGE_HOURS = 6     # Reducido a 6 horas máximo - MÁS FRESCOS
-MIN_AGE_HOURS = 0.5   # Mínimo 30 minutos
+# FILTROS MODIFICADOS SEGÚN TUS INDICACIONES
+MIN_LIQUIDITY = 10000  # $10,000 mínimo (como solicitaste)
+MAX_AGE_HOURS = 8      # 8 horas máximo (como solicitaste)
+MIN_AGE_HOURS = 0.18   # ~11 minutos mínimo (0.18 horas)
 
 # Estructuras en memoria
 incubator: Dict[str, Dict[str, Any]] = {}
@@ -484,7 +484,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     TARGET_CHAT_ID = update.message.chat_id
     await update.message.reply_text(
         "🚀 *Bot Mejorado - Tokens Recientes*\n\n"
-        f"🎯 *Objetivo:* Tokens de {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez\n"
+        f"🎯 *Objetivo:* Tokens de {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h (11min-8h) con ≥${MIN_LIQUIDITY:,} liquidez\n"
         "🔍 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
         "⚡ *Detección directa sin verificaciones externas*\n"
         "⏰ *Búsqueda cada 1 minuto*\n\n"
@@ -528,7 +528,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = (
             f"✅ *Radar Combinado Activo*\n\n"
             f"🏆 *Watchlist:* {len(watchlist)} tokens\n"
-            f"🔍 *Buscando:* Tokens {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,} liquidez\n"
+            f"🔍 *Buscando:* Tokens {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h (11min-8h) + ≥${MIN_LIQUIDITY:,} liquidez\n"
             f"📡 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
             f"⚡ *Sin DexScreener*"
         )
