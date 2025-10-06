@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import httpx
 import asyncpg
 from typing import Dict, Any, List
+from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -18,23 +19,22 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 TARGET_CHAT_ID = None
 
-# FUENTES CONFIABLES
+# FUENTES CONFIRMADAS QUE SÍ FUNCIONAN
 TOKEN_SOURCES = {
-    "dexscreener_new_pairs": "https://api.dexscreener.com/latest/dex/pairs/new",
-    "jupiter_strict": "https://cache.jup.ag/strict-tokens"
+    "pump_fun": "https://frontend-api.pump.fun/coins/trending",  # ENDPOINT CORREGIDO
+    "birdeye_trending": "https://public-api.birdeye.so/public/trending?include_native_metadata=true",  # ENDPOINT PÚBLICO
+    "dexscreener_new": "https://api.dexscreener.com/latest/dex/search/?q=SOL&rankBy=createdAt&order=desc",  # ORDENADO POR CREACIÓN
 }
 
-# Headers
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
-    "Referer": "https://jup.ag/"
 }
 
-# Umbrales
-LIQUIDITY_THRESHOLD = 5000  # $5,000
-MIN_TOKEN_AGE_HOURS = 1     # Mínimo 1 hora
-MAX_TOKEN_AGE_HOURS = 24    # Máximo 24 horas
+# UMBRALES RELAJADOS
+MIN_LIQUIDITY = 5000  # $5,000 mínimo
+MAX_AGE_HOURS = 24    # Máximo 24 horas
+MIN_AGE_HOURS = 1     # Mínimo 1 hora
 
 # Estructuras en memoria
 incubator: Dict[str, Dict[str, Any]] = {}
@@ -49,47 +49,152 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # -------------------- DATABASE (MANTENER IGUAL) --------------------
-# [ ... mismo código de database ... ]
-
-# -------------------- FUENTES CONFIABLES --------------------
-async def get_jupiter_strict_tokens(client: httpx.AsyncClient) -> List[Dict]:
-    """Obtiene tokens de Jupiter Strict List"""
+async def setup_database():
+    if not DATABASE_URL: return
     try:
-        res = await client.get(TOKEN_SOURCES["jupiter_strict"], headers=HEADERS, timeout=15)
-        if res.status_code == 200:
-            tokens = res.json()
-            logger.info(f"[JUPITER] Tokens strict obtenidos: {len(tokens)}")
-            return tokens
-        else:
-            logger.warning(f"Jupiter responded {res.status_code}")
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS incubator (
+                token_address TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS watchlist (
+                token_address TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+        ''')
+        await conn.close()
+        logger.info("Base de datos inicializada.")
     except Exception as e:
-        logger.error(f"Error Jupiter strict: {e}")
+        logger.error(f"Error inicializando DB: {e}")
+
+async def db_add_to_incubator(token_address: str, data: dict):
+    if not DATABASE_URL: return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
+            "INSERT INTO incubator (token_address, data) VALUES ($1, $2) ON CONFLICT (token_address) DO UPDATE SET data = $2",
+            token_address, json.dumps(data)
+        )
+    finally: await conn.close()
+
+async def db_remove_from_incubator(token_address: str):
+    if not DATABASE_URL: return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("DELETE FROM incubator WHERE token_address = $1", token_address)
+    finally: await conn.close()
+
+async def db_load_all_incubator() -> Dict[str, dict]:
+    if not DATABASE_URL: return {}
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("SELECT token_address, data FROM incubator")
+        return {row['token_address']: json.loads(row['data']) for row in rows}
+    finally: await conn.close()
+
+async def db_add_to_watchlist(token_address: str, data: dict):
+    if not DATABASE_URL: return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute(
+            "INSERT INTO watchlist (token_address, data) VALUES ($1, $2) ON CONFLICT (token_address) DO UPDATE SET data = $2",
+            token_address, json.dumps(data)
+        )
+    finally: await conn.close()
+
+async def db_load_all_watchlist() -> Dict[str, dict]:
+    if not DATABASE_URL: return {}
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("SELECT token_address, data FROM watchlist")
+        return {row['token_address']: json.loads(row['data']) for row in rows}
+    finally: await conn.close()
+
+# -------------------- FUENTES MEJORADAS --------------------
+async def get_pump_fun_trending(client: httpx.AsyncClient) -> List[Dict]:
+    """Obtiene tokens trending de Pump.fun - ENDPOINT CORREGIDO"""
+    try:
+        res = await client.get(TOKEN_SOURCES["pump_fun"], headers=HEADERS, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            coins = data.get("data", []) if isinstance(data, dict) else data
+            logger.info(f"[PUMP.FUN] Tokens trending: {len(coins)}")
+            
+            # Filtrar por antigüedad
+            now = time.time()
+            recent_coins = []
+            for coin in coins:
+                created_at = coin.get("createdAt") or coin.get("timestamp")
+                if created_at:
+                    # Convertir a segundos si es necesario
+                    if created_at > 1e12:  # Si está en milisegundos
+                        created_at = created_at / 1000
+                    age_hours = (now - created_at) / 3600
+                    if MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS:
+                        recent_coins.append(coin)
+            
+            logger.info(f"[PUMP.FUN] Tokens recientes (1-24h): {len(recent_coins)}")
+            return recent_coins
+    except Exception as e:
+        logger.error(f"Error Pump.fun: {e}")
+    return []
+
+async def get_birdeye_trending(client: httpx.AsyncClient) -> List[Dict]:
+    """Obtiene tokens trending de Birdeye - ENDPOINT PÚBLICO"""
+    try:
+        headers = {**HEADERS, "X-API-KEY": "public"}  # Birdeye permite "public" como API key
+        res = await client.get(TOKEN_SOURCES["birdeye_trending"], headers=headers, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
+            tokens = data.get("data", {}).get("items", [])
+            logger.info(f"[BIRDEYE] Tokens trending: {len(tokens)}")
+            return tokens[:50]  # Limitar a 50 más populares
+    except Exception as e:
+        logger.error(f"Error Birdeye: {e}")
     return []
 
 async def get_dexscreener_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
-    """Obtiene pares NUEVOS de DexScreener"""
+    """Obtiene pares NUEVOS de DexScreener ordenados por creación"""
     try:
-        res = await client.get(TOKEN_SOURCES["dexscreener_new_pairs"], headers=HEADERS, timeout=15)
+        res = await client.get(TOKEN_SOURCES["dexscreener_new"], headers=HEADERS, timeout=15)
         if res.status_code == 200:
             data = res.json()
             pairs = data.get("pairs", [])
-            # Filtrar solo Solana
-            solana_pairs = [pair for pair in pairs if pair.get('chainId') == 'solana']
-            logger.info(f"[DEXSCREENER] Pares nuevos Solana: {len(solana_pairs)}")
-            return solana_pairs
-        else:
-            logger.warning(f"DexScreener new pairs responded {res.status_code}")
+            
+            # Filtrar SOLO Solana y por antigüedad
+            now = time.time()
+            recent_pairs = []
+            
+            for pair in pairs:
+                if pair.get('chainId') != 'solana':
+                    continue
+                    
+                created_at = pair.get('pairCreatedAt')
+                if created_at:
+                    age_hours = (now - (created_at / 1000)) / 3600
+                    if MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS:
+                        recent_pairs.append(pair)
+                else:
+                    # Incluir aunque no tenga timestamp
+                    recent_pairs.append(pair)
+            
+            logger.info(f"[DEXSCREENER] Pares nuevos (1-24h): {len(recent_pairs)}")
+            return recent_pairs
     except Exception as e:
-        logger.error(f"Error DexScreener new pairs: {e}")
+        logger.error(f"Error DexScreener: {e}")
     return []
 
 async def get_all_recent_tokens(client: httpx.AsyncClient) -> List[Dict]:
-    """Combina fuentes CONFIABLES"""
+    """Combina todas las fuentes"""
     all_tokens = []
     
-    # Ejecutar fuentes en paralelo
+    # Ejecutar en paralelo
     tasks = [
-        get_jupiter_strict_tokens(client),
+        get_pump_fun_trending(client),
+        get_birdeye_trending(client),
         get_dexscreener_new_pairs(client)
     ]
     
@@ -99,47 +204,55 @@ async def get_all_recent_tokens(client: httpx.AsyncClient) -> List[Dict]:
         if isinstance(result, list):
             all_tokens.extend(result)
     
-    # Procesar y normalizar tokens
+    # Procesar tokens
     processed_tokens = []
     
     for item in all_tokens:
         if isinstance(item, dict):
-            # Para tokens de Jupiter strict
-            if 'address' in item and 'name' in item:
+            address = None
+            name = ""
+            symbol = ""
+            
+            # Para Pump.fun
+            if "mint" in item:
+                address = item.get("mint")
+                name = item.get("name", "")
+                symbol = item.get("symbol", "")
+            
+            # Para Birdeye
+            elif "address" in item:
+                address = item.get("address")
+                name = item.get("name", "")
+                symbol = item.get("symbol", "")
+            
+            # Para DexScreener
+            elif "baseToken" in item:
+                base_token = item.get("baseToken", {})
+                address = base_token.get("address")
+                name = base_token.get("name", "")
+                symbol = base_token.get("symbol", "")
+            
+            if address:
                 processed_tokens.append({
-                    'type': 'jupiter_token',
-                    'address': item['address'],
-                    'name': item.get('name', ''),
-                    'symbol': item.get('symbol', ''),
-                    'source': 'jupiter_strict'
+                    'address': address,
+                    'name': name,
+                    'symbol': symbol,
+                    'raw_data': item
                 })
-            # Para pares de DexScreener
-            elif 'baseToken' in item:
-                base_token = item.get('baseToken', {})
-                address = base_token.get('address')
-                if address:
-                    processed_tokens.append({
-                        'type': 'dex_pair',
-                        'address': address,
-                        'name': base_token.get('name', ''),
-                        'symbol': base_token.get('symbol', ''),
-                        'pair_data': item,
-                        'source': 'dexscreener'
-                    })
     
     # Eliminar duplicados
     unique_tokens = {}
     for token in processed_tokens:
-        address = token.get('address')
-        if address and address not in unique_tokens:
-            unique_tokens[address] = token
+        addr = token['address']
+        if addr not in unique_tokens:
+            unique_tokens[addr] = token
     
-    logger.info(f"🎯 TOTAL tokens únicos: {len(unique_tokens)}")
+    logger.info(f"🎯 TOTAL tokens únicos (1-24h): {len(unique_tokens)}")
     return list(unique_tokens.values())
 
-# -------------------- APIS DE VERIFICACIÓN --------------------
+# -------------------- VERIFICACIÓN DE DATOS --------------------
 async def get_dexscreener_token_data(client: httpx.AsyncClient, token_address: str):
-    """Obtiene datos específicos de un token"""
+    """Obtiene datos actualizados de DexScreener"""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
     try:
         res = await client.get(url, timeout=10)
@@ -153,52 +266,46 @@ async def get_dexscreener_token_data(client: httpx.AsyncClient, token_address: s
         logger.debug(f"Error DexScreener para {token_address}: {e}")
     return None
 
-# -------------------- FILTROS (SOLO LIQUIDEZ Y EDAD) --------------------
-def passes_filters(dex_data: dict) -> tuple:
-    """Filtros de liquidez y edad"""
+# -------------------- FILTROS SIMPLIFICADOS --------------------
+def passes_basic_filters(dex_data: dict) -> tuple:
+    """Solo verifica liquidez y edad - SIN SEGURIDAD AUTOMÁTICA"""
     if not dex_data:
-        return False, "sin datos de DexScreener"
+        return False, "sin datos"
     
-    # Liquidez mínima
+    # 1. Verificar liquidez
     liquidity = dex_data.get('liquidity', {}).get('usd', 0)
-    if liquidity < LIQUIDITY_THRESHOLD:
-        return False, f"liquidez insuficiente (${liquidity:,.0f})"
+    if liquidity < MIN_LIQUIDITY:
+        return False, f"liquidez ${liquidity:,.0f} < ${MIN_LIQUIDITY:,}"
     
-    # Edad del token
-    pair_created_at = dex_data.get('pairCreatedAt')
-    if not pair_created_at:
-        return False, "no hay datos de creación"
+    # 2. Verificar edad
+    created_at = dex_data.get('pairCreatedAt')
+    if not created_at:
+        return False, "sin timestamp de creación"
     
-    now = time.time()
-    age_hours = (now - (pair_created_at / 1000)) / 3600
+    age_hours = (time.time() - (created_at / 1000)) / 3600
+    if age_hours > MAX_AGE_HOURS:
+        return False, f"demasiado viejo ({age_hours:.1f}h)"
+    if age_hours < MIN_AGE_HOURS:
+        return False, f"demasiado nuevo ({age_hours:.1f}h)"
     
-    if age_hours < MIN_TOKEN_AGE_HOURS:
-        return False, f"demasiado nuevo ({age_hours:.2f} horas)"
-    if age_hours > MAX_TOKEN_AGE_HOURS:
-        return False, f"demasiado antiguo ({age_hours:.2f} horas)"
-    
-    return True, "OK"
+    return True, f"OK - ${liquidity:,.0f} - {age_hours:.1f}h"
 
 # -------------------- TAREAS PRINCIPALES --------------------
-async def multi_source_radar_task(context: ContextTypes.DEFAULT_TYPE):
-    """Radar con fuentes CONFIABLES"""
-    logger.info("🚀 Iniciando Radar...")
+async def token_radar_task(context: ContextTypes.DEFAULT_TYPE):
+    """Busca tokens nuevos constantemente"""
+    logger.info("🚀 Iniciando Radar de Tokens...")
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                # Obtener tokens de fuentes confiables
-                recent_tokens = await get_all_recent_tokens(client)
+                tokens = await get_all_recent_tokens(client)
                 
-                if not recent_tokens:
-                    logger.info("[RADAR] No se obtuvieron tokens en este ciclo.")
+                if not tokens:
+                    logger.info("[RADAR] No se encontraron tokens en este ciclo.")
                 else:
-                    tokens_added = 0
-                    for token_data in recent_tokens:
-                        address = token_data.get('address')
-                        if not address:
-                            continue
-                            
-                        # Evitar duplicados
+                    added_count = 0
+                    for token in tokens:
+                        address = token['address']
+                        
                         if address in incubator or address in watchlist:
                             continue
                             
@@ -206,86 +313,94 @@ async def multi_source_radar_task(context: ContextTypes.DEFAULT_TYPE):
                         found_at = time.time()
                         data = {
                             'found_at': found_at,
-                            'source': token_data.get('source', 'unknown'),
-                            'token_data': token_data
+                            'token_info': token,
+                            'source': 'multi_fuente'
                         }
                         incubator[address] = data
                         await db_add_to_incubator(address, data)
-                        tokens_added += 1
+                        added_count += 1
                         
-                    logger.info(f"  - 🐣 {tokens_added} nuevos tokens añadidos a incubadora")
+                    logger.info(f"  - 🐣 {added_count} tokens nuevos a incubadora")
+                    
+                    # Notificar si encontramos muchos tokens
+                    if added_count >= 5:
+                        if TARGET_CHAT_ID:
+                            await context.bot.send_message(
+                                chat_id=TARGET_CHAT_ID,
+                                text=f"🔍 *Radar activo:* {added_count} nuevos tokens encontrados y en revisión...",
+                                parse_mode='Markdown'
+                            )
                 
-                # Esperar 3 minutos entre ciclos
-                await asyncio.sleep(180)
+                await asyncio.sleep(120)  # 2 minutos entre búsquedas
                 
-            except asyncio.CancelledError:
-                logger.info("Radar detenido.")
-                break
             except Exception as e:
                 logger.error(f"Error en radar: {e}")
                 await asyncio.sleep(30)
 
 async def incubator_checker_task(context: ContextTypes.DEFAULT_TYPE):
-    """Verifica tokens en incubadora por liquidez y edad"""
-    logger.info("Iniciando Vigilante de la Incubadora...")
+    """Verifica tokens en incubadora - SOLO LIQUIDEZ Y EDAD"""
+    logger.info("Iniciando Verificación de Incubadora...")
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                await asyncio.sleep(120)  # Verificar cada 2 minutos
+                await asyncio.sleep(60)  # Revisar cada 1 minuto
                 
                 if not incubator:
                     continue
                     
-                now_ts = time.time()
+                now = time.time()
                 logger.info(f"[INCUBADORA] Verificando {len(incubator)} tokens...")
-                promoted_count = 0
+                approved_count = 0
                 
                 for token_address, data in list(incubator.items()):
                     # Obtener datos actualizados
                     dex_data = await get_dexscreener_token_data(client, token_address)
                     if not dex_data:
-                        # Si no hay datos después de 1 hora, descartar
-                        if now_ts - data['found_at'] > 3600:
+                        # Eliminar después de 1 hora sin datos
+                        if now - data['found_at'] > 3600:
                             del incubator[token_address]
                             await db_remove_from_incubator(token_address)
                         continue
 
-                    # APLICAR FILTROS (solo liquidez y edad)
-                    passes, reason = passes_filters(dex_data)
+                    # APLICAR FILTROS BÁSICOS
+                    passes, reason = passes_basic_filters(dex_data)
                     
                     if passes:
-                        # ✅ PROMOVER A WATCHLIST
-                        approved_at = now_ts
+                        # ✅ APROBAR - Cumple liquidez y edad
+                        approved_at = now
                         liquidity = dex_data.get('liquidity', {}).get('usd', 0)
                         price_change = dex_data.get('priceChange', {}).get('h24', 0)
-                        pair_created_at = dex_data.get('pairCreatedAt')
-                        age_hours = (now_ts - (pair_created_at / 1000)) / 3600 if pair_created_at else 0
+                        created_at = dex_data.get('pairCreatedAt')
+                        age_hours = (now - (created_at / 1000)) / 3600
                         
                         watch_data = {
                             'approved_at': approved_at,
-                            'last_notified': 'initial',
                             'liquidity': liquidity,
                             'price_change_24h': price_change,
                             'age_hours': age_hours,
-                            'dex_data': dex_data
+                            'dex_data': dex_data,
+                            'token_info': data['token_info']
                         }
                         watchlist[token_address] = watch_data
                         await db_add_to_watchlist(token_address, watch_data)
 
+                        # Eliminar de incubadora
                         del incubator[token_address]
                         await db_remove_from_incubator(token_address)
-                        promoted_count += 1
+                        approved_count += 1
 
-                        # NOTIFICACIÓN
+                        # NOTIFICACIÓN INMEDIATA
                         message = (
-                            f"🚨 *TOKEN ENCONTRADO* 🚨\n\n"
+                            f"🎯 *TOKEN CUMPLE CRITERIOS* 🎯\n\n"
                             f"*Token:* `{token_address}`\n"
                             f"*Liquidez:* `${liquidity:,.2f}`\n"
-                            f"*Cambio 24h:* `{price_change}%`\n"
-                            f"*Edad:* `{age_hours:.2f} horas`\n\n"
-                            f"🔍 *Verificar:*\n"
-                            f"- DexScreener: dexscreener.com/solana/{token_address}\n"
-                            f"- RugCheck: rugcheck.xyz/tokens/{token_address}"
+                            f"*Edad:* `{age_hours:.1f} horas`\n"
+                            f"*Cambio 24h:* `{price_change}%`\n\n"
+                            f"🔍 *Verificar manualmente:*\n"
+                            f"- DexScreener: https://dexscreener.com/solana/{token_address}\n"
+                            f"- RugCheck: https://rugcheck.xyz/tokens/{token_address}\n"
+                            f"- BirdEye: https://birdeye.so/token/{token_address}?chain=solana\n\n"
+                            f"⚠️ *Verifica seguridad manualmente antes de invertir*"
                         )
                         
                         if TARGET_CHAT_ID:
@@ -299,46 +414,100 @@ async def incubator_checker_task(context: ContextTypes.DEFAULT_TYPE):
                             except Exception as e:
                                 logger.warning(f"No se pudo enviar notificación: {e}")
 
-                        logger.info(f"  - 🏆 PROMOVIDO: {token_address}")
+                        logger.info(f"  - ✅ APROBADO: {token_address}")
 
                     else:
-                        # ❌ No pasa filtros
-                        logger.debug(f"  - ❌ Rechazado: {token_address} - {reason}")
+                        # ❌ No cumple filtros básicos
+                        logger.info(f"  - ❌ Rechazado: {token_address} - {reason}")
                         
-                        # Remover después de 3 horas
-                        if now_ts - data['found_at'] > 10800:
+                        # Eliminar después de 3 horas
+                        if now - data['found_at'] > 10800:
                             del incubator[token_address]
                             await db_remove_from_incubator(token_address)
                     
-                    # Pequeño delay entre tokens
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)  # Pequeño delay
                 
-                if promoted_count > 0:
-                    logger.info(f"🎯 Total promovidos: {promoted_count}")
+                if approved_count > 0:
+                    logger.info(f"🎯 Tokens aprobados este ciclo: {approved_count}")
                     
-            except asyncio.CancelledError:
-                logger.info("Vigilante detenido.")
-                break
             except Exception as e:
-                logger.error(f"Error en vigilante: {e}")
+                logger.error(f"Error en verificador: {e}")
                 await asyncio.sleep(10)
 
-async def watchlist_monitor_task(context: ContextTypes.DEFAULT_TYPE):
-    """Monitoreo de watchlist"""
-    logger.info("Iniciando Monitor de Watchlist...")
-    while True:
-        try:
-            await asyncio.sleep(300)
-            # Monitoreo básico
-            pass
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Error en monitor: {e}")
-            await asyncio.sleep(10)
-
 # -------------------- COMANDOS TELEGRAM --------------------
-# [ ... mismo código de comandos ... ]
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global TARGET_CHAT_ID
+    TARGET_CHAT_ID = update.message.chat_id
+    await update.message.reply_text(
+        "🚀 *Bot de Tokens Nuevos Activado*\n\n"
+        "🎯 *Objetivo:* Encontrar tokens de 1-24 horas con ≥$5,000 liquidez\n"
+        "🔍 *Fuentes:* Pump.fun + Birdeye + DexScreener\n"
+        "⏰ *Búsqueda cada 2 minutos*\n\n"
+        "*/cazar* - Iniciar monitoreo\n"
+        "*/parar* - Detener\n"
+        "*/status* - Estado actual\n"
+        "*/incubadora* - Tokens en revisión\n"
+        "*/watchlist* - Tokens que cumplen criterios",
+        parse_mode='Markdown'
+    )
+
+async def hunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.bot_data.get('tasks'):
+        await update.message.reply_text("🤔 Ya está cazando.")
+        return
+        
+    await update.message.reply_text("🏹 *Iniciando búsqueda de tokens...*", parse_mode='Markdown')
+    
+    await setup_database()
+    global incubator, watchlist
+    incubator = await db_load_all_incubator()
+    watchlist = await db_load_all_watchlist()
+
+    context.bot_data['tasks'] = [
+        asyncio.create_task(token_radar_task(context)),
+        asyncio.create_task(incubator_checker_task(context))
+    ]
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.bot_data.get('tasks'):
+        await update.message.reply_text("🤔 No está cazando.")
+        return
+        
+    for task in context.bot_data['tasks']:
+        task.cancel()
+    context.bot_data.clear()
+    await update.message.reply_text("🛑 Búsqueda detenida.")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    status_msg = "🛑 Bot detenido"
+    if context.bot_data.get('tasks'):
+        status_msg = (
+            f"✅ *Bot Activo - Buscando Tokens*\n\n"
+            f"🐣 *Incubadora:* {len(incubator)} tokens\n"
+            f"🏆 *Watchlist:* {len(watchlist)} tokens\n"
+            f"🎯 *Criterios:* 1-24h + ≥${MIN_LIQUIDITY:,} liquidez"
+        )
+    await update.message.reply_text(status_msg, parse_mode='Markdown')
+
+async def incubator_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not incubator:
+        await update.message.reply_text("🐣 Incubadora vacía")
+        return
+    message = f"🐣 *Tokens en Revisión ({len(incubator)}):*\n\n"
+    for i, addr in enumerate(list(incubator.keys())[-15:][::-1], 1):
+        message += f"{i}. `{addr}`\n"
+    await update.message.reply_text(message, parse_mode='Markdown')
+
+async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not watchlist:
+        await update.message.reply_text("🏆 Watchlist vacía")
+        return
+    message = f"🏆 *Tokens que Cumplen ({len(watchlist)}):*\n\n"
+    for i, (addr, data) in enumerate(list(watchlist.items())[-20:][::-1], 1):
+        liq = data.get('liquidity', 0)
+        age = data.get('age_hours', 0)
+        message += f"{i}. `{addr}`\n   💰 ${liq:,.0f} | ⏰ {age:.1f}h\n"
+    await update.message.reply_text(message, parse_mode='Markdown')
 
 # -------------------- MAIN --------------------
 def main():
@@ -355,15 +524,12 @@ def main():
     application.add_handler(CommandHandler("incubadora", incubator_command))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
 
-    logger.info("--- Bot de Tokens Recientes listo ---")
+    logger.info("--- Bot de Tokens Nuevos listo ---")
     
     try:
-        application.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
+        application.run_polling(drop_pending_updates=True)
     except Exception as e:
-        logger.error(f"Error fatal: {e}")
+        logger.error(f"Error: {e}")
 
 if __name__ == '__main__':
     main()
