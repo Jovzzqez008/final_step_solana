@@ -124,7 +124,9 @@ async def jupiter_momentum_task():
             try:
                 await asyncio.sleep(300) 
                 logger.info("[RADAR JÚPITER] Buscando tokens con momentum y edad específica...")
-                momentum_tokens = await get_jupiter_momentum_tokens(client)
+                ### --- INICIO DE LA CORRECCIÓN --- ###
+                momentum_tokens = await get_jupiter_top_tokens(client) # Corregido el nombre de la función
+                ### --- FIN DE LA CORRECCIÓN --- ###
                 if not momentum_tokens: 
                     logger.info("[RADAR JÚPITER] No se encontraron tokens en la ventana de 12-24 horas.")
                     continue
@@ -221,7 +223,7 @@ async def watchlist_monitor_task(client, context: ContextTypes.DEFAULT_TYPE):
 # --- COMANDOS Y EJECUCIÓN ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_CHAT_ID; TARGET_CHAT_ID = update.message.chat_id
-    await update.message.reply_text("👋 v10.0 (Completo). Usa /cazar, /parar, /status, /incubadora, /watchlist.")
+    await update.message.reply_text("👋 v10.0 (Corregido). Usa /cazar, /parar, /status, /incubadora, /watchlist.")
 
 async def hunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.bot_data.get('tasks'): await update.message.reply_text("🤔 El bot ya está cazando."); return
