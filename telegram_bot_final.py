@@ -1,340 +1,386 @@
-# -*- coding: utf-8 -*-
-
 import asyncio
 import json
-import httpx
 import time
 import logging
 import os
-import signal
 from dotenv import load_dotenv
+import httpx
 import asyncpg
+from typing import Dict, Any
+
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# --- Carga de variables de entorno ---
 load_dotenv()
 
-# --- CONFIGURACIÓN GLOBAL ---
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")
-HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
+# -------------------- CONFIG --------------------
+HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")  # conservado por compatibilidad
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 TARGET_CHAT_ID = None
 
-# --- CONSTANTES DE LÓGICA ---
-MIN_LIQUIDITY_USD = 7500
-JUPITER_RADAR_INTERVAL_SECONDS = 120
-INCUBATOR_CHECK_INTERVAL_SECONDS = 180
-WATCHLIST_MONITOR_INTERVAL_SECONDS = 300
-INCUBATOR_DISCARD_AFTER_HOURS = 3
-SECONDS_IN_HOUR = 3600
+# Ajustes operativos
+JUPITER_TOKENS_ENDPOINT = "https://api.jup.ag/markets/v1/tokens"
+DEXSCREENER_TOKEN_INFO = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 
-# --- ESTADO GLOBAL ---
-DB_POOL = None
-watchlist = {}
-incubator = {}
+# Umbral de liquidez para pasar a watchlist (USD)
+LIQUIDITY_THRESHOLD = 7500
+# Ventana de "nuevo" en segundos (12 horas)
+NEW_WINDOW_SECONDS = 12 * 3600
 
-# --- Configuración del Logging ---
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# Estructuras en memoria (se sincronizan con la DB al iniciar)
+incubator: Dict[str, Dict[str, Any]] = {}
+watchlist: Dict[str, Dict[str, Any]] = {}
+
+# Logging
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
-# --- 💾 FUNCIONES DE LA BASE DE DATOS 💾 ---
-# (Esta sección no necesita cambios)
-async def setup_database(pool):
+# -------------------- DATABASE HELPERS --------------------
+async def setup_database():
+    if not DATABASE_URL:
+        logger.warning("No DATABASE_URL configurada — la persistencia no funcionará.")
+        return
     try:
-        async with pool.acquire() as conn:
-            await conn.execute('''CREATE TABLE IF NOT EXISTS incubator (token_address TEXT PRIMARY KEY, data JSONB NOT NULL);''')
-            await conn.execute('''CREATE TABLE IF NOT EXISTS watchlist (token_address TEXT PRIMARY KEY, data JSONB NOT NULL);''')
-        logger.info("Tablas de la base de datos verificadas/creadas correctamente.")
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS incubator (
+                token_address TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+        ''')
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS watchlist (
+                token_address TEXT PRIMARY KEY,
+                data JSONB NOT NULL
+            );
+        ''')
+        await conn.close()
+        logger.info("Base de datos inicializada.")
     except Exception as e:
-        logger.error(f"Error al configurar la base de datos: {e}")
+        logger.error(f"Error inicializando DB: {e}")
 
-async def db_add_to_incubator(pool, token_address, data):
-    async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO incubator (token_address, data) VALUES ($1, $2) ON CONFLICT (token_address) DO NOTHING", token_address, json.dumps(data))
+async def db_add_to_incubator(token_address: str, data: dict):
+    if not DATABASE_URL:
+        return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("INSERT INTO incubator (token_address, data) VALUES ($1, $2) ON CONFLICT (token_address) DO UPDATE SET data = $2", token_address, json.dumps(data))
+    finally:
+        await conn.close()
 
-async def db_remove_from_incubator(pool, token_address):
-    async with pool.acquire() as conn:
+async def db_remove_from_incubator(token_address: str):
+    if not DATABASE_URL:
+        return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
         await conn.execute("DELETE FROM incubator WHERE token_address = $1", token_address)
+    finally:
+        await conn.close()
 
-async def db_load_all_incubator(pool):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT token_address, data FROM incubator")
-    return {row['token_address']: json.loads(row['data']) for row in rows}
-
-async def db_add_to_watchlist(pool, token_address, data):
-    async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO watchlist (token_address, data) VALUES ($1, $2) ON CONFLICT (token_address) DO UPDATE SET data = $2", token_address, json.dumps(data))
-
-async def db_load_all_watchlist(pool):
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT token_address, data FROM watchlist")
-    return {row['token_address']: json.loads(row['data']) for row in rows}
-
-
-# --- 📞 FUNCIONES DE APIS EXTERNAS ---
-# (Esta sección no necesita cambios)
-async def get_dexscreener_data(client: httpx.AsyncClient, token_address: str):
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+async def db_load_all_incubator() -> Dict[str, dict]:
+    if not DATABASE_URL:
+        return {}
+    conn = await asyncpg.connect(DATABASE_URL)
     try:
-        res = await client.get(url, timeout=15)
-        res.raise_for_status()
+        rows = await conn.fetch("SELECT token_address, data FROM incubator")
+        return {row['token_address']: json.loads(row['data']) for row in rows}
+    finally:
+        await conn.close()
+
+async def db_add_to_watchlist(token_address: str, data: dict):
+    if not DATABASE_URL:
+        return
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        await conn.execute("INSERT INTO watchlist (token_address, data) VALUES ($1, $2) ON CONFLICT (token_address) DO UPDATE SET data = $2", token_address, json.dumps(data))
+    finally:
+        await conn.close()
+
+async def db_load_all_watchlist() -> Dict[str, dict]:
+    if not DATABASE_URL:
+        return {}
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("SELECT token_address, data FROM watchlist")
+        return {row['token_address']: json.loads(row['data']) for row in rows}
+    finally:
+        await conn.close()
+
+# -------------------- EXTERNAL API HELPERS --------------------
+async def get_jupiter_tokens(client: httpx.AsyncClient):
+    """
+    Consulta tokens desde la API de Jupiter y devuelve aquellos que tengan fecha de listing
+    dentro de la ventana NEW_WINDOW_SECONDS. La API de jup.ag devuelve objetos con timestamps
+    en algunos campos; si no vienen, hacemos lo mejor posible con la información disponible.
+    """
+    try:
+        res = await client.get(JUPITER_TOKENS_ENDPOINT, timeout=20)
+        if res.status_code != 200:
+            logger.warning(f"Jupiter responded {res.status_code}")
+            return []
         data = res.json()
-        if data and data.get('pairs'):
-            return sorted(data['pairs'], key=lambda p: p.get('liquidity', {}).get('usd', 0), reverse=True)[0]
-    except httpx.RequestError as e:
-        logger.warning(f"Error de red consultando DexScreener para {token_address}: {e}")
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"Error procesando respuesta de DexScreener para {token_address}: {e}")
+        tokens = data.get('data') or data.get('tokens') or data.get('results') or []
+        now_ts = time.time()
+        recent = []
+        for t in tokens:
+            # La estructura exacta puede variar; intentamos obtener un timestamp razonable
+            created_ts = None
+            # Common fields to check (depends on endpoint version)
+            if isinstance(t, dict):
+                created_ts = t.get('listedAt') or t.get('createdAt') or t.get('pairCreatedAt')
+                # algunos endpoints traen timestamps en ms
+                if created_ts and created_ts > 1e12:
+                    created_ts = created_ts / 1000.0
+            if created_ts:
+                age = now_ts - float(created_ts)
+                if 0 <= age <= NEW_WINDOW_SECONDS:
+                    recent.append(t)
+            else:
+                # Si no hay timestamp, aplicar heurística: incluir tokens con liquidez baja/no listados
+                # (esto reduce falsos negativos; igualmente el filtro de incubadora sigue vigente)
+                recent.append(t)
+        logger.info(f"[JUPITER] Tokens obtenidos: {len(recent)} (filtrados por ventana)")
+        return recent
     except Exception as e:
-        logger.error(f"Error inesperado en get_dexscreener_data para {token_address}: {e}")
+        logger.error(f"Error consultando Jupiter: {e}")
+        return []
+
+async def get_dexscreener_data(client: httpx.AsyncClient, token_address: str):
+    url = DEXSCREENER_TOKEN_INFO.format(mint=token_address)
+    try:
+        res = await client.get(url, timeout=12)
+        if res.status_code == 200 and res.json().get('pairs'):
+            # Escogemos el par con mayor liquidez reportada
+            pairs = res.json()['pairs']
+            best = sorted(pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0), reverse=True)[0]
+            return best
+    except Exception as e:
+        logger.debug(f"Error DexScreener para {token_address}: {e}")
     return None
 
-async def get_jupiter_top_tokens(client: httpx.AsyncClient):
-    query = "solana age > 1 hours and age < 24 hours"
-    url = f"https://api.dexscreener.com/latest/dex/search?q={query}"
-    try:
-        res = await client.get(url, timeout=30)
-        res.raise_for_status()
-        data = res.json()
-        if data and data.get('pairs'):
-            return [p for p in data['pairs'] if p.get('chainId') == 'solana']
-    except httpx.RequestError as e:
-        logger.warning(f"Error de red consultando el radar de DexScreener: {e}")
-    except (json.JSONDecodeError, KeyError) as e:
-        logger.error(f"Error procesando la respuesta del radar de DexScreener: {e}")
-    except Exception as e:
-        logger.error(f"Error inesperado en get_jupiter_top_tokens: {e}")
-    return []
+# -------------------- TAREAS ASÍNCRONAS PRINCIPALES --------------------
+async def jupiter_radar_task(context: ContextTypes.DEFAULT_TYPE):
+    """Tarea principal: consulta periódica a Jupiter y agrega tokens nuevos a la incubadora."""
+    logger.info("Iniciando Radar de Jupiter...")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                recent_tokens = await get_jupiter_tokens(client)
+                if not recent_tokens:
+                    logger.info("[RADAR] No se obtuvieron tokens en este ciclo.")
+                else:
+                    for entry in recent_tokens:
+                        # intentamos normalizar una dirección de mint/base token
+                        token_address = None
+                        if isinstance(entry, dict):
+                            token_address = entry.get('mint') or entry.get('address') or (entry.get('baseToken') or {}).get('address')
+                        if not token_address:
+                            continue
 
+                        if token_address in incubator or token_address in watchlist:
+                            continue
 
-# --- 🔄 TAREAS ASÍNCRONAS ---
-# (Esta sección no necesita cambios)
-async def jupiter_momentum_task(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Iniciando Radar de Momentum (Júpiter/DexScreener)...")
-    client = context.bot_data['client']
-    db_pool = context.bot_data['db_pool']
-    while True:
-        try:
-            logger.info("[RADAR JÚPITER] Buscando tokens con momentum en la ventana de 1-24 horas...")
-            momentum_tokens = await get_jupiter_top_tokens(client)
-            if not momentum_tokens:
-                logger.info("[RADAR JÚPITER] No se encontraron nuevos tokens que cumplan el criterio de edad.")
-            else:
-                for pair in momentum_tokens:
-                    token_address = pair.get('baseToken', {}).get('address')
-                    if token_address and token_address not in incubator and token_address not in watchlist:
-                        logger.info(f"  - 📡 [RADAR] Júpiter detectó {pair.get('baseToken', {}).get('symbol','N/A')}. Enviando a la incubadora.")
-                        new_data = {'found_at': time.time(), 'source': 'Júpiter Radar'}
-                        incubator[token_address] = new_data
-                        await db_add_to_incubator(db_pool, token_address, new_data)
-            await asyncio.sleep(JUPITER_RADAR_INTERVAL_SECONDS)
-        except asyncio.CancelledError:
-            logger.info("Radar de Momentum detenido.")
-            break
-        except Exception as e:
-            logger.error(f"Error crítico en Radar de Momentum: {e}")
-            await asyncio.sleep(60)
+                        found_at = time.time()
+                        data = {'found_at': found_at, 'source': 'Jupiter Radar', 'meta': entry}
+                        incubator[token_address] = data
+                        await db_add_to_incubator(token_address, data)
+                        logger.info(f"  - 🐣 Nuevo en incubadora: {token_address}")
+                await asyncio.sleep(300)  # 5 minutos entre consultas
+            except asyncio.CancelledError:
+                logger.info("Radar de Jupiter detenido.")
+                break
+            except Exception as e:
+                logger.error(f"Error en Radar de Jupiter: {e}")
+                await asyncio.sleep(15)
 
 async def incubator_checker_task(context: ContextTypes.DEFAULT_TYPE):
+    """Verifica tokens en incubadora: consulta DexScreener y promueve a watchlist si cumplen liquidez."""
     logger.info("Iniciando Vigilante de la Incubadora...")
-    client = context.bot_data['client']
-    db_pool = context.bot_data['db_pool']
-    while True:
-        try:
-            await asyncio.sleep(INCUBATOR_CHECK_INTERVAL_SECONDS)
-            if not incubator: continue
-            logger.info(f"[INCUBADORA] Verificando {len(incubator)} tokens...")
-            now_ts = time.time()
-            for token_address, data in list(incubator.items()):
-                dex_data = await get_dexscreener_data(client, token_address)
-                if not dex_data:
-                    if now_ts - data['found_at'] > INCUBATOR_DISCARD_AFTER_HOURS * SECONDS_IN_HOUR:
-                        logger.info(f"  - 🗑️ [DESCARTADO] {token_address[:10]}... sin datos en DexScreener tras {INCUBATOR_DISCARD_AFTER_HOURS}h.")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await asyncio.sleep(180)  # cada 3 minutos
+                if not incubator:
+                    continue
+                now_ts = time.time()
+                logger.info(f"[INCUBADORA] Verificando {len(incubator)} tokens...")
+                for token_address, data in list(incubator.items()):
+                    dex_data = await get_dexscreener_data(client, token_address)
+                    if not dex_data:
+                        # Si no hay datos y pasó 1 hora desde encontrado, descartamos
+                        if now_ts - data['found_at'] > 3600:
+                            logger.info(f"  - 🗑️ Descartado (sin datos): {token_address}")
+                            del incubator[token_address]
+                            await db_remove_from_incubator(token_address)
+                        continue
+
+                    liquidity = dex_data.get('liquidity', {}).get('usd', 0)
+                    logger.info(f"  - {token_address[:8]}... Liquidez: ${liquidity:,.2f}")
+                    if liquidity >= LIQUIDITY_THRESHOLD:
+                        # Promover a watchlist
+                        approved_at = now_ts
+                        watch_data = {'approved_at': approved_at, 'last_notified': 'initial', 'meta': dex_data}
+                        watchlist[token_address] = watch_data
+                        await db_add_to_watchlist(token_address, watch_data)
+
+                        # eliminar de incubadora
                         del incubator[token_address]
-                        await db_remove_from_incubator(db_pool, token_address)
-                    continue
-                liquidity = dex_data.get('liquidity', {}).get('usd', 0)
-                if liquidity < MIN_LIQUIDITY_USD:
-                    logger.info(f"  - [EN ESPERA] {token_address[:10]}... liquidez baja (${liquidity:,.0f}). Objetivo: >${MIN_LIQUIDITY_USD:,.0f}")
-                    continue
-                logger.info(f"  - ✅ [APROBADO] ¡{token_address[:10]}... pasa el filtro de liquidez! Movido a Watchlist.")
-                new_watchlist_data = {'approved_at': now_ts, 'last_notified': 'initial'}
-                watchlist[token_address] = new_watchlist_data
-                await db_add_to_watchlist(db_pool, token_address, new_watchlist_data)
-                del incubator[token_address]
-                await db_remove_from_incubator(db_pool, token_address)
-                mensaje = (
-                    f"✅ **Alerta de Oportunidad (Fuente: {data.get('source')})**\n\n"
-                    f"**Token:** `{dex_data.get('baseToken', {}).get('symbol', 'N/A')}`\n"
-                    f"**Mint:** `{token_address}`\n\n"
-                    f"**Liquidez:** `${liquidity:,.2f}` USD\n"
-                    f"**Precio:** `${dex_data.get('priceUsd', '0.0')}`\n\n"
-                    f"🚨 *Realiza tu propio análisis. Verifica en RugCheck, etc.*"
-                )
-                if TARGET_CHAT_ID:
-                    await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=mensaje, parse_mode='Markdown')
-        except asyncio.CancelledError:
-            logger.info("Vigilante de Incubadora detenido.")
-            break
-        except Exception as e:
-            logger.error(f"Error crítico en Vigilante de Incubadora: {e}")
-            await asyncio.sleep(60)
+                        await db_remove_from_incubator(token_address)
+
+                        # notificar a Telegram
+                        message = (
+                            f"✅ *Alerta de Oportunidad (Jupiter Radar)*\n\n"
+                            f"*Mint:* `{token_address}`\n"
+                            f"*Liquidez:* `${liquidity:,.2f}` USD\n\n"
+                            "🚨 Realiza tu análisis de seguridad manual en RugCheck."
+                        )
+                        if TARGET_CHAT_ID:
+                            try:
+                                await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=message, parse_mode='Markdown')
+                            except Exception as e:
+                                logger.warning(f"No se pudo enviar notificación Telegram: {e}")
+
+                # fin for incubator
+            except asyncio.CancelledError:
+                logger.info("Vigilante de incubadora detenido.")
+                break
+            except Exception as e:
+                logger.error(f"Error en vigilante de incubadora: {e}")
+                await asyncio.sleep(10)
 
 async def watchlist_monitor_task(context: ContextTypes.DEFAULT_TYPE):
+    """Monitorea tokens aprobados y envía reportes periódicos (24h,72h,96h)."""
     logger.info("Iniciando Monitor de Watchlist...")
-    while True:
-        try:
-            await asyncio.sleep(WATCHLIST_MONITOR_INTERVAL_SECONDS)
-            if not watchlist: continue
-            logger.info(f"[WATCHLIST] Monitoreando {len(watchlist)} tokens aprobados...")
-        except asyncio.CancelledError:
-            logger.info("Monitor de Watchlist detenido.")
-            break
-        except Exception as e:
-            logger.error(f"Error en Monitor de Watchlist: {e}")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                await asyncio.sleep(300)
+                if not watchlist:
+                    continue
+                now = time.time()
+                for token_address, data in list(watchlist.items()):
+                    approved_at = data.get('approved_at', 0)
+                    last_notified = data.get('last_notified', 'initial')
+                    age_hours = (now - approved_at) / 3600
+                    notify_periods = {'initial': 24, '24hr': 72, '72hr': 96}
+                    if last_notified in notify_periods and age_hours >= notify_periods[last_notified]:
+                        # Obtener datos frescos de DexScreener
+                        dex_data = await get_dexscreener_data(client, token_address)
+                        liquidity = dex_data.get('liquidity', {}).get('usd', 0) if dex_data else 0
+                        price_change_24h = dex_data.get('priceChange', {}).get('h24', 0) if dex_data else 0
+                        message = (
+                            f"🔔 *Reporte ({notify_periods[last_notified]}h)*\n\n"
+                            f"*Mint:* `{token_address}`\n"
+                            f"*Liq. Actual:* `${liquidity:,.2f}` USD\n"
+                            f"*Cambio 24h:* `{price_change_24h}%`"
+                        )
+                        if TARGET_CHAT_ID:
+                            try:
+                                await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=message, parse_mode='Markdown')
+                            except Exception as e:
+                                logger.warning(f"No se pudo enviar reporte Telegram: {e}")
 
+                        # actualizar estado
+                        new_state = f"{notify_periods[last_notified]}hr"
+                        watchlist[token_address]['last_notified'] = new_state
+                        await db_add_to_watchlist(token_address, watchlist[token_address])
+            except asyncio.CancelledError:
+                logger.info("Monitor de watchlist detenido.")
+                break
+            except Exception as e:
+                logger.error(f"Error en monitor de watchlist: {e}")
+                await asyncio.sleep(10)
 
-# --- 🤖 COMANDOS DE TELEGRAM ---
-# (Esta sección no necesita cambios)
+# -------------------- TELEGRAM COMMANDS --------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_CHAT_ID
     TARGET_CHAT_ID = update.message.chat_id
-    if not context.bot_data.get('db_pool'):
-        await update.message.reply_text("❌ **Error Crítico:** No se pudo conectar a la base de datos. El bot no puede funcionar.")
-        return
-    await update.message.reply_text(
-        "👋 **Bot de Caza v16.2 (Modo Despliegue)**\n\n"
-        "Este bot monitorea DexScreener en busca de nuevos tokens en Solana (1-24h de antigüedad) que alcancen un umbral de liquidez.\n\n"
-        "**Comandos:**\n"
-        "/cazar - Inicia todas las tareas de monitoreo.\n"
-        "/parar - Detiene la caza.\n"
-        "/status - Muestra el estado actual y contadores.\n"
-        "/incubadora - Muestra los últimos tokens encontrados, esperando liquidez.\n"
-        "/watchlist - Muestra los tokens que ya fueron aprobados y notificados."
-    )
+    await update.message.reply_text("👋 Bot listo. Usa /cazar, /parar, /status, /incubadora, /watchlist.")
 
 async def hunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.bot_data.get('tasks'):
         await update.message.reply_text("🤔 El bot ya está cazando.")
         return
-    db_pool = context.bot_data.get('db_pool')
-    if not db_pool:
-        await update.message.reply_text("❌ No se puede iniciar la caza: no hay conexión a la base de datos.")
-        return
-    await update.message.reply_text("📡 ¡Iniciando caza! Cargando estado desde la base de datos y arrancando tareas...")
-    global watchlist, incubator
-    watchlist = await db_load_all_watchlist(db_pool)
-    incubator = await db_load_all_incubator(db_pool)
-    logger.info(f"Cargados {len(incubator)} tokens en incubadora y {len(watchlist)} en watchlist desde la BD.")
-    client = httpx.AsyncClient()
-    context.bot_data.update({'client': client, 'tasks': [
-        asyncio.create_task(jupiter_momentum_task(context)),
+    await update.message.reply_text("🏹 Iniciando Radar de Jupiter y monitores...")
+    await setup_database()
+    global incubator, watchlist
+    incubator = await db_load_all_incubator()
+    watchlist = await db_load_all_watchlist()
+
+    # Crear client HTTP compartido
+    context.bot_data['client'] = httpx.AsyncClient()
+    context.bot_data['tasks'] = [
+        asyncio.create_task(jupiter_radar_task(context)),
         asyncio.create_task(incubator_checker_task(context)),
         asyncio.create_task(watchlist_monitor_task(context))
-    ]})
-    await update.message.reply_text("✅ ¡Caza activa! El radar y los vigilantes están en funcionamiento.")
+    ]
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.bot_data.get('tasks'):
-        await update.message.reply_text("🤔 El bot no está cazando actualmente.")
+        await update.message.reply_text("🤔 El bot no está cazando.")
         return
-    for task in context.bot_data['tasks']: task.cancel()
-    if client := context.bot_data.get('client'): await client.aclose()
+    for task in context.bot_data['tasks']:
+        task.cancel()
+    if client := context.bot_data.get('client'):
+        await client.aclose()
     context.bot_data.clear()
-    context.bot_data['db_pool'] = DB_POOL 
-    await update.message.reply_text("🛑 ¡Caza detenida! Todas las tareas han sido canceladas.")
+    await update.message.reply_text("🛑 Caza detenida.")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = "🛑 El bot está **Detenido**."
+    status_msg = "🛑 El bot está *Detenido*."
     if context.bot_data.get('tasks'):
         status_msg = (
-            f"✅ El bot está **Activo** (Modo Radar Enfocado).\n\n"
-            f"🐣 **{len(incubator)}** tokens en incubadora (esperando liquidez).\n"
-            f"🏆 **{len(watchlist)}** tokens en watchlist (aprobados y bajo monitoreo)."
+            f"✅ El bot está *Activo* (Radar Jupiter).\n"
+            f"🐣 *{len(incubator)}* tokens en incubadora.\n"
+            f"🏆 *{len(watchlist)}* tokens en watchlist.\n"
         )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
 async def incubator_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not incubator:
-        await update.message.reply_text("🐣 La incubadora está vacía."); return
-    message = f"🐣 **Últimos 10 Tokens en la Incubadora ({len(incubator)} en total):**\n\n"
-    token_addresses = list(incubator.keys()); tokens_to_show = token_addresses[-10:]; tokens_to_show.reverse()
-    for token_address in tokens_to_show: message += f"- `{token_address}`\n"
-    if len(incubator) > 10: message += f"\n... y {len(incubator) - 10} más antiguos."
+        await update.message.reply_text("🐣 La incubadora está vacía.")
+        return
+    message = f"🐣 *Últimos Tokens en Incubadora ({len(incubator)}):*\n\n"
+    token_addresses = list(incubator.keys())
+    tokens_to_show = token_addresses[-10:]
+    tokens_to_show.reverse()
+    for token_address in tokens_to_show:
+        message += f"- `{token_address}`\n"
+    if len(incubator) > 10:
+        message += f"\n... y {len(incubator) - 10} más antiguos."
     await update.message.reply_text(message, parse_mode='Markdown')
 
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not watchlist:
-        await update.message.reply_text("🏆 La watchlist está vacía."); return
-    message = f"🏆 **Últimos 15 Tokens en la Watchlist ({len(watchlist)} en total):**\n\n"
-    token_addresses = list(watchlist.keys()); tokens_to_show = token_addresses[-15:]; tokens_to_show.reverse()
-    for token_address in tokens_to_show: message += f"- `{token_address}`\n"
-    if len(watchlist) > 15: message += f"\n... y {len(watchlist) - 15} más antiguos."
+        await update.message.reply_text("🏆 La watchlist está vacía.")
+        return
+    message = f"🏆 *Últimos Tokens en Watchlist ({len(watchlist)}):*\n\n"
+    token_addresses = list(watchlist.keys())
+    tokens_to_show = token_addresses[-15:]
+    tokens_to_show.reverse()
+    for token_address in tokens_to_show:
+        message += f"- `{token_address}`\n"
+    if len(watchlist) > 15:
+        message += f"\n... y {len(watchlist) - 15} más antiguos."
     await update.message.reply_text(message, parse_mode='Markdown')
 
+# -------------------- BOOT --------------------
 
-# --- 🚀 PUNTO DE ENTRADA PRINCIPAL (CORREGIDO PARA DESPLIEGUE) ---
-
-async def main():
-    """Función principal que configura e inicia el bot de forma robusta."""
-    global DB_POOL
-    
-    # Evento para manejar el apagado de forma elegante
-    stop_event = asyncio.Event()
-
-    # Configurar manejadores de señales para SIGINT (Ctrl+C) y SIGTERM (enviado por Railway)
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, stop_event.set)
-
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN no configurado en las variables de entorno.")
+        return
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    try:
-        # --- ARRANQUE ---
-        logger.info("Iniciando el bot...")
-        DB_POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-        logger.info("Pool de conexiones a la base de datos creado.")
-        
-        application.bot_data['db_pool'] = DB_POOL
-        await setup_database(DB_POOL)
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("cazar", hunt_command))
+    application.add_handler(CommandHandler("parar", stop_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("incubadora", incubator_command))
+    application.add_handler(CommandHandler("watchlist", watchlist_command))
 
-        # Añadir handlers de comandos
-        application.add_handler(CommandHandler("start", start_command))
-        application.add_handler(CommandHandler("cazar", hunt_command))
-        application.add_handler(CommandHandler("parar", stop_command))
-        application.add_handler(CommandHandler("status", status_command))
-        application.add_handler(CommandHandler("incubadora", incubator_command))
-        application.add_handler(CommandHandler("watchlist", watchlist_command))
-
-        # Iniciar todos los componentes de la aplicación manualmente
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling()
-        
-        logger.info("--- El bot está en línea y escuchando ---")
-        
-        # Esperar hasta que se reciba una señal de apagado
-        await stop_event.wait()
-
-    except Exception as e:
-        logger.critical(f"Error crítico durante el arranque o ejecución: {e}")
-    finally:
-        # --- APAGADO ---
-        logger.info("Recibida señal de apagado. Cerrando conexiones...")
-        if application.updater and application.updater.is_running():
-            await application.updater.stop()
-        if application.running:
-            await application.stop()
-        await application.shutdown()
-        
-        if DB_POOL:
-            await DB_POOL.close()
-            logger.info("Pool de conexiones a la base de datos cerrado.")
-        logger.info("El bot se ha apagado correctamente.")
-
+    logger.info("--- Bot listo. Ejecutando polling... ---")
+    application.run_polling()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    main()
