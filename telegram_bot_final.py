@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 import httpx
 import asyncpg
 from typing import Dict, Any, List
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -19,24 +19,26 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 TARGET_CHAT_ID = None
 
-# JUPITER V2 API - MANTENEMOS JUPITER
-JUPITER_V2_BASE = "https://lite-api.jup.ag/tokens/v2"
-JUPITER_V2_RECENT = f"{JUPITER_V2_BASE}/recent"
-JUPITER_V2_TRENDING = f"{JUPITER_V2_BASE}/toptrending/1h"
-JUPITER_V2_TOP_ORGANIC = f"{JUPITER_V2_BASE}/toporganicscore/1h"
+# FUENTES CONFIABLES - SIN DEXSCREENER
+JUPITER_V2_RECENT = "https://lite-api.jup.ag/tokens/v2/recent"
+JUPITER_V2_TRENDING = "https://lite-api.jup.ag/tokens/v2/toptrending/1h"
+JUPITER_V2_ORGANIC = "https://lite-api.jup.ag/tokens/v2/toporganicscore/1h"
 
-# DEXSCREENER COMO BACKUP
-DEXSCREENER_SOLANA_TRENDING = "https://api.dexscreener.com/latest/dex/search?q=solana&limit=50"
+# GeckoTerminal para tokens nuevos
+GECKO_NEW_PAIRS = "https://api.geckoterminal.com/api/v2/networks/solana/new_pools"
+
+# Birdeye para verificación rápida (opcional, solo si es necesario)
+BIRDEYE_API = "https://public-api.birdeye.so/public/token?address={}"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json",
 }
 
-# FILTROS MEJORADOS
-MIN_LIQUIDITY = 5000
-MAX_AGE_HOURS = 24
-MIN_AGE_HOURS = 1
+# FILTROS MÁS ESTRICTOS
+MIN_LIQUIDITY = 5000  # $5,000 mínimo
+MAX_AGE_HOURS = 6     # Reducido a 6 horas máximo - MÁS FRESCOS
+MIN_AGE_HOURS = 0.5   # Mínimo 30 minutos
 
 # Estructuras en memoria
 incubator: Dict[str, Dict[str, Any]] = {}
@@ -117,59 +119,141 @@ async def db_load_all_watchlist() -> Dict[str, dict]:
         return {row['token_address']: json.loads(row['data']) for row in rows}
     finally: await conn.close()
 
-# -------------------- JUPITER V2 API MEJORADA --------------------
+# -------------------- FILTROS DE EDAD MEJORADOS --------------------
 def calculate_token_age(created_at_str: str) -> float:
-    """Calcula la edad del token en horas - CORREGIDA"""
+    """Calcula la edad del token en horas de forma más robusta"""
     try:
-        # Formato: "2024-01-15T10:30:45Z"
-        created_dt = datetime.fromisoformat(created_at_str.replace('Z', '+00:00'))
+        if not created_at_str:
+            return None
+            
+        # Manejar diferentes formatos de fecha
+        created_at_str = created_at_str.replace('Z', '+00:00')
+        created_dt = datetime.fromisoformat(created_at_str)
         current_dt = datetime.utcnow().replace(tzinfo=created_dt.tzinfo)
         age_seconds = (current_dt - created_dt).total_seconds()
         age_hours = age_seconds / 3600
+        
         return age_hours
     except Exception as e:
         logger.debug(f"Error calculando edad para {created_at_str}: {e}")
         return None
 
-async def get_jupiter_recent_tokens(client: httpx.AsyncClient) -> List[Dict]:
-    """Obtiene tokens RECIENTES de Jupiter V2 - FILTRO MEJORADO"""
+def is_token_in_age_range(age_hours: float) -> bool:
+    """Verifica si el token está en el rango de edad deseado"""
+    if age_hours is None:
+        return False
+    return MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS
+
+# -------------------- GECKOTERMINAL - FUENTE PRINCIPAL --------------------
+async def get_geckoterminal_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
+    """Obtiene pools nuevos de GeckoTerminal - MÁS CONFIABLE"""
+    try:
+        logger.info("Consultando GeckoTerminal /new_pools...")
+        res = await client.get(GECKO_NEW_PAIRS, headers=HEADERS, timeout=20)
+        
+        if res.status_code == 200:
+            data = res.json()
+            pools = data.get('data', [])
+            logger.info(f"[GECKO TERMINAL] Pools obtenidos: {len(pools)}")
+            
+            processed_tokens = []
+            for pool in pools:
+                try:
+                    attributes = pool.get('attributes', {})
+                    token_address = attributes.get('base_token_address', '')
+                    
+                    if not token_address:
+                        continue
+                    
+                    # Calcular edad del pool
+                    created_at = attributes.get('pool_created_at')
+                    age_hours = calculate_token_age(created_at) if created_at else None
+                    
+                    # FILTRO ESTRICTO: solo tokens en rango de edad
+                    if not is_token_in_age_range(age_hours):
+                        continue
+                    
+                    # Obtener datos del token
+                    base_token = attributes.get('base_token', {})
+                    liquidity = float(attributes.get('reserve_in_usd', 0))
+                    
+                    # FILTRO DE LIQUIDEZ
+                    if liquidity < MIN_LIQUIDITY:
+                        continue
+                    
+                    processed_tokens.append({
+                        'address': token_address,
+                        'name': base_token.get('name', ''),
+                        'symbol': base_token.get('symbol', ''),
+                        'liquidity': liquidity,
+                        'age_hours': age_hours,
+                        'created_at': created_at,
+                        'price_usd': float(base_token.get('price_usd', 0)),
+                        'fdv_usd': float(attributes.get('fdv_usd', 0)),
+                        'volume_24h': float(attributes.get('volume_usd', {}).get('h24', 0)),
+                        'price_change_24h': float(attributes.get('price_change_percentage', {}).get('h24', 0)),
+                        'source': 'geckoterminal_new'
+                    })
+                    
+                except Exception as e:
+                    logger.debug(f"Error procesando pool de GeckoTerminal: {e}")
+                    continue
+            
+            logger.info(f"[GECKO TERMINAL] Tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
+            return processed_tokens
+            
+        else:
+            logger.warning(f"GeckoTerminal responded {res.status_code}")
+            
+    except Exception as e:
+        logger.error(f"Error GeckoTerminal: {e}")
+    return []
+
+# -------------------- JUPITER V2 MEJORADO --------------------
+async def get_jupiter_recent_tokens_improved(client: httpx.AsyncClient) -> List[Dict]:
+    """Jupiter V2 con filtros más estrictos"""
     try:
         logger.info("Consultando Jupiter V2 /recent...")
         res = await client.get(JUPITER_V2_RECENT, headers=HEADERS, timeout=20)
         
         if res.status_code == 200:
             tokens = res.json()
-            logger.info(f"[JUPITER V2 RECENT] Tokens brutos: {len(tokens)}")
+            logger.info(f"[JUPITER V2 RECENT] Tokens obtenidos: {len(tokens)}")
             
             processed_tokens = []
-            now = time.time()
-            
             for token in tokens:
                 if isinstance(token, dict) and token.get('id'):
-                    # Calcular edad basada en firstPool.createdAt
+                    # Calcular edad del token
+                    age_hours = None
                     first_pool = token.get('firstPool', {})
-                    created_at = first_pool.get('createdAt')
+                    if first_pool and first_pool.get('createdAt'):
+                        age_hours = calculate_token_age(first_pool['createdAt'])
                     
-                    if created_at:
-                        age_hours = calculate_token_age(created_at)
+                    # FILTRO ESTRICTO: solo tokens en rango de edad
+                    if not is_token_in_age_range(age_hours):
+                        continue
+                    
+                    liquidity = token.get('liquidity', 0)
+                    
+                    # FILTRO DE LIQUIDEZ
+                    if liquidity < MIN_LIQUIDITY:
+                        continue
                         
-                        # FILTRO CRÍTICO: Solo tokens de 1-24 horas
-                        if age_hours and MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS:
-                            processed_tokens.append({
-                                'address': token['id'],
-                                'name': token.get('name', ''),
-                                'symbol': token.get('symbol', ''),
-                                'liquidity': token.get('liquidity', 0),
-                                'age_hours': age_hours,
-                                'first_pool_created': created_at,
-                                'organic_score': token.get('organicScore', 0),
-                                'is_verified': token.get('isVerified', False),
-                                'holder_count': token.get('holderCount', 0),
-                                'price_usd': token.get('usdPrice', 0),
-                                'source': 'jupiter_v2_recent'
-                            })
+                    processed_tokens.append({
+                        'address': token['id'],
+                        'name': token.get('name', ''),
+                        'symbol': token.get('symbol', ''),
+                        'liquidity': liquidity,
+                        'age_hours': age_hours,
+                        'first_pool_created': first_pool.get('createdAt'),
+                        'organic_score': token.get('organicScore', 0),
+                        'is_verified': token.get('isVerified', False),
+                        'holder_count': token.get('holderCount', 0),
+                        'price_usd': token.get('usdPrice', 0),
+                        'source': 'jupiter_v2_recent'
+                    })
             
-            logger.info(f"[JUPITER V2 RECENT] Tokens filtrados (1-24h): {len(processed_tokens)}")
+            logger.info(f"[JUPITER V2 RECENT] Tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
             return processed_tokens
         else:
             logger.warning(f"Jupiter V2 recent responded {res.status_code}")
@@ -178,40 +262,48 @@ async def get_jupiter_recent_tokens(client: httpx.AsyncClient) -> List[Dict]:
         logger.error(f"Error Jupiter V2 recent: {e}")
     return []
 
-async def get_jupiter_trending_tokens(client: httpx.AsyncClient) -> List[Dict]:
-    """Obtiene tokens TRENDING de Jupiter V2 con filtro de edad"""
+async def get_jupiter_trending_tokens_improved(client: httpx.AsyncClient) -> List[Dict]:
+    """Jupiter V2 trending con filtros"""
     try:
         logger.info("Consultando Jupiter V2 /toptrending...")
         res = await client.get(JUPITER_V2_TRENDING, headers=HEADERS, timeout=20)
         
         if res.status_code == 200:
             tokens = res.json()
-            logger.info(f"[JUPITER V2 TRENDING] Tokens brutos: {len(tokens)}")
+            logger.info(f"[JUPITER V2 TRENDING] Tokens obtenidos: {len(tokens)}")
             
             processed_tokens = []
-            
             for token in tokens:
                 if isinstance(token, dict) and token.get('id'):
+                    # Para trending, también verificar edad
+                    age_hours = None
                     first_pool = token.get('firstPool', {})
-                    created_at = first_pool.get('createdAt')
+                    if first_pool and first_pool.get('createdAt'):
+                        age_hours = calculate_token_age(first_pool['createdAt'])
                     
-                    if created_at:
-                        age_hours = calculate_token_age(created_at)
+                    # FILTRO ESTRICTO: solo tokens en rango de edad
+                    if not is_token_in_age_range(age_hours):
+                        continue
+                    
+                    liquidity = token.get('liquidity', 0)
+                    
+                    # FILTRO DE LIQUIDEZ
+                    if liquidity < MIN_LIQUIDITY:
+                        continue
                         
-                        if age_hours and MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS:
-                            processed_tokens.append({
-                                'address': token['id'],
-                                'name': token.get('name', ''),
-                                'symbol': token.get('symbol', ''),
-                                'liquidity': token.get('liquidity', 0),
-                                'age_hours': age_hours,
-                                'organic_score': token.get('organicScore', 0),
-                                'is_verified': token.get('isVerified', False),
-                                'price_change_1h': token.get('stats1h', {}).get('priceChange', 0),
-                                'source': 'jupiter_v2_trending'
-                            })
+                    processed_tokens.append({
+                        'address': token['id'],
+                        'name': token.get('name', ''),
+                        'symbol': token.get('symbol', ''),
+                        'liquidity': liquidity,
+                        'age_hours': age_hours,
+                        'organic_score': token.get('organicScore', 0),
+                        'is_verified': token.get('isVerified', False),
+                        'price_change_1h': token.get('stats1h', {}).get('priceChange', 0),
+                        'source': 'jupiter_v2_trending'
+                    })
             
-            logger.info(f"[JUPITER V2 TRENDING] Tokens filtrados (1-24h): {len(processed_tokens)}")
+            logger.info(f"[JUPITER V2 TRENDING] Tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
             return processed_tokens
         else:
             logger.warning(f"Jupiter V2 trending responded {res.status_code}")
@@ -220,48 +312,15 @@ async def get_jupiter_trending_tokens(client: httpx.AsyncClient) -> List[Dict]:
         logger.error(f"Error Jupiter V2 trending: {e}")
     return []
 
-async def get_dexscreener_trending_pairs(client: httpx.AsyncClient) -> List[Dict]:
-    """Backup: Obtiene pares trending de DexScreener"""
-    try:
-        logger.info("Consultando DexScreener trending...")
-        res = await client.get(DEXSCREENER_SOLANA_TRENDING, headers=HEADERS, timeout=20)
-        
-        if res.status_code == 200:
-            data = res.json()
-            pairs = data.get("pairs", [])
-            logger.info(f"[DEXSCREENER] Pares brutos: {len(pairs)}")
-            
-            now = time.time()
-            recent_pairs = []
-            
-            for pair in pairs:
-                if pair.get('chainId') != 'solana':
-                    continue
-                    
-                created_at = pair.get('pairCreatedAt')
-                if created_at:
-                    age_hours = (now - (created_at / 1000)) / 3600
-                    if MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS:
-                        recent_pairs.append(pair)
-            
-            logger.info(f"[DEXSCREENER] Pares filtrados (1-24h): {len(recent_pairs)}")
-            return recent_pairs
-        else:
-            logger.warning(f"DexScreener responded {res.status_code}")
-            
-    except Exception as e:
-        logger.error(f"Error DexScreener trending: {e}")
-    return []
-
-async def get_all_recent_tokens(client: httpx.AsyncClient) -> List[Dict]:
-    """Combina Jupiter V2 + DexScreener"""
+async def get_all_tokens_combined(client: httpx.AsyncClient) -> List[Dict]:
+    """Combina múltiples fuentes con filtros estrictos - SIN DEXSCREENER"""
     all_tokens = []
     
-    # Ejecutar TODAS las fuentes en paralelo
+    # Ejecutar todas las fuentes en paralelo
     tasks = [
-        get_jupiter_recent_tokens(client),
-        get_jupiter_trending_tokens(client),
-        get_dexscreener_trending_pairs(client)
+        get_jupiter_recent_tokens_improved(client),
+        get_jupiter_trending_tokens_improved(client),
+        get_geckoterminal_new_pairs(client)
     ]
     
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -270,253 +329,96 @@ async def get_all_recent_tokens(client: httpx.AsyncClient) -> List[Dict]:
         if isinstance(result, list):
             all_tokens.extend(result)
     
-    # Procesar tokens de diferentes fuentes
-    processed_tokens = []
-    
-    for item in all_tokens:
-        if isinstance(item, dict):
-            address = None
-            name = ""
-            symbol = ""
-            liquidity = 0
-            age_hours = None
-            
-            # Para tokens de Jupiter
-            if item.get('source', '').startswith('jupiter_v2'):
-                address = item.get('address')
-                name = item.get('name', '')
-                symbol = item.get('symbol', '')
-                liquidity = item.get('liquidity', 0)
-                age_hours = item.get('age_hours')
-            
-            # Para pares de DexScreener
-            elif "baseToken" in item:
-                base_token = item.get("baseToken", {})
-                address = base_token.get("address")
-                name = base_token.get("name", "")
-                symbol = base_token.get("symbol", "")
-                liquidity = item.get('liquidity', {}).get('usd', 0)
-                created_at = item.get('pairCreatedAt')
-                if created_at:
-                    age_hours = (time.time() - (created_at / 1000)) / 3600
-            
-            if address and age_hours and MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS:
-                processed_tokens.append({
-                    'address': address,
-                    'name': name,
-                    'symbol': symbol,
-                    'liquidity': liquidity,
-                    'age_hours': age_hours,
-                    'raw_data': item,
-                    'source': item.get('source', 'dexscreener')
-                })
-    
-    # Eliminar duplicados
+    # Eliminar duplicados por address
     unique_tokens = {}
-    for token in processed_tokens:
+    for token in all_tokens:
         addr = token['address']
         if addr and addr not in unique_tokens:
             unique_tokens[addr] = token
     
-    logger.info(f"🎯 TOTAL tokens únicos (1-24h): {len(unique_tokens)}")
+    logger.info(f"🎯 TOTAL tokens únicos ({MIN_AGE_HOURS}-{MAX_AGE_HOURS}h, ≥${MIN_LIQUIDITY:,}): {len(unique_tokens)}")
     
-    # DEBUG: Estadísticas detalladas
+    # Mostrar ejemplos para debugging
     if unique_tokens:
-        jupiter_tokens = [t for t in unique_tokens.values() if 'jupiter' in t.get('source', '')]
-        dexscreener_tokens = [t for t in unique_tokens.values() if 'dexscreener' in t.get('source', '')]
-        tokens_with_liquidity = [t for t in unique_tokens.values() if t.get('liquidity', 0) >= MIN_LIQUIDITY]
-        
-        logger.info(f"📊 Fuentes: Jupiter={len(jupiter_tokens)}, DexScreener={len(dexscreener_tokens)}")
-        logger.info(f"📊 Con liquidez ≥${MIN_LIQUIDITY}: {len(tokens_with_liquidity)}")
-        
-        # Mostrar ejemplos
-        sample_tokens = list(unique_tokens.values())[:5]
-        logger.info("🔍 Ejemplos de tokens encontrados:")
+        sample_tokens = list(unique_tokens.values())[:3]
+        logger.info("📋 Ejemplos de tokens encontrados:")
         for token in sample_tokens:
-            age_info = f"{token.get('age_hours', 'N/A'):.1f}h"
+            age_info = f"{token.get('age_hours', 'N/A'):.1f}h" if token.get('age_hours') else 'edad N/A'
             liq = token.get('liquidity', 0)
-            source = token.get('source', 'unknown')
-            logger.info(f"  - {token['symbol']} | {age_info} | ${liq:,.0f} | {source}")
+            source = token.get('source', 'desconocido')
+            logger.info(f"  - {token['symbol']}: {age_info}, ${liq:,.0f} liquidez, {source}")
     
     return list(unique_tokens.values())
 
-# -------------------- VERIFICACIÓN CON DEXSCREENER --------------------
-async def get_dexscreener_token_data(client: httpx.AsyncClient, token_address: str):
-    """Obtiene datos actualizados de DexScreener"""
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+# -------------------- VERIFICACIÓN RÁPIDA CON BIRDEYE (OPCIONAL) --------------------
+async def get_birdeye_token_data(client: httpx.AsyncClient, token_address: str):
+    """Verificación opcional con Birdeye - SOLO SI ES NECESARIO"""
     try:
-        res = await client.get(url, timeout=8)
+        url = BIRDEYE_API.format(token_address)
+        res = await client.get(url, timeout=5)
         if res.status_code == 200:
             data = res.json()
-            if data.get('pairs'):
-                pairs = data['pairs']
-                if pairs:
-                    best_pair = sorted(pairs, key=lambda p: p.get('liquidity', {}).get('usd', 0), reverse=True)[0]
-                    return best_pair
+            if data.get('data'):
+                return data['data']
     except Exception as e:
-        logger.debug(f"Error DexScreener para {token_address}: {e}")
+        logger.debug(f"Birdeye opcional falló para {token_address}: {e}")
     return None
 
-# -------------------- FILTROS PRÁCTICOS --------------------
-def check_liquidity(dex_data: dict) -> tuple:
-    """Verifica liquidez mínima"""
-    if not dex_data:
-        return False, "❌ Sin datos"
-    
-    liquidity = dex_data.get('liquidity', {}).get('usd', 0)
-    if liquidity < MIN_LIQUIDITY:
-        return False, f"❌ Liquidez: ${liquidity:,.0f}"
-    
-    return True, f"✅ Liquidez: ${liquidity:,.0f}"
-
-def check_age(dex_data: dict) -> tuple:
-    """Verifica edad del token"""
-    created_at = dex_data.get('pairCreatedAt')
-    if not created_at:
-        return False, "❌ Sin timestamp"
-    
-    age_hours = (time.time() - (created_at / 1000)) / 3600
-    if age_hours < MIN_AGE_HOURS:
-        return False, f"❌ Muy nuevo: {age_hours:.1f}h"
-    if age_hours > MAX_AGE_HOURS:
-        return False, f"❌ Muy viejo: {age_hours:.1f}h"
-    
-    return True, f"✅ Edad: {age_hours:.1f}h"
-
-def check_volume(dex_data: dict) -> tuple:
-    """Verifica volumen mínimo"""
-    volume_24h = dex_data.get('volume', {}).get('h24', 0)
-    if volume_24h < 1000:
-        return True, f"⚠️ Volumen bajo: ${volume_24h:,.0f}"
-    
-    return True, f"✅ Volumen: ${volume_24h:,.0f}"
-
-# -------------------- TAREAS PRINCIPALES --------------------
-async def hybrid_radar_task(context: ContextTypes.DEFAULT_TYPE):
-    """Radar HÍBRIDO: Jupiter V2 + DexScreener"""
-    logger.info("🚀 Iniciando Radar Híbrido (Jupiter V2 + DexScreener)...")
+# -------------------- TAREAS PRINCIPALES - SIN DEXSCREENER --------------------
+async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
+    """Radar combinado SIN verificación externa"""
+    logger.info("🚀 Iniciando Radar Combinado (SIN DexScreener)...")
     async with httpx.AsyncClient() as client:
         while True:
             try:
-                tokens = await get_all_recent_tokens(client)
+                tokens = await get_all_tokens_combined(client)
                 
                 if not tokens:
-                    logger.info("[RADAR] No se encontraron tokens recientes (1-24h).")
+                    logger.info(f"[RADAR] No tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez")
                 else:
-                    added_count = 0
+                    approved_count = 0
                     for token in tokens:
                         address = token['address']
                         
                         if not address:
                             continue
                             
-                        if address in incubator or address in watchlist:
+                        # Evitar duplicados
+                        if address in watchlist:
                             continue
                             
-                        found_at = time.time()
-                        data = {
-                            'found_at': found_at,
-                            'token_info': token,
-                            'source': token.get('source', 'hybrid')
-                        }
-                        incubator[address] = data
-                        await db_add_to_incubator(address, data)
-                        added_count += 1
-                        
-                    logger.info(f"  - 🐣 {added_count} tokens nuevos añadidos a incubadora")
-                    
-                    if added_count > 0 and TARGET_CHAT_ID:
-                        await context.bot.send_message(
-                            chat_id=TARGET_CHAT_ID,
-                            text=f"🔍 *Radar Híbrido activo:* {added_count} tokens recientes encontrados! Verificando...",
-                            parse_mode='Markdown'
-                        )
-                
-                await asyncio.sleep(120)  # 2 minutos
-                
-            except Exception as e:
-                logger.error(f"Error en radar híbrido: {e}")
-                await asyncio.sleep(30)
-
-async def incubator_checker_task(context: ContextTypes.DEFAULT_TYPE):
-    """Verificación PRÁCTICA"""
-    logger.info("Iniciando Verificación de Incubadora...")
-    async with httpx.AsyncClient() as client:
-        while True:
-            try:
-                await asyncio.sleep(60)
-                
-                if not incubator:
-                    continue
-                    
-                now = time.time()
-                logger.info(f"[INCUBADORA] Verificando {len(incubator)} tokens...")
-                approved_count = 0
-                rejected_count = 0
-                
-                for token_address, data in list(incubator.items()):
-                    dex_data = await get_dexscreener_token_data(client, token_address)
-                    if not dex_data:
-                        if now - data['found_at'] > 1800:  # 30 minutos sin datos
-                            del incubator[token_address]
-                            await db_remove_from_incubator(token_address)
-                        continue
-
-                    # APLICAR FILTROS
-                    liquidity_ok, liquidity_reason = check_liquidity(dex_data)
-                    age_ok, age_reason = check_age(dex_data)
-                    volume_ok, volume_reason = check_volume(dex_data)
-                    
-                    if liquidity_ok and age_ok:
-                        # ✅ APROBADO
-                        approved_at = now
-                        liquidity = dex_data.get('liquidity', {}).get('usd', 0)
-                        price_change = dex_data.get('priceChange', {}).get('h24', 0)
-                        volume_24h = dex_data.get('volume', {}).get('h24', 0)
-                        
+                        # ✅ APROBAR DIRECTAMENTE - Ya pasó todos los filtros
+                        approved_at = time.time()
                         watch_data = {
                             'approved_at': approved_at,
-                            'liquidity': liquidity,
-                            'price_change_24h': price_change,
-                            'volume_24h': volume_24h,
-                            'dex_data': dex_data,
-                            'token_info': data['token_info'],
-                            'checks': {
-                                'liquidity': liquidity_reason,
-                                'age': age_reason,
-                                'volume': volume_reason
-                            }
+                            'token_info': token,
+                            'source': token.get('source', 'combined')
                         }
-                        watchlist[token_address] = watch_data
-                        await db_add_to_watchlist(token_address, watch_data)
-
-                        del incubator[token_address]
-                        await db_remove_from_incubator(token_address)
+                        watchlist[address] = watch_data
+                        await db_add_to_watchlist(address, watch_data)
                         approved_count += 1
 
-                        # NOTIFICACIÓN
-                        token_info = data['token_info']
-                        symbol = token_info.get('symbol', 'N/A')
-                        name = token_info.get('name', 'N/A')
-                        source = data.get('source', 'N/A')
+                        # NOTIFICACIÓN INMEDIATA
+                        symbol = token.get('symbol', 'N/A')
+                        name = token.get('name', 'N/A')
+                        age_hours = token.get('age_hours', 'N/A')
+                        age_str = f"{age_hours:.1f}h" if isinstance(age_hours, (int, float)) else age_hours
+                        liquidity = token.get('liquidity', 0)
+                        source = token.get('source', 'N/A')
                         
                         message = (
                             f"🎯 *TOKEN RECIENTE DETECTADO* 🎯\n\n"
                             f"*Symbol:* {symbol}\n"
                             f"*Name:* {name}\n"
-                            f"*Fuente:* {source}\n"
-                            f"*Address:* `{token_address}`\n"
+                            f"*Address:* `{address}`\n"
+                            f"*Edad:* {age_str}\n"
                             f"*Liquidez:* `${liquidity:,.2f}`\n"
-                            f"*Volumen 24h:* `${volume_24h:,.2f}`\n"
-                            f"*Cambio 24h:* `{price_change}%`\n\n"
-                            f"📊 *Verificaciones:*\n"
-                            f"- {liquidity_reason}\n"
-                            f"- {age_reason}\n"
-                            f"- {volume_reason}\n\n"
-                            f"🔍 *Verificar manualmente:*\n"
-                            f"- DexScreener: https://dexscreener.com/solana/{token_address}\n"
-                            f"- RugCheck: https://rugcheck.xyz/tokens/{token_address}\n\n"
-                            f"⚠️ *Verifica seguridad en RugCheck antes de invertir*"
+                            f"*Fuente:* {source}\n\n"
+                            f"🔍 *Verificar:*\n"
+                            f"- DexScreener: https://dexscreener.com/solana/{address}\n"
+                            f"- RugCheck: https://rugcheck.xyz/tokens/{address}\n"
+                            f"- Birdeye: https://birdeye.so/token/{address}?chain=solana\n\n"
+                            f"⚠️ *Verifica seguridad manualmente antes de invertir*"
                         )
                         
                         if TARGET_CHAT_ID:
@@ -530,43 +432,66 @@ async def incubator_checker_task(context: ContextTypes.DEFAULT_TYPE):
                             except Exception as e:
                                 logger.warning(f"No se pudo enviar notificación: {e}")
 
-                        logger.info(f"  - ✅ APROBADO: {symbol}")
-
-                    else:
-                        # ❌ RECHAZADO
-                        rejected_count += 1
-                        rejection_reasons = []
-                        if not liquidity_ok: rejection_reasons.append(liquidity_reason)
-                        if not age_ok: rejection_reasons.append(age_reason)
+                        logger.info(f"  - ✅ APROBADO: {symbol} - ${liquidity:,.0f} liquidez, {age_str} edad")
                         
-                        reason_text = " | ".join(rejection_reasons)
-                        logger.info(f"  - ❌ RECHAZADO: {token_address} - {reason_text}")
-                        
-                        del incubator[token_address]
-                        await db_remove_from_incubator(token_address)
+                    logger.info(f"  - 🎯 {approved_count} tokens aprobados directamente")
                     
-                    await asyncio.sleep(0.3)
+                    # Notificar resumen
+                    if approved_count > 0 and TARGET_CHAT_ID:
+                        await context.bot.send_message(
+                            chat_id=TARGET_CHAT_ID,
+                            text=f"📊 *Resumen radar:* {approved_count} tokens nuevos ({MIN_AGE_HOURS}-{MAX_AGE_HOURS}h, ≥${MIN_LIQUIDITY:,})",
+                            parse_mode='Markdown'
+                        )
                 
-                if approved_count > 0 or rejected_count > 0:
-                    logger.info(f"📈 Ciclo: {approved_count} aprobados, {rejected_count} rechazados")
-                    
+                await asyncio.sleep(60)  # 1 minuto entre búsquedas (más rápido)
+                
             except Exception as e:
-                logger.error(f"Error en verificador: {e}")
-                await asyncio.sleep(10)
+                logger.error(f"Error en radar combinado: {e}")
+                await asyncio.sleep(30)
+
+# -------------------- LIMPIEZA AUTOMÁTICA --------------------
+async def cleanup_task(context: ContextTypes.DEFAULT_TYPE):
+    """Limpia tokens viejos de la watchlist"""
+    logger.info("Iniciando tarea de limpieza...")
+    while True:
+        try:
+            await asyncio.sleep(3600)  # Revisar cada 1 hora
+            
+            if not watchlist:
+                continue
+                
+            now = time.time()
+            removed_count = 0
+            
+            for token_address, data in list(watchlist.items()):
+                approved_at = data.get('approved_at', 0)
+                # Eliminar tokens con más de 24 horas en watchlist
+                if now - approved_at > 86400:  # 24 horas
+                    del watchlist[token_address]
+                    # No eliminamos de DB para mantener historial
+                    removed_count += 1
+            
+            if removed_count > 0:
+                logger.info(f"🧹 Limpiados {removed_count} tokens viejos de watchlist")
+                
+        except Exception as e:
+            logger.error(f"Error en limpieza: {e}")
 
 # -------------------- COMANDOS TELEGRAM --------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_CHAT_ID
     TARGET_CHAT_ID = update.message.chat_id
     await update.message.reply_text(
-        "🚀 *Bot Híbrido - Jupiter V2 + DexScreener*\n\n"
-        "🎯 *Objetivo:* Tokens 1-24h + ≥$5,000 liquidez\n"
-        "🔍 *Fuentes:* Jupiter V2 (recent/trending) + DexScreener\n"
-        "🛡️ *Filtros:* Liquidez + Edad + Volumen\n"
-        "⏰ *Búsqueda cada 2 minutos*\n\n"
+        "🚀 *Bot Mejorado - Tokens Recientes*\n\n"
+        f"🎯 *Objetivo:* Tokens de {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez\n"
+        "🔍 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
+        "⚡ *Detección directa sin verificaciones externas*\n"
+        "⏰ *Búsqueda cada 1 minuto*\n\n"
         "*/cazar* - Iniciar monitoreo\n"
         "*/parar* - Detener\n"
-        "*/status* - Estado actual",
+        "*/status* - Estado actual\n"
+        "*/watchlist* - Tokens aprobados",
         parse_mode='Markdown'
     )
 
@@ -575,7 +500,7 @@ async def hunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🤔 Ya está cazando.")
         return
         
-    await update.message.reply_text("🏹 *Iniciando Radar Híbrido...*", parse_mode='Markdown')
+    await update.message.reply_text("🏹 *Iniciando Radar Combinado...*", parse_mode='Markdown')
     
     await setup_database()
     global incubator, watchlist
@@ -583,8 +508,8 @@ async def hunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     watchlist = await db_load_all_watchlist()
 
     context.bot_data['tasks'] = [
-        asyncio.create_task(hybrid_radar_task(context)),
-        asyncio.create_task(incubator_checker_task(context))
+        asyncio.create_task(combined_radar_task(context)),
+        asyncio.create_task(cleanup_task(context))
     ]
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -601,43 +526,32 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_msg = "🛑 Bot detenido"
     if context.bot_data.get('tasks'):
         status_msg = (
-            f"✅ *Bot Híbrido Activo*\n\n"
-            f"🐣 *Incubadora:* {len(incubator)} tokens\n"
+            f"✅ *Radar Combinado Activo*\n\n"
             f"🏆 *Watchlist:* {len(watchlist)} tokens\n"
-            f"🔍 *Fuentes:* Jupiter V2 + DexScreener\n"
-            f"🎯 *Buscando:* Tokens 1-24h + ≥${MIN_LIQUIDITY:,}"
+            f"🔍 *Buscando:* Tokens {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,} liquidez\n"
+            f"📡 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
+            f"⚡ *Sin DexScreener*"
         )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
-
-async def incubator_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not incubator:
-        await update.message.reply_text("🐣 Incubadora vacía")
-        return
-    message = f"🐣 *Tokens en Revisión ({len(incubator)}):*\n\n"
-    for i, (addr, data) in enumerate(list(incubator.items())[-10:][::-1], 1):
-        token_info = data.get('token_info', {})
-        symbol = token_info.get('symbol', 'N/A')
-        age_hours = token_info.get('age_hours', 'N/A')
-        age_str = f"{age_hours:.1f}h" if isinstance(age_hours, (int, float)) else age_hours
-        liquidity = token_info.get('liquidity', 0)
-        source = data.get('source', 'N/A')
-        message += f"{i}. `{addr}`\n   📛 {symbol} | ⏰ {age_str} | 💰 ${liquidity:,.0f} | 📡 {source}\n"
-    await update.message.reply_text(message, parse_mode='Markdown')
 
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not watchlist:
         await update.message.reply_text("🏆 Watchlist vacía")
         return
+    
+    # Ordenar por más recientes
+    sorted_watchlist = sorted(watchlist.items(), key=lambda x: x[1].get('approved_at', 0), reverse=True)
+    
     message = f"🏆 *Tokens Aprobados ({len(watchlist)}):*\n\n"
-    for i, (addr, data) in enumerate(list(watchlist.items())[-15:][::-1], 1):
-        liq = data.get('liquidity', 0)
+    for i, (addr, data) in enumerate(list(sorted_watchlist)[:15], 1):
+        liq = data.get('token_info', {}).get('liquidity', 0)
         token_info = data.get('token_info', {})
         symbol = token_info.get('symbol', 'N/A')
         age_hours = token_info.get('age_hours', 'N/A')
         age_str = f"{age_hours:.1f}h" if isinstance(age_hours, (int, float)) else age_hours
-        price_change = data.get('price_change_24h', 0)
         source = token_info.get('source', 'N/A')
-        message += f"{i}. `{addr}`\n   📛 {symbol} | 💰 ${liq:,.0f} | ⏰ {age_str} | 📈 {price_change}% | 📡 {source}\n"
+        message += f"{i}. `{addr}`\n   📛 {symbol} | 💰 ${liq:,.0f} | ⏰ {age_str} | 📡 {source}\n"
+    
     await update.message.reply_text(message, parse_mode='Markdown')
 
 # -------------------- MAIN --------------------
@@ -652,10 +566,9 @@ def main():
     application.add_handler(CommandHandler("cazar", hunt_command))
     application.add_handler(CommandHandler("parar", stop_command))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("incubadora", incubator_command))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
 
-    logger.info("--- Bot Híbrido (Jupiter V2 + DexScreener) listo ---")
+    logger.info("--- Bot Mejorado (SIN DexScreener) - Tokens Recientes listo ---")
     
     try:
         application.run_polling(drop_pending_updates=True)
