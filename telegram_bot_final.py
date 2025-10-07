@@ -1,3 +1,5 @@
+[file name]: telegram_bot_final11.py
+[file content begin]
 import asyncio
 import json
 import time
@@ -37,8 +39,8 @@ HEADERS = {
 
 # FILTROS MÁS ESTRICTOS - MODIFICADOS
 MIN_LIQUIDITY = 10000  # $10,000 mínimo - MODIFICADO
-MAX_AGE_HOURS = 1      # 1 hora máximo - MODIFICADO
-MIN_AGE_HOURS = 0.166  # Mínimo 0.166 horas (10 minutos) - MODIFICADO
+MAX_AGE_HOURS = 0.6667     # 40 minutos máximo (40/60 ≈ 0.6667h) - MODIFICADO
+MIN_AGE_HOURS = 0.1167    # Mínimo 7 minutos (7/60 ≈ 0.1167h) - MODIFICADO
 
 # Estructuras en memoria
 incubator: Dict[str, Dict[str, Any]] = {}
@@ -577,3 +579,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+[file content end]
