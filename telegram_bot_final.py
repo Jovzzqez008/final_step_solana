@@ -1,5 +1,3 @@
-[file name]: telegram_bot_final11.py
-[file content begin]
 import asyncio
 import json
 import time
@@ -579,4 +577,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-[file content end]
