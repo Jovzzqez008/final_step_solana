@@ -35,10 +35,10 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# FILTROS MÁS ESTRICTOS - MODIFICADOS PARA TOKENS RECIÉN NACIDOS
-MIN_LIQUIDITY = 10000  # $10,000 mínimo - MODIFICADO
-MAX_AGE_HOURS = 2      # 2 horas máximo - MODIFICADO
-MIN_AGE_MINUTES = 1    # Mínimo 1 minuto - MODIFICADO (para tokens recién nacidos)
+# FILTROS MÁS ESTRICTOS - MODIFICADOS PARA TOKENS ENTRE 10min Y 1h
+MIN_LIQUIDITY = 10000  # $10,000 mínimo
+MIN_AGE_MINUTES = 10   # Mínimo 10 minutos - MODIFICADO
+MAX_AGE_HOURS = 1      # 1 hora máximo - MODIFICADO
 MIN_AGE_HOURS = MIN_AGE_MINUTES / 60  # Convertir a horas
 
 # Estructuras en memoria
@@ -418,7 +418,7 @@ async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
                         source = token.get('source', 'N/A')
                         
                         message = (
-                            f"🎯 *TOKEN RECIÉN NACIDO DETECTADO* 🎯\n\n"
+                            f"🎯 *TOKEN RECIENTE DETECTADO* 🎯\n\n"
                             f"*Symbol:* {symbol}\n"
                             f"*Name:* {name}\n"
                             f"*Address:* `{address}`\n"
@@ -494,7 +494,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_CHAT_ID
     TARGET_CHAT_ID = update.message.chat_id
     await update.message.reply_text(
-        "🚀 *Bot Mejorado - Tokens Recién Nacidos*\n\n"
+        "🚀 *Bot Mejorado - Tokens Recientes*\n\n"
         f"🎯 *Objetivo:* Tokens de {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez\n"
         "🔍 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
         "⚡ *Detección directa sin verificaciones externas*\n"
@@ -579,7 +579,7 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
 
-    logger.info("--- Bot Mejorado (SIN DexScreener) - Tokens Recién Nacidos listo ---")
+    logger.info("--- Bot Mejorado (SIN DexScreener) - Tokens Recientes listo ---")
     
     try:
         application.run_polling(drop_pending_updates=True)
