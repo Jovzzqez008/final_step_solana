@@ -36,9 +36,9 @@ HEADERS = {
 }
 
 # FILTROS MÁS ESTRICTOS - MODIFICADOS
-MIN_LIQUIDITY = 10000  # $10,000 mínimo - MODIFICADO
-MAX_AGE_HOURS = 0.1667     # 10 minutos máximo (10/60 ≈ 0.1667h) - MODIFICADO
-MIN_AGE_HOURS = 0.0833    # Mínimo 5 minutos (5/60 ≈ 0.0833h) - MODIFICADO
+MIN_LIQUIDITY = 15000  # $15,000 mínimo - MODIFICADO
+MAX_AGE_HOURS = 0.3333     # 20 minutos máximo (20/60 ≈ 0.3333h) - MODIFICADO
+MIN_AGE_HOURS = 0.0167    # Mínimo 1 minuto (1/60 ≈ 0.0167h) - MODIFICADO
 
 # Estructuras en memoria
 incubator: Dict[str, Dict[str, Any]] = {}
@@ -577,4 +577,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
