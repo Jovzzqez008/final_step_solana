@@ -35,10 +35,11 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# FILTROS MÁS ESTRICTOS - MODIFICADOS
-MIN_LIQUIDITY = 22000  # $22,000 mínimo - MODIFICADO
-MAX_AGE_HOURS = 11     # 11 horas máximo - MODIFICADO
-MIN_AGE_HOURS = 0.1    # Mínimo 0.1 horas (6 minutos) - MODIFICADO
+# FILTROS MÁS ESTRICTOS - MODIFICADOS PARA TOKENS RECIÉN NACIDOS
+MIN_LIQUIDITY = 10000  # $10,000 mínimo - MODIFICADO
+MAX_AGE_HOURS = 2      # 2 horas máximo - MODIFICADO
+MIN_AGE_MINUTES = 1    # Mínimo 1 minuto - MODIFICADO (para tokens recién nacidos)
+MIN_AGE_HOURS = MIN_AGE_MINUTES / 60  # Convertir a horas
 
 # Estructuras en memoria
 incubator: Dict[str, Dict[str, Any]] = {}
@@ -144,6 +145,16 @@ def is_token_in_age_range(age_hours: float) -> bool:
         return False
     return MIN_AGE_HOURS <= age_hours <= MAX_AGE_HOURS
 
+def format_age_display(age_hours: float) -> str:
+    """Formatea la edad para mostrar en minutos/horas según corresponda"""
+    if age_hours is None:
+        return "N/A"
+    if age_hours < 1:
+        minutes = age_hours * 60
+        return f"{minutes:.0f}min"
+    else:
+        return f"{age_hours:.1f}h"
+
 # -------------------- GECKOTERMINAL - FUENTE PRINCIPAL --------------------
 async def get_geckoterminal_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
     """Obtiene pools nuevos de GeckoTerminal - MÁS CONFIABLE"""
@@ -199,7 +210,7 @@ async def get_geckoterminal_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
                     logger.debug(f"Error procesando pool de GeckoTerminal: {e}")
                     continue
             
-            logger.info(f"[GECKO TERMINAL] Tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
+            logger.info(f"[GECKO TERMINAL] Tokens en rango {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
             return processed_tokens
             
         else:
@@ -253,7 +264,7 @@ async def get_jupiter_recent_tokens_improved(client: httpx.AsyncClient) -> List[
                         'source': 'jupiter_v2_recent'
                     })
             
-            logger.info(f"[JUPITER V2 RECENT] Tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
+            logger.info(f"[JUPITER V2 RECENT] Tokens en rango {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
             return processed_tokens
         else:
             logger.warning(f"Jupiter V2 recent responded {res.status_code}")
@@ -303,7 +314,7 @@ async def get_jupiter_trending_tokens_improved(client: httpx.AsyncClient) -> Lis
                         'source': 'jupiter_v2_trending'
                     })
             
-            logger.info(f"[JUPITER V2 TRENDING] Tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
+            logger.info(f"[JUPITER V2 TRENDING] Tokens en rango {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,}: {len(processed_tokens)}")
             return processed_tokens
         else:
             logger.warning(f"Jupiter V2 trending responded {res.status_code}")
@@ -336,17 +347,17 @@ async def get_all_tokens_combined(client: httpx.AsyncClient) -> List[Dict]:
         if addr and addr not in unique_tokens:
             unique_tokens[addr] = token
     
-    logger.info(f"🎯 TOTAL tokens únicos ({MIN_AGE_HOURS}-{MAX_AGE_HOURS}h, ≥${MIN_LIQUIDITY:,}): {len(unique_tokens)}")
+    logger.info(f"🎯 TOTAL tokens únicos ({MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h, ≥${MIN_LIQUIDITY:,}): {len(unique_tokens)}")
     
     # Mostrar ejemplos para debugging
     if unique_tokens:
         sample_tokens = list(unique_tokens.values())[:3]
         logger.info("📋 Ejemplos de tokens encontrados:")
         for token in sample_tokens:
-            age_info = f"{token.get('age_hours', 'N/A'):.1f}h" if token.get('age_hours') else 'edad N/A'
+            age_display = format_age_display(token.get('age_hours'))
             liq = token.get('liquidity', 0)
             source = token.get('source', 'desconocido')
-            logger.info(f"  - {token['symbol']}: {age_info}, ${liq:,.0f} liquidez, {source}")
+            logger.info(f"  - {token['symbol']}: {age_display}, ${liq:,.0f} liquidez, {source}")
     
     return list(unique_tokens.values())
 
@@ -374,7 +385,7 @@ async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
                 tokens = await get_all_tokens_combined(client)
                 
                 if not tokens:
-                    logger.info(f"[RADAR] No tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez")
+                    logger.info(f"[RADAR] No tokens en rango {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez")
                 else:
                     approved_count = 0
                     for token in tokens:
@@ -402,12 +413,12 @@ async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
                         symbol = token.get('symbol', 'N/A')
                         name = token.get('name', 'N/A')
                         age_hours = token.get('age_hours', 'N/A')
-                        age_str = f"{age_hours:.1f}h" if isinstance(age_hours, (int, float)) else age_hours
+                        age_str = format_age_display(age_hours)
                         liquidity = token.get('liquidity', 0)
                         source = token.get('source', 'N/A')
                         
                         message = (
-                            f"🎯 *TOKEN RECIENTE DETECTADO* 🎯\n\n"
+                            f"🎯 *TOKEN RECIÉN NACIDO DETECTADO* 🎯\n\n"
                             f"*Symbol:* {symbol}\n"
                             f"*Name:* {name}\n"
                             f"*Address:* `{address}`\n"
@@ -440,7 +451,7 @@ async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
                     if approved_count > 0 and TARGET_CHAT_ID:
                         await context.bot.send_message(
                             chat_id=TARGET_CHAT_ID,
-                            text=f"📊 *Resumen radar:* {approved_count} tokens nuevos ({MIN_AGE_HOURS}-{MAX_AGE_HOURS}h, ≥${MIN_LIQUIDITY:,})",
+                            text=f"📊 *Resumen radar:* {approved_count} tokens nuevos ({MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h, ≥${MIN_LIQUIDITY:,})",
                             parse_mode='Markdown'
                         )
                 
@@ -483,8 +494,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_CHAT_ID
     TARGET_CHAT_ID = update.message.chat_id
     await update.message.reply_text(
-        "🚀 *Bot Mejorado - Tokens Recientes*\n\n"
-        f"🎯 *Objetivo:* Tokens de {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez\n"
+        "🚀 *Bot Mejorado - Tokens Recién Nacidos*\n\n"
+        f"🎯 *Objetivo:* Tokens de {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h con ≥${MIN_LIQUIDITY:,} liquidez\n"
         "🔍 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
         "⚡ *Detección directa sin verificaciones externas*\n"
         "⏰ *Búsqueda cada 1 minuto*\n\n"
@@ -528,7 +539,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_msg = (
             f"✅ *Radar Combinado Activo*\n\n"
             f"🏆 *Watchlist:* {len(watchlist)} tokens\n"
-            f"🔍 *Buscando:* Tokens {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,} liquidez\n"
+            f"🔍 *Buscando:* Tokens {MIN_AGE_MINUTES}min-{MAX_AGE_HOURS}h + ≥${MIN_LIQUIDITY:,} liquidez\n"
             f"📡 *Fuentes:* Jupiter V2 + GeckoTerminal\n"
             f"⚡ *Sin DexScreener*"
         )
@@ -548,7 +559,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_info = data.get('token_info', {})
         symbol = token_info.get('symbol', 'N/A')
         age_hours = token_info.get('age_hours', 'N/A')
-        age_str = f"{age_hours:.1f}h" if isinstance(age_hours, (int, float)) else age_hours
+        age_str = format_age_display(age_hours)
         source = token_info.get('source', 'N/A')
         message += f"{i}. `{addr}`\n   📛 {symbol} | 💰 ${liq:,.0f} | ⏰ {age_str} | 📡 {source}\n"
     
@@ -568,7 +579,7 @@ def main():
     application.add_handler(CommandHandler("status", status_command))
     application.add_handler(CommandHandler("watchlist", watchlist_command))
 
-    logger.info("--- Bot Mejorado (SIN DexScreener) - Tokens Recientes listo ---")
+    logger.info("--- Bot Mejorado (SIN DexScreener) - Tokens Recién Nacidos listo ---")
     
     try:
         application.run_polling(drop_pending_updates=True)
