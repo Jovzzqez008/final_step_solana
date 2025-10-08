@@ -1,3 +1,4 @@
+# bot_antirug_completo.py - VERSIÓN COMPLETA Y FUNCIONAL
 import asyncio, json, os, time, logging, aiohttp
 from statistics import pstdev, mean
 from datetime import datetime, timedelta
@@ -17,14 +18,14 @@ MIN_HOLDERS = 100                 # Mínimo de holders
 MAX_TAX_BUY = 5.0                 # Máximo 5% de tax en compra
 MAX_TAX_SELL = 5.0                # Máximo 5% de tax en venta
 MIN_MARKET_CAP = 100000.0         # Market cap mínimo
-FLAT_STD_THRESHOLD = 0.1          # Más estricto para "plano"
-BREAKOUT_STEP = 20.0              # Breakout más significativo
+FLAT_STD_THRESHOLD = 0.2          # Más estricto para "plano"
+BREAKOUT_STEP = 15.0              # Breakout más significativo
 UPDATE_INTERVAL = 30              # Más lento para mejor análisis
 
 # APIs
 JUPITER_TOKENS_API = "https://api.jup.ag/tokens/v1/all"
 DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
-BIRDEYE_API = "https://public-api.birdeye.so/public"  # Para datos adicionales
+BIRDEYE_API = "https://public-api.birdeye.so/public"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("antirug_bot")
@@ -48,12 +49,11 @@ class SecurityAPI:
     async def get_session(self):
         if not self.session:
             self.session = aiohttp.ClientSession()
-        return self_session
+        return self.session
     
     async def get_token_security_data(self, token_address: str):
         """Obtiene datos de seguridad del token"""
         try:
-            # Primero, datos básicos de DexScreener
             session = await self.get_session()
             url = f"{DEXSCREENER_API}/tokens/{token_address}"
             
@@ -93,11 +93,6 @@ class SecurityAPI:
                             'valid': True
                         }
                         
-                        # Intentar obtener más datos de seguridad
-                        security_info = await self.get_additional_security_info(token_address)
-                        if security_info:
-                            token_data.update(security_info)
-                        
                         return token_data
             return None
         except Exception as e:
@@ -110,62 +105,12 @@ class SecurityAPI:
             return None
             
         try:
-            # Convertir timestamp a horas de antigüedad
-            created_timestamp = pair_created_at / 1000  # DexScreener usa milliseconds
+            created_timestamp = pair_created_at / 1000
             current_time = time.time()
             age_hours = (current_time - created_timestamp) / 3600
             return age_hours
         except:
             return None
-    
-    async def get_additional_security_info(self, token_address: str):
-        """Obtiene información adicional de seguridad"""
-        try:
-            session = await self.get_session()
-            
-            # Intentar con Birdeye para más datos (opcional)
-            if self.birdeye_api_key:
-                headers = {"X-API-KEY": self.birdeye_api_key}
-                url = f"{BIRDEYE_API}/token/{token_address}?chain=solana"
-                
-                async with session.get(url, headers=headers, timeout=8) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get('data'):
-                            return {
-                                'holders': data['data'].get('holder', 0),
-                                'security_score': self.calculate_security_score(data['data'])
-                            }
-            
-            return {}
-        except Exception as e:
-            logger.debug(f"Error info adicional {token_address}: {e}")
-            return {}
-    
-    def calculate_security_score(self, token_data):
-        """Calcula puntuación de seguridad basada en múltiples factores"""
-        score = 50  # Puntuación base
-        
-        # Factor: Liquidez vs FDV
-        liquidity = token_data.get('liquidity', 0)
-        fdv = token_data.get('fdv', 1)
-        liquidity_ratio = liquidity / fdv if fdv > 0 else 0
-        
-        if liquidity_ratio > 0.1:
-            score += 20
-        elif liquidity_ratio > 0.05:
-            score += 10
-        elif liquidity_ratio < 0.01:
-            score -= 20
-        
-        # Factor: Volumen sostenido
-        volume = token_data.get('volume24h', 0)
-        if volume > 100000:
-            score += 15
-        elif volume < 10000:
-            score -= 10
-            
-        return min(100, max(0, score))
 
 security_api = SecurityAPI()
 
@@ -180,25 +125,25 @@ async def get_jupiter_tokens_safe():
                 
                 # Filtrar tokens con símbolos sospechosos
                 safe_tokens = []
+                suspicious_keywords = [
+                    'TEST', 'FAKE', 'SCAM', 'RUG', 'PULL', 'DUMP', 
+                    'SHIT', 'MEME', 'MOON', 'SHIB', 'DOGE', 'ELON', 
+                    'TSUKI', 'AKITA', 'HUSKY', 'FLOKI', 'PEPE', 'WOJAK'
+                ]
+                
                 for token in tokens:
                     symbol = token.get('symbol', '').upper()
                     name = token.get('name', '').upper()
                     
                     # 🚨 FILTRO DE SÍMBOLOS/NOMBRES SOSPECHOSOS
-                    suspicious_indicators = [
-                        'TEST', 'FAKE', 'SCAM', 'RUG', 'PULL', 
-                        'DUMP', 'SHIT', 'MEME', 'MOON', 'SHIB', 
-                        'DOGE', 'ELON', 'TSUKI', 'AKITA', 'HUSKY'
-                    ]
-                    
-                    is_suspicious = any(indicator in symbol or indicator in name 
-                                      for indicator in suspicious_indicators)
+                    is_suspicious = any(keyword in symbol or keyword in name 
+                                      for keyword in suspicious_keywords)
                     
                     if not is_suspicious:
                         safe_tokens.append(token)
                 
                 logger.info(f"🛡️ Filtrados {len(tokens) - len(safe_tokens)} tokens sospechosos")
-                return safe_tokens
+                return safe_tokens[:150]  # Limitar a 150 tokens
         return []
     except Exception as e:
         logger.error(f"Error obteniendo tokens seguros: {e}")
@@ -212,12 +157,10 @@ async def initialize_safe_token_list():
             logger.error("❌ No se pudieron obtener tokens seguros")
             return []
         
-        # Tomar tokens limitados para análisis profundo
         safe_tokens = []
-        for token in tokens[:100]:  # Solo 100 para análisis detallado
+        for token in tokens:
             addr = token.get('address')
             if addr and addr not in monitored_tokens and addr not in blacklisted_tokens:
-                # Verificar seguridad antes de añadir
                 token_data = await security_api.get_token_security_data(addr)
                 if token_data and token_data.get('valid'):
                     safe_tokens.append(addr)
@@ -226,7 +169,6 @@ async def initialize_safe_token_list():
                     blacklisted_tokens.add(addr)
         
         logger.info(f"🛡️ Inicializados {len(safe_tokens)} tokens SEGUROS")
-        logger.info(f"🚫 Blacklisted {len(blacklisted_tokens)} tokens")
         return safe_tokens
         
     except Exception as e:
@@ -236,7 +178,7 @@ async def initialize_safe_token_list():
 # ===================== ANÁLISIS TÉCNICO SEGURO =====================
 def is_flat_safe(hist):
     """Detección MUY estricta de tokens planos"""
-    if len(hist) < 8:  # Más muestras requeridas
+    if len(hist) < 8:
         return False
         
     prices = [point["price"] for point in hist if point["price"] > 0]
@@ -252,14 +194,13 @@ def is_flat_safe(hist):
     if not returns:
         return False
         
-    # 🛡️ CRITERIOS MÁS ESTRICTOS
     sd = pstdev(returns) if len(returns) > 1 else 100
     max_move = max(abs(x) for x in returns) if returns else 100
     avg_move = mean([abs(x) for x in returns]) if returns else 100
     
     return (sd < FLAT_STD_THRESHOLD and 
-            max_move < 0.5 and  # Movimiento máximo muy pequeño
-            avg_move < 0.2)     # Movimiento promedio muy pequeño
+            max_move < 0.5 and
+            avg_move < 0.2)
 
 # ===================== MONITOREO SEGURO =====================
 async def monitor_safe_tokens(context: ContextTypes.DEFAULT_TYPE):
@@ -292,7 +233,8 @@ async def monitor_safe_tokens(context: ContextTypes.DEFAULT_TYPE):
                 token_data = await security_api.get_token_security_data(token_addr)
                 if not token_data or not token_data.get('valid'):
                     blacklisted_tokens.add(token_addr)
-                    tokens_to_monitor.remove(token_addr)
+                    if token_addr in tokens_to_monitor:
+                        tokens_to_monitor.remove(token_addr)
                     threats_detected += 1
                     continue
                 
@@ -301,7 +243,7 @@ async def monitor_safe_tokens(context: ContextTypes.DEFAULT_TYPE):
                 if result:
                     processed += 1
                 
-                await asyncio.sleep(0.2)  # Más lento para no saturar
+                await asyncio.sleep(0.2)
             
             # Reporte de seguridad
             if iteration % 5 == 0:
@@ -346,9 +288,7 @@ async def process_safe_token(token_addr: str, token_data: dict, context: Context
             if len(watchlist) > 80:
                 watchlist.pop(0)
         
-        result = {'processed': True}
-        
-        # Detectar tokens planos (más estricto)
+        # Detectar tokens planos
         if token_addr not in flat_tokens and is_flat_safe(hist):
             flat_tokens[token_addr] = {
                 "first_price": current_price,
@@ -356,13 +296,11 @@ async def process_safe_token(token_addr: str, token_data: dict, context: Context
                 "max_alert": 0,
                 "volume": token_data.get('volume24h', 0),
                 "liquidity": token_data.get('liquidity', 0),
-                "age_hours": token_data.get('age_hours', 0),
-                "security_score": token_data.get('security_score', 50)
+                "age_hours": token_data.get('age_hours', 0)
             }
             logger.info(f"🛡️ TOKEN PLANO SEGURO: {token_addr[:8]}...")
-            result['flat_detected'] = True
         
-        # Detectar breakout (más estricto)
+        # Detectar breakout
         if token_addr in flat_tokens:
             base_price = flat_tokens[token_addr]["first_price"]
             if base_price > 0:
@@ -376,9 +314,8 @@ async def process_safe_token(token_addr: str, token_data: dict, context: Context
                         flat_tokens[token_addr]["max_alert"] = current_pct
                         await send_safe_breakout_alert(context, token_addr, current_pct, token_data)
                         logger.info(f"🚀 BREAKOUT SEGURO: {token_addr[:8]}... +{current_pct:.1f}%")
-                        result['breakout'] = True
         
-        return result
+        return {'processed': True}
         
     except Exception as e:
         logger.debug(f"Error procesando token seguro {token_addr}: {e}")
@@ -390,14 +327,13 @@ async def send_safe_breakout_alert(context, token_addr, breakout_pct, token_data
     try:
         short_addr = token_addr[:8] + "..." + token_addr[-6:]
         age_hours = token_data.get('age_hours', 0)
-        security_score = token_data.get('security_score', 50)
         
-        # Evaluación de riesgo basada en múltiples factores
+        # Evaluación de riesgo
         risk_level = "🟢 BAJO"
-        if security_score < 40:
-            risk_level = "🔴 ALTO"
-        elif security_score < 60:
+        if age_hours < 48:
             risk_level = "🟡 MEDIO"
+        if age_hours < 24:
+            risk_level = "🔴 ALTO"
         
         emoji = "🚀" if breakout_pct > 25 else "📈" if breakout_pct > 15 else "🔼"
         
@@ -409,7 +345,6 @@ async def send_safe_breakout_alert(context, token_addr, breakout_pct, token_data
             f"*Volumen 24h:* ${token_data['volume24h']:,.0f}\n"
             f"*Liquidez:* ${token_data['liquidity']:,.0f}\n"
             f"*Edad aprox.:* {age_hours:.1f} horas\n"
-            f"*Puntuación seguridad:* {security_score}/100\n"
             f"*Nivel de Riesgo:* {risk_level}\n\n"
             f"✅ *Filtros pasados:*\n"
             f"• Volumen > ${MIN_VOLUME_USD:,.0f}\n"
@@ -434,7 +369,7 @@ async def send_safe_breakout_alert(context, token_addr, breakout_pct, token_data
     except Exception as e:
         logger.error(f"Error enviando alerta segura: {e}")
 
-# ===================== COMANDOS SEGURIDAD =====================
+# ===================== COMANDOS TELEGRAM =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global TARGET_CHAT_ID
     TARGET_CHAT_ID = update.effective_chat.id
@@ -449,6 +384,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Breakout mínimo: +{BREAKOUT_STEP}%\n\n"
         "🚫 *Bloquea automáticamente:*\n"
         "• Tokens sospechosos (TEST, FAKE, SCAM...)\n"
+        "• Meme coins (DOGE, SHIB, ELON, PEPE...)\n"
         "• Tokens muy nuevos (<24h)\n"
         "• Tokens con poca liquidez/volumen\n\n"
         "📊 *Comandos:*\n"
@@ -462,6 +398,96 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     await update.message.reply_text(welcome_msg, parse_mode="Markdown")
+
+async def cmd_cazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el monitoreo seguro"""
+    global bot_active
+    if bot_active:
+        await update.message.reply_text("⚙️ Ya está monitoreando tokens seguros.")
+        return
+    
+    bot_active = True
+    await update.message.reply_text(
+        "🎯 *INICIANDO MONITOREO SEGURO*\n\n"
+        "🛡️ Cargando tokens con filtros de seguridad...\n"
+        "🔍 Aplicando filtros anti-rug pull...\n"
+        "📊 Verificando volumen, liquidez y antigüedad...\n"
+        "⏰ Monitoreo activo cada 30 segundos\n\n"
+        "_Buscando oportunidades SEGURAS..._",
+        parse_mode="Markdown"
+    )
+    
+    # Iniciar monitoreo seguro
+    asyncio.create_task(monitor_safe_tokens(context))
+
+async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detiene el monitoreo"""
+    global bot_active
+    bot_active = False
+    await update.message.reply_text(
+        "🛑 *MONITOREO DETENIDO*\n\n"
+        "El bot ha dejado de buscar nuevas señales.\n"
+        "Usa /cazar para reiniciar el monitoreo seguro.",
+        parse_mode="Markdown"
+    )
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Estado con foco en seguridad"""
+    status_msg = (
+        f"🛡️ *ESTADO DE SEGURIDAD*\n\n"
+        f"🔧 Monitoreo: {'🟢 ACTIVO' if bot_active else '🔴 DETENIDO'}\n"
+        f"✅ Tokens seguros: {len(monitored_tokens)}\n"
+        f"🚫 Tokens bloqueados: {len(blacklisted_tokens)}\n"
+        f"📊 Tokens planos seguros: {len(flat_tokens)}\n"
+        f"📈 Breakouts detectados: {sum(1 for t in flat_tokens.values() if t['max_alert'] > 0)}\n"
+        f"📞 Requests API: {security_api.request_count}\n\n"
+        f"💡 _Sistema anti-rug pulls ACTIVADO_"
+    )
+    await update.message.reply_text(status_msg, parse_mode="Markdown")
+
+async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra tokens monitoreados"""
+    if not monitored_tokens:
+        await update.message.reply_text("📭 No hay tokens en monitoreo seguro.")
+        return
+        
+    msg = "👁️ *Tokens en Monitoreo Seguro:*\n\n"
+    tokens_list = list(monitored_tokens)[:15]
+    
+    for i, addr in enumerate(tokens_list, 1):
+        short_addr = addr[:8] + "..." + addr[-6:]
+        status = "📊" if addr in flat_tokens else "🔍"
+        hist_len = len(price_histories.get(addr, []))
+        msg += f"{i}. `{short_addr}` {status} ({hist_len} datos)\n"
+    
+    if len(monitored_tokens) > 15:
+        msg += f"\n... y {len(monitored_tokens) - 15} más"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def cmd_planos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra tokens planos detectados"""
+    if not flat_tokens:
+        await update.message.reply_text("📊 No hay tokens planos detectados todavía.")
+        return
+        
+    msg = "📊 *Tokens Planos SEGUROS Detectados:*\n\n"
+    for i, (addr, info) in enumerate(list(flat_tokens.items())[:10], 1):
+        short_addr = addr[:8] + "..." + addr[-6:]
+        since = datetime.fromtimestamp(info["flat_since"]).strftime("%H:%M")
+        samples = len(price_histories.get(addr, []))
+        alert_pct = info.get("max_alert", 0)
+        age = info.get("age_hours", 0)
+        
+        if alert_pct > 0:
+            status = f"🚀 +{alert_pct:.1f}%"
+        else:
+            flat_duration = (time.time() - info["flat_since"]) / 60
+            status = f"⏳ {flat_duration:.0f}min"
+            
+        msg += f"{i}. `{short_addr}`\n   ⏰ {since} | 📈 {status} | 🕐 {age:.1f}h | 📊 {samples} datos\n\n"
+    
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Muestra tokens bloqueados por seguridad"""
@@ -479,25 +505,33 @@ async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(blacklisted_tokens) > 15:
         msg += f"\n... y {len(blacklisted_tokens) - 15} más bloqueados"
     
+    msg += "\n💡 _Estos tokens no pasaron los filtros de seguridad_"
+    
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estado con foco en seguridad"""
-    avg_security = 0
-    if flat_tokens:
-        avg_security = sum(t.get('security_score', 50) for t in flat_tokens.values()) / len(flat_tokens)
-    
-    status_msg = (
-        f"🛡️ *ESTADO DE SEGURIDAD*\n\n"
-        f"🔧 Monitoreo: {'🟢 ACTIVO' if bot_active else '🔴 DETENIDO'}\n"
-        f"✅ Tokens seguros: {len(monitored_tokens)}\n"
-        f"🚫 Tokens bloqueados: {len(blacklisted_tokens)}\n"
-        f"📊 Tokens planos seguros: {len(flat_tokens)}\n"
-        f"📈 Breakouts detectados: {sum(1 for t in flat_tokens.values() if t['max_alert'] > 0)}\n"
-        f"🎯 Puntuación seguridad avg: {avg_security:.1f}/100\n\n"
-        f"💡 _Sistema anti-rug pulls ACTIVADO_"
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra configuración actual"""
+    config_msg = (
+        f"⚙️ *CONFIGURACIÓN DE SEGURIDAD*\n\n"
+        f"**Filtros Principales:**\n"
+        f"• Volumen mínimo: ${MIN_VOLUME_USD:,.0f}\n"
+        f"• Liquidez mínima: ${MIN_LIQUIDITY:,.0f}\n"
+        f"• Antigüedad mínima: {MIN_AGE_HOURS} horas\n"
+        f"• Market cap mínimo: ${MIN_MARKET_CAP:,.0f}\n\n"
+        f"**Detección Técnica:**\n"
+        f"• Breakout mínimo: +{BREAKOUT_STEP}%\n"
+        f"• Volatilidad máxima: {FLAT_STD_THRESHOLD}%\n"
+        f"• Mínimo muestras: 8 datos\n\n"
+        f"**Bloqueos Automáticos:**\n"
+        f"• Meme coins (DOGE, SHIB, PEPE...)\n"
+        f"• Nombres sospechosos\n"
+        f"• Tokens muy nuevos\n\n"
+        f"**Rendimiento:**\n"
+        f"• Intervalo: {UPDATE_INTERVAL} segundos\n"
+        f"• Máximo tokens: 150\n"
+        f"• Historial: 30 muestras"
     )
-    await update.message.reply_text(status_msg, parse_mode="Markdown")
+    await update.message.reply_text(config_msg, parse_mode="Markdown")
 
 # ===================== MAIN SEGURO =====================
 def main():
@@ -507,6 +541,7 @@ def main():
         
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
+    # Registrar TODOS los comandos necesarios
     commands = [
         ("start", cmd_start),
         ("cazar", cmd_cazar),
