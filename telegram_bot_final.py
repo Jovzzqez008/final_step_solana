@@ -58,6 +58,9 @@ INCUBATOR_CHECK_INTERVAL = 60 * 60 * 4  # 4 horas
 WATCHLIST_CHECK_INTERVAL = 60 * 60 * 4  # 4 horas
 RADAR_LOOP_INTERVAL = 60  # 1 minuto entre búsquedas combinadas (ajustable)
 
+# Tiempo entre revisión de cada token (8 segundos)
+TOKEN_CHECK_DELAY = 8
+
 # Elección de criterio: usar liquidity, marketcap, o ambos (combinación lógica)
 # Opciones:
 #   "liquidity_only", "marketcap_only", "either" (liquidity OR marketcap),
@@ -473,6 +476,9 @@ async def incubator_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.debug(f"Error procesando incubator token {addr}: {e}")
                         continue
+                    finally:
+                        # Espera 8 segundos entre cada token
+                        await asyncio.sleep(TOKEN_CHECK_DELAY)
 
                 if moved > 0:
                     logger.info(f"🟢 Movidos a watchlist: {moved}")
@@ -548,6 +554,9 @@ async def watchlist_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         logger.debug(f"Error watchlist monitor {addr}: {e}")
                         continue
+                    finally:
+                        # Espera 8 segundos entre cada token
+                        await asyncio.sleep(TOKEN_CHECK_DELAY)
 
                 if removals > 0:
                     logger.info(f"🧹 Remove from watchlist: {removals}")
@@ -566,7 +575,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"🎯 *Edad buscada:* {MIN_AGE_HOURS} a {MAX_AGE_HOURS} horas\n"
         f"💧 *Liquidez mínima para incubadora:* ${MIN_LIQUIDITY:,}\n"
         f"🟡 *Incubadora -> Watchlist:* Liquidez ≥ ${WATCHLIST_LIQUIDITY_THRESHOLD:,} (o marketcap según configuración)\n"
-        "🔁 *Monitoreo incubadora/watchlist cada 4 horas*\n\n"
+        "🔁 *Monitoreo incubadora/watchlist cada 4 horas*\n"
+        f"⏰ *Delay entre tokens:* {TOKEN_CHECK_DELAY} segundos\n\n"
         "*/cazar* - Iniciar monitoreo\n"
         "*/parar* - Detener\n"
         "*/status* - Estado actual\n"
@@ -614,6 +624,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏆 *Watchlist:* {len(watchlist)} tokens\n"
             f"🔍 *Edad buscada:* {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h\n"
             f"⚖️ *Criterio:* {CRITERIA_MODE}\n"
+            f"⏰ *Delay entre tokens:* {TOKEN_CHECK_DELAY} segundos\n"
         )
     await update.message.reply_text(status_msg, parse_mode='Markdown')
 
