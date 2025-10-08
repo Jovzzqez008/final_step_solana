@@ -1,7 +1,5 @@
-# bot_corregido.py - VERSIÓN QUE SÍ DETECTA TOKENS
+# bot_diagnostico_completo.py
 import asyncio, json, os, time, logging, aiohttp
-from statistics import pstdev, mean
-from datetime import datetime, timedelta
 import websockets
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -11,379 +9,271 @@ from collections import defaultdict, deque
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-DEXSCREENER_API = os.getenv("DEXSCREENER_API", "https://api.dexscreener.com/latest/dex")
-
-# Parámetros optimizados
-FLAT_STD_THRESHOLD = 0.2
-BREAKOUT_STEP = 12.0
-MIN_VOLUME_USD = 10000.0
-MIN_LIQUIDITY = 5000.0
-MIN_SAMPLES = 6
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("breakout_bot_fixed")
+logger = logging.getLogger("diagnostico_completo")
 
-# ===================== ESTADO =====================
-price_histories = defaultdict(lambda: deque(maxlen=30))
-flat_tokens = {}
-watchlist = []
-token_metadata = {}
-bot_active = False
+# Variables de diagnóstico
+message_count = 0
+transaction_count = 0
+token_count = 0
 
-# ===================== API CLIENT MEJORADO =====================
-class PriceAPI:
-    def __init__(self):
-        self.session = None
-        self.request_count = 0
-        
-    async def get_session(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        return self.session
+async def helius_monitor_diagnostico(context: ContextTypes.DEFAULT_TYPE):
+    """Monitor de diagnóstico que muestra TODO lo que recibe"""
+    global message_count, transaction_count, token_count
     
-    async def get_token_price(self, token_address: str):
-        """Obtiene precio REAL desde DexScreener"""
-        try:
-            self.request_count += 1
-            session = await self.get_session()
-            url = f"{DEXSCREENER_API}/tokens/{token_address}"
-            
-            async with session.get(url, timeout=8) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if data.get('pairs') and len(data['pairs']) > 0:
-                        pair = data['pairs'][0]
-                        
-                        # Validar que el token sea real y tenga datos
-                        price = float(pair.get('priceUsd', 0))
-                        volume = float(pair.get('volume', {}).get('h24', 0))
-                        liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                        
-                        # Solo retornar si es un token válido
-                        if price > 0 and volume >= MIN_VOLUME_USD and liquidity >= MIN_LIQUIDITY:
-                            return {
-                                'price': price,
-                                'volume24h': volume,
-                                'liquidity': liquidity,
-                                'price_change24h': float(pair.get('priceChange', {}).get('h24', 0)),
-                                'dex': pair.get('dexId'),
-                                'pair_address': pair.get('pairAddress'),
-                                'valid': True
-                            }
-            
-            return None
-        except Exception as e:
-            logger.debug(f"Error obteniendo precio para {token_address}: {e}")
-            return None
-
-price_api = PriceAPI()
-
-# ===================== DETECCIÓN MEJORADA =====================
-def is_flat(hist):
-    """Detección mejorada de tokens planos"""
-    if len(hist) < MIN_SAMPLES:
-        return False
-        
-    prices = [point["price"] for point in hist if point["price"] > 0]
-    if len(prices) < 3:
-        return False
-        
-    returns = []
-    for i in range(1, len(prices)):
-        if prices[i-1] > 0:
-            ret = (prices[i] - prices[i-1]) / prices[i-1] * 100
-            returns.append(ret)
-    
-    if not returns:
-        return False
-        
-    sd = pstdev(returns) if len(returns) > 1 else 0
-    max_abs = max(abs(x) for x in returns) if returns else 0
-    
-    return sd < FLAT_STD_THRESHOLD and max_abs < 1.0
-
-# ===================== PROCESAMIENTO DE TRANSACCIONES MEJORADO =====================
-async def extract_tokens_from_transaction(tx_data):
-    """Extrae tokens REALES de una transacción de Helius"""
-    tokens_found = set()
-    
-    try:
-        # Método 1: Buscar en accountKeys
-        account_keys = tx_data.get("transaction", {}).get("message", {}).get("accountKeys", [])
-        for key in account_keys:
-            if isinstance(key, str) and len(key) >= 32:  # Más flexible con la longitud
-                tokens_found.add(key)
-        
-        # Método 2: Buscar en meta información
-        meta = tx_data.get("meta", {})
-        if meta:
-            # Buscar en preTokenBalances y postTokenBalances
-            for balance_type in ["preTokenBalances", "postTokenBalances"]:
-                balances = meta.get(balance_type, [])
-                for balance in balances:
-                    mint = balance.get("mint")
-                    if mint and isinstance(mint, str):
-                        tokens_found.add(mint)
-        
-        # Método 3: Buscar en logs
-        logs = meta.get("logMessages", [])
-        for log in logs:
-            if isinstance(log, str) and "mint" in log.lower():
-                # Intentar extraer dirección del log
-                words = log.split()
-                for word in words:
-                    if len(word) >= 32 and len(word) <= 44:
-                        tokens_found.add(word)
-        
-        return list(tokens_found)
-        
-    except Exception as e:
-        logger.debug(f"Error extrayendo tokens: {e}")
-        return []
-
-async def process_real_token(token_addr: str, context: ContextTypes.DEFAULT_TYPE):
-    """Procesa un token con datos REALES"""
-    try:
-        logger.info(f"🔍 Procesando token: {token_addr}")
-        
-        # Obtener datos REALES del token
-        token_data = await price_api.get_token_price(token_addr)
-        
-        if not token_data or not token_data.get('valid'):
-            logger.debug(f"Token no válido o sin datos: {token_addr}")
-            return
-        
-        # Añadir a watchlist
-        if token_addr not in watchlist:
-            watchlist.append(token_addr)
-            if len(watchlist) > 50:
-                watchlist.pop(0)
-        
-        current_price = token_data['price']
-        hist = price_histories[token_addr]
-        hist.append({
-            "ts": time.time(), 
-            "price": current_price,
-            "volume": token_data.get('volume24h', 0)
-        })
-        
-        logger.info(f"✅ Token válido: {token_addr} - Precio: ${current_price:.6f} - Vol: ${token_data.get('volume24h', 0):,.0f}")
-        
-        # Detectar tokens planos
-        if token_addr not in flat_tokens and is_flat(hist):
-            flat_tokens[token_addr] = {
-                "first_price": current_price,
-                "flat_since": time.time(),
-                "max_alert": 0,
-                "volume": token_data.get('volume24h', 0),
-                "liquidity": token_data.get('liquidity', 0),
-                "history_length": len(hist)
-            }
-            logger.info(f"📊 TOKEN PLANO DETECTADO: {token_addr}")
-
-        # Detectar breakout
-        if token_addr in flat_tokens:
-            base_price = flat_tokens[token_addr]["first_price"]
-            if base_price > 0:
-                current_pct = (current_price - base_price) / base_price * 100
-                last_alert = flat_tokens[token_addr]["max_alert"]
-                
-                if current_pct >= last_alert + BREAKOUT_STEP:
-                    flat_tokens[token_addr]["max_alert"] = current_pct
-                    await send_breakout_alert(context, token_addr, current_pct, token_data)
-                    logger.info(f"🚀 BREAKOUT ALERTADO: {token_addr} +{current_pct:.1f}%")
-
-    except Exception as e:
-        logger.error(f"Error procesando token real {token_addr}: {e}")
-
-# ===================== MONITOR HELIUS CORREGIDO =====================
-async def helius_monitor_fixed(context: ContextTypes.DEFAULT_TYPE):
-    """Monitor corregido que SÍ detecta tokens"""
     if not HELIUS_WSS_URL:
         logger.error("❌ HELIUS_WSS_URL no configurada")
         return
 
-    logger.info("🎯 Iniciando monitor CORREGIDO...")
+    logger.info("🎯 INICIANDO DIAGNÓSTICO COMPLETO...")
     
-    # Suscripción más específica para tokens
+    # Mostrar URL (segura)
+    safe_url = HELIUS_WSS_URL.split('?')[0] if '?' in HELIUS_WSS_URL else HELIUS_WSS_URL
+    logger.info(f"📡 Conectando a: {safe_url}")
+    
+    # Suscripción MÁS AMPLIA posible
     subscription_msg = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "transactionSubscribe",
         "params": [
             {
-                "accountInclude": [
-                    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"  # Programa de tokens de Solana
-                ],
-                "vote": False,
-                "failed": False
+                # Sin filtros para recibir TODO
+                "vote": True,      # Incluir transacciones de votación
+                "failed": True,    # Incluir transacciones fallidas
+                "accountInclude": [],  # Sin filtros
+                "accountExclude": []   # Sin exclusiones
             }
         ],
     }
 
-    while bot_active:
-        try:
-            async with websockets.connect(HELIUS_WSS_URL, ping_interval=30, ping_timeout=10) as ws:
-                await ws.send(json.dumps(subscription_msg))
-                logger.info("✅ Conectado a Helius WebSocket - Buscando tokens...")
-
-                async for message in ws:
-                    if not bot_active:
-                        break
-                        
-                    try:
-                        data = json.loads(message)
-                        tx = data.get("params", {}).get("result", {})
-                        
-                        if not tx:
-                            continue
-                        
-                        # EXTRAER TOKENS de la transacción
-                        tokens = await extract_tokens_from_transaction(tx)
-                        
-                        if tokens:
-                            logger.info(f"📨 Transacción con {len(tokens)} tokens potenciales")
-                            
-                            # Procesar cada token encontrado
-                            for token_addr in tokens[:5]:  # Límite para no saturar
-                                if bot_active:
-                                    await process_real_token(token_addr, context)
-                        
-                    except Exception as e:
-                        logger.debug(f"Error procesando mensaje: {e}")
-
-        except Exception as e:
-            if bot_active:
-                logger.error(f"Error WebSocket: {e}. Reconectando en 5s...")
-                await asyncio.sleep(5)
-
-# ===================== ALERTAS =====================
-async def send_breakout_alert(context, token_addr, breakout_pct, token_data):
-    """Envía alertas de breakout"""
     try:
-        short_addr = token_addr[:8] + "..." + token_addr[-8:]
+        async with websockets.connect(HELIUS_WSS_URL, ping_interval=30, ping_timeout=10) as ws:
+            await context.bot.send_message(
+                chat_id=TARGET_CHAT_ID,
+                text="✅ CONECTADO A HELIUS WEB SOCKET\n\nEnviando suscripción..."
+            )
+            
+            await ws.send(json.dumps(subscription_msg))
+            await context.bot.send_message(
+                chat_id=TARGET_CHAT_ID,
+                text="📨 SUSCRIPCIÓN ENVIADA\n\nEsperando transacciones..."
+            )
+            
+            logger.info("🟢 Esperando mensajes...")
+
+            async for message in ws:
+                message_count += 1
+                
+                try:
+                    data = json.loads(message)
+                    
+                    # LOG cada mensaje recibido
+                    logger.info(f"📨 MENSAJE #{message_count} RECIBIDO")
+                    
+                    # Verificar el tipo de mensaje
+                    if data.get('method') == 'transactionNotification':
+                        transaction_count += 1
+                        
+                        # Obtener la transacción
+                        tx = data.get('params', {}).get('result', {})
+                        
+                        # Información básica de la transacción
+                        signatures = tx.get('transaction', {}).get('signatures', [])
+                        signature = signatures[0][:16] + "..." if signatures else "Unknown"
+                        
+                        # Enviar alerta de transacción recibida
+                        await context.bot.send_message(
+                            chat_id=TARGET_CHAT_ID,
+                            text=f"🔔 TRANSACCIÓN #{transaction_count} RECIBIDA\n\nSignature: `{signature}`",
+                            parse_mode="Markdown"
+                        )
+                        
+                        # Analizar la transacción en detalle
+                        await analyze_transaction(tx, context)
+                        
+                    elif data.get('method') == 'ping':
+                        logger.info("🏓 PING recibido - Conexión activa")
+                    else:
+                        logger.info(f"📦 Mensaje de tipo: {data.get('method', 'desconocido')}")
+                        
+                except Exception as e:
+                    logger.error(f"❌ Error procesando mensaje: {e}")
+                    await context.bot.send_message(
+                        chat_id=TARGET_CHAT_ID,
+                        text=f"❌ ERROR: {str(e)}"
+                    )
+
+    except websockets.exceptions.InvalidURI:
+        error_msg = """
+❌ URL DE WEBSOCKET INVÁLIDA
+
+Tu variable HELIUS_WSS_URL parece incorrecta.
+
+✅ DEBERÍA SER:
+wss://mainnet.helius-rpc.com/?api-key=tu_key
+
+❌ NO DEBERÍA SER:
+https://api.helius.xyz/v0/transactions/...
+        """
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=error_msg)
         
-        msg = (
-            f"🚀 *BREAKOUT DETECTADO* 🎯\n\n"
-            f"*Token:* `{short_addr}`\n"
-            f"*Cambio:* +{breakout_pct:.2f}%\n"
-            f"*Precio:* ${token_data['price']:.6f}\n"
-            f"*Volumen 24h:* ${token_data['volume24h']:,.0f}\n"
-            f"*Liquidez:* ${token_data['liquidity']:,.0f}\n\n"
-            f"🔍 *Verificación:*\n"
-            f"- [DexScreener](https://dexscreener.com/solana/{token_addr})\n"
-            f"- [Birdeye](https://birdeye.so/token/{token_addr}?chain=solana)\n"
-            f"- [Jupiter](https://jup.ag/swap/SOL-{token_addr})"
-        )
+    except Exception as e:
+        error_msg = f"""
+🚨 ERROR DE CONEXIÓN
+
+No se pudo conectar a Helius:
+
+{str(e)}
+
+Verifica:
+1. Tu API key de Helius
+2. Que la URL sea WebSocket (wss://)
+3. Tu conexión a internet
+        """
+        await context.bot.send_message(chat_id=TARGET_CHAT_ID, text=error_msg)
+        logger.error(f"Error de conexión: {e}")
+
+async def analyze_transaction(tx: dict, context: ContextTypes.DEFAULT_TYPE):
+    """Analiza una transacción en detalle"""
+    try:
+        # Información básica
+        signatures = tx.get('transaction', {}).get('signatures', [])
+        account_keys = tx.get('transaction', {}).get('message', {}).get('accountKeys', [])
+        instructions = tx.get('transaction', {}).get('message', {}).get('instructions', [])
+        
+        # Meta información
+        meta = tx.get('meta', {})
+        pre_token_balances = meta.get('preTokenBalances', [])
+        post_token_balances = meta.get('postTokenBalances', [])
+        
+        # Construir mensaje de análisis
+        analysis_msg = f"""
+🔍 ANÁLISIS DE TRANSACCIÓN
+
+📝 Signatures: {len(signatures)}
+👤 Accounts: {len(account_keys)}
+📋 Instructions: {len(instructions)}
+💰 Pre Token Balances: {len(pre_token_balances)}
+💰 Post Token Balances: {len(post_token_balances)}
+
+📊 CUENTAS ENCONTRADAS:
+"""
+        
+        # Mostrar primeras cuentas
+        for i, account in enumerate(account_keys[:10]):
+            analysis_msg += f"{i+1}. `{account[:16]}...`\n"
+        
+        if len(account_keys) > 10:
+            analysis_msg += f"... y {len(account_keys) - 10} más\n"
+        
+        # Buscar posibles tokens
+        tokens_found = set()
+        
+        # De preTokenBalances
+        for balance in pre_token_balances:
+            mint = balance.get('mint')
+            if mint:
+                tokens_found.add(mint)
+        
+        # De postTokenBalances  
+        for balance in post_token_balances:
+            mint = balance.get('mint')
+            if mint:
+                tokens_found.add(mint)
+        
+        # De account keys que parecen tokens
+        for account in account_keys:
+            if len(account) == 44:  # Longitud típica de token
+                tokens_found.add(account)
+        
+        analysis_msg += f"\n🎯 POSIBLES TOKENS: {len(tokens_found)}\n"
+        
+        for i, token in enumerate(list(tokens_found)[:5]):
+            analysis_msg += f"{i+1}. `{token}`\n"
         
         await context.bot.send_message(
             chat_id=TARGET_CHAT_ID,
-            text=msg,
-            parse_mode="Markdown",
-            disable_web_page_preview=True,
+            text=analysis_msg,
+            parse_mode="Markdown"
         )
         
-        logger.info(f"📤 Alerta enviada: {short_addr} +{breakout_pct:.1f}%")
+        # Procesar tokens encontrados
+        for token in list(tokens_found)[:3]:  # Solo primeros 3 para no saturar
+            await process_token_simple(token, context)
+            
+    except Exception as e:
+        logger.error(f"Error analizando transacción: {e}")
+
+async def process_token_simple(token_addr: str, context: ContextTypes.DEFAULT_TYPE):
+    """Procesa un token de manera simple"""
+    global token_count
+    try:
+        token_count += 1
+        
+        # Mensaje simple de token detectado
+        await context.bot.send_message(
+            chat_id=TARGET_CHAT_ID,
+            text=f"🎯 TOKEN #{token_count} DETECTADO\n\n`{token_addr}`",
+            parse_mode="Markdown"
+        )
+        
+        logger.info(f"✅ Token detectado: {token_addr}")
         
     except Exception as e:
-        logger.error(f"Error enviando alerta: {e}")
+        logger.error(f"Error procesando token simple: {e}")
 
 # ===================== COMANDOS TELEGRAM =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global TARGET_CHAT_ID
-    TARGET_CHAT_ID = update.effective_chat.id
-    
-    welcome_msg = (
-        "🤖 *Breakout Bot - CORREGIDO* 🚀\n\n"
-        "✅ *Ahora SÍ detecta tokens reales:*\n"
-        "• Precios reales desde DexScreener\n"
-        "• Filtros por volumen y liquidez\n"
-        "• Detección de tokens planos\n"
-        "• Alertas de breakout\n\n"
-        f"⚙️ *Configuración:*\n"
-        f"• Breakout: +{BREAKOUT_STEP}%\n"
-        f"• Volumen mínimo: ${MIN_VOLUME_USD:,.0f}\n"
-        f"• Liquidez mínima: ${MIN_LIQUIDITY:,.0f}\n\n"
-        "📊 *Comandos:*\n"
-        "• /cazar - Iniciar monitoreo\n"
-        "• /parar - Detener\n"
-        "• /status - Estado\n"
-        "• /tokens - Ver tokens\n"
-        "• /planos - Tokens planos"
-    )
-    
-    await update.message.reply_text(welcome_msg, parse_mode="Markdown")
-
-async def cmd_cazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el monitoreo"""
-    global bot_active
-    if bot_active:
-        await update.message.reply_text("⚙️ Ya está monitoreando.")
-        return
-    
-    bot_active = True
     await update.message.reply_text(
-        "🎯 *INICIANDO DETECCIÓN DE TOKENS*\n\n"
-        "🔍 Buscando tokens reales en Solana...\n"
-        "✅ Usando datos REALES de DexScreener\n"
-        "📊 Filtros activos por volumen/liquidez",
+        "🤖 DIAGNÓSTICO HELIUS COMPLETO\n\n"
+        "Este bot mostrará TODAS las transacciones que reciba de Helius.\n\n"
+        "Comandos:\n"
+        "• /diagnostico - Iniciar diagnóstico\n"
+        "• /estado - Ver estado actual\n"
+        "• /parar - Detener diagnóstico",
+        parse_mode="Markdown"
+    )
+
+async def cmd_diagnostico(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inicia el diagnóstico completo"""
+    await update.message.reply_text(
+        "🔍 INICIANDO DIAGNÓSTICO COMPLETO...\n\n"
+        "Voy a mostrar:\n"
+        "• Cada mensaje recibido de Helius\n"
+        "• Cada transacción detectada\n" 
+        "• Análisis detallado de transacciones\n"
+        "• Tokens encontrados\n\n"
+        "⏳ Conectando...",
         parse_mode="Markdown"
     )
     
-    # Iniciar el monitor CORREGIDO
-    asyncio.create_task(helius_monitor_fixed(context))
+    # Iniciar el monitor de diagnóstico
+    asyncio.create_task(helius_monitor_diagnostico(context))
+
+async def cmd_estado(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Muestra estado del diagnóstico"""
+    estado_msg = f"""
+📊 ESTADO DEL DIAGNÓSTICO
+
+📨 Mensajes recibidos: {message_count}
+🔔 Transacciones detectadas: {transaction_count}  
+🎯 Tokens identificados: {token_count}
+
+💡 Si todos están en 0, hay problemas de conexión.
+    """
+    await update.message.reply_text(estado_msg, parse_mode="Markdown")
 
 async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detiene el monitoreo"""
-    global bot_active
-    bot_active = False
-    await update.message.reply_text("🛑 Monitoreo detenido.")
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estado del sistema"""
-    status_msg = (
-        f"🤖 *ESTADO DEL BOT*\n\n"
-        f"🔧 Monitoreo: {'🟢 ACTIVO' if bot_active else '🔴 DETENIDO'}\n"
-        f"📊 Tokens observados: {len(price_histories)}\n"
-        f"📈 Tokens planos: {len(flat_tokens)}\n"
-        f"👁️ En watchlist: {len(watchlist)}\n"
-        f"📞 Requests API: {price_api.request_count}\n\n"
-        f"💡 Comandos: /cazar /parar /tokens /planos"
+    """Detiene el diagnóstico"""
+    # En una implementación real, necesitarías un mecanismo para detener el loop
+    await update.message.reply_text(
+        "🛑 Para detener el diagnóstico, necesitas reiniciar el bot.\n\n"
+        "En Railway, ve a Deployments y haz 'Redeploy'.",
+        parse_mode="Markdown"
     )
-    await update.message.reply_text(status_msg, parse_mode="Markdown")
 
-async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra tokens detectados"""
-    if not watchlist:
-        await update.message.reply_text("📭 No hay tokens en la lista.")
-        return
-        
-    msg = "👁️ *Últimos Tokens Detectados:*\n\n"
-    for i, addr in enumerate(reversed(watchlist[-10:]), 1):
-        short_addr = addr[:8] + "..." + addr[-6:]
-        status = "📊" if addr in flat_tokens else "🔍"
-        msg += f"{i}. `{short_addr}` {status}\n"
-    
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_planos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra tokens planos"""
-    if not flat_tokens:
-        await update.message.reply_text("📊 No hay tokens planos detectados.")
-        return
-        
-    msg = "📊 *Tokens Planos Detectados:*\n\n"
-    for i, (addr, info) in enumerate(list(flat_tokens.items())[:10], 1):
-        short_addr = addr[:8] + "..." + addr[-6:]
-        since = datetime.fromtimestamp(info["flat_since"]).strftime("%H:%M")
-        samples = info.get("history_length", 0)
-        alert_pct = info.get("max_alert", 0)
-        status = f"🚀 +{alert_pct:.1f}%" if alert_pct > 0 else "⏳ Plano"
-        msg += f"{i}. `{short_addr}`\n   ⏰ {since} | 📈 {status} | 📊 {samples} datos\n\n"
-    
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-# ===================== MAIN =====================
 def main():
     if not TELEGRAM_BOT_TOKEN:
         logger.error("❌ TELEGRAM_BOT_TOKEN no configurado")
@@ -392,13 +282,11 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("cazar", cmd_cazar))
+    app.add_handler(CommandHandler("diagnostico", cmd_diagnostico))
+    app.add_handler(CommandHandler("estado", cmd_estado))
     app.add_handler(CommandHandler("parar", cmd_parar))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("tokens", cmd_tokens))
-    app.add_handler(CommandHandler("planos", cmd_planos))
     
-    logger.info("🚀 Breakout Bot Corregido - Listo para detectar tokens REALES")
+    logger.info("🚀 Bot de Diagnóstico Completo Iniciado")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
