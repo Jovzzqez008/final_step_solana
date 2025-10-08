@@ -1,4 +1,3 @@
-# bot_antirug_final.py - FILTROS EXTREMOS CONTRA RUG PULLS
 import asyncio, json, os, time, logging, aiohttp
 from statistics import pstdev, mean
 from datetime import datetime, timedelta
