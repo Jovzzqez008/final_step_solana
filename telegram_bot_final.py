@@ -1,4 +1,4 @@
-# telegram_bot_final8.py  (corregido datetime.utcnow())
+# telegram_bot_final8.py  (liquidez mínima $35,000)
 import asyncio
 import json
 import time
@@ -23,9 +23,9 @@ TARGET_CHAT_ID = None
 # FUENTES CONFIABLES - JUPITER V2 + GECKOTERMINAL + BIRDEYE
 # Jupiter Token API v2 (lite)
 JUPITER_BASE_LITE = "https://lite-api.jup.ag/tokens/v2"
-JUPITER_V2_RECENT = f"{JUPITER_BASE_LITE}/recent"
-JUPITER_V2_TRENDING = f"{JUPITER_BASE_LITE}/toptrending/1h"
-JUPITER_V2_ORGANIC = f"{JUPITER_BASE_LITE}/toporganicscore/1h"
+JUPITER_V2_TRENDING_6H = f"{JUPITER_BASE_LITE}/toptrending/6h"
+JUPITER_V2_TRENDING_24H = f"{JUPITER_BASE_LITE}/toptrending/24h"
+JUPITER_V2_ORGANIC_24H = f"{JUPITER_BASE_LITE}/toporganicscore/24h"
 
 # GeckoTerminal API base
 GECKO_API_BASE = "https://api.geckoterminal.com/api/v2"
@@ -34,7 +34,6 @@ GECKO_TOKEN_INFO = f"{GECKO_API_BASE}/networks/solana/tokens/{{}}/info"
 
 # Birdeye API
 BIRDEYE_API = "https://public-api.birdeye.so/public/token?address={}"
-BIRDEYE_PRICE_API = "https://public-api.birdeye.so/public/price?address={}"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -42,30 +41,19 @@ HEADERS = {
 }
 
 # -------------------- FILTROS (ajustables) --------------------
-# Edad en horas — ahora 6 a 120 horas según tu pedido
 MIN_AGE_HOURS = 6
 MAX_AGE_HOURS = 120
-
-# Liquidez mínima para entrada a incubadora (puedes bajarlo)
-MIN_LIQUIDITY = 10000  # $10,000 mínimo para considerar
-# Requisitos para mover de incubadora -> watchlist
-WATCHLIST_LIQUIDITY_THRESHOLD = 100000  # $100k para pasar a watchlist
-WATCHLIST_MARKETCAP_THRESHOLD = 200000  # $200k marketcap (si decides usar marketcap)
-# Al final de 5 días, si liquidez < LIQUIDITY_DISCARD_THRESHOLD se borra
+MIN_LIQUIDITY = 35000  # 🔥 CAMBIADO: $35,000 mínimo para considerar
+WATCHLIST_LIQUIDITY_THRESHOLD = 100000
+WATCHLIST_MARKETCAP_THRESHOLD = 200000
 LIQUIDITY_DISCARD_THRESHOLD = 35000
 
 # Monitoreo periódicos
-INCUBATOR_CHECK_INTERVAL = 60 * 60 * 4  # 4 horas
-WATCHLIST_CHECK_INTERVAL = 60 * 60 * 4  # 4 horas
-RADAR_LOOP_INTERVAL = 60  # 1 minuto entre búsquedas combinadas (ajustable)
-
-# Tiempo entre revisión de cada token (8 segundos para Birdeye)
+INCUBATOR_CHECK_INTERVAL = 60 * 60 * 4
+WATCHLIST_CHECK_INTERVAL = 60 * 60 * 4
+RADAR_LOOP_INTERVAL = 60
 TOKEN_CHECK_DELAY = 8
 
-# Elección de criterio: usar liquidity, marketcap, o ambos (combinación lógica)
-# Opciones:
-#   "liquidity_only", "marketcap_only", "either" (liquidity OR marketcap),
-#   "both" (liquidity AND marketcap)
 CRITERIA_MODE = "either"
 
 # Estructuras en memoria
@@ -183,9 +171,9 @@ def format_age_display(age_hours: float) -> str:
     else:
         return f"{age_hours:.1f}h"
 
-# -------------------- FUENTES: GeckoTerminal & Jupiter & Birdeye --------------------
+# -------------------- FUENTES MEJORADAS --------------------
 async def get_geckoterminal_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
-    """Obtiene pools nuevos de GeckoTerminal."""
+    """Obtiene pools nuevos de GeckoTerminal con filtro de edad."""
     try:
         logger.info("Consultando GeckoTerminal new_pools...")
         res = await client.get(GECKO_NEW_POOLS, headers=HEADERS, timeout=20)
@@ -206,7 +194,6 @@ async def get_geckoterminal_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
                 if not is_token_in_age_range(age_hours):
                     continue
                 liquidity = float(attributes.get('reserve_in_usd', 0) or 0)
-                # omitimos tokens con liquidez 0 o muy baja
                 if liquidity < MIN_LIQUIDITY:
                     continue
                 base_token = attributes.get('base_token', {})
@@ -230,49 +217,65 @@ async def get_geckoterminal_new_pairs(client: httpx.AsyncClient) -> List[Dict]:
         logger.error(f"Error GeckoTerminal: {e}")
         return []
 
-async def get_jupiter_recent_tokens_improved(client: httpx.AsyncClient) -> List[Dict]:
-    """Consulta Jupiter lite /recent y filtra por edad y liquidez."""
+async def get_jupiter_tokens_improved(client: httpx.AsyncClient) -> List[Dict]:
+    """Consulta Jupiter trending/organic tokens que son más propensos a estar en nuestro rango de edad."""
     try:
-        logger.info("Consultando Jupiter V2 recent...")
-        res = await client.get(JUPITER_V2_RECENT, headers=HEADERS, timeout=20)
-        if res.status_code != 200:
-            logger.warning(f"Jupiter recent responded {res.status_code}")
-            return []
-        tokens = res.json()
-        processed = []
-        for token in tokens:
+        logger.info("Consultando Jupiter trending 6h y 24h...")
+        
+        # Consultar múltiples endpoints de Jupiter
+        endpoints = [
+            JUPITER_V2_TRENDING_6H,
+            JUPITER_V2_TRENDING_24H, 
+            JUPITER_V2_ORGANIC_24H
+        ]
+        
+        all_tokens = []
+        for endpoint in endpoints:
             try:
-                # Jupiter puede devolver 'firstPool' u otros campos
-                first_pool = token.get('firstPool') or token.get('first_pool') or {}
-                created_at = first_pool.get('createdAt') or first_pool.get('created_at')
-                age_hours = calculate_token_age(created_at) if created_at else None
-                if not is_token_in_age_range(age_hours):
-                    continue
-                liquidity = float(token.get('liquidity') or 0)
-                if liquidity < MIN_LIQUIDITY:
-                    continue
-                processed.append({
-                    'address': token.get('id'),
-                    'name': token.get('name',''),
-                    'symbol': token.get('symbol',''),
-                    'liquidity': liquidity,
-                    'age_hours': age_hours,
-                    'created_at': created_at,
-                    'marketcap': float(token.get('marketCapUsd') or token.get('fdvUsd') or 0),
-                    'holders': int(token.get('holderCount') or 0),
-                    'source': 'jupiter'
-                })
+                res = await client.get(endpoint, headers=HEADERS, timeout=20)
+                if res.status_code == 200:
+                    tokens = res.json()
+                    for token in tokens:
+                        try:
+                            # Para Jupiter, asumimos que los tokens trending tienen edad apropiada
+                            first_pool = token.get('firstPool') or token.get('first_pool') or {}
+                            created_at = first_pool.get('createdAt') or first_pool.get('created_at')
+                            age_hours = calculate_token_age(created_at) if created_at else None
+                            
+                            # Si no tenemos edad o está fuera de rango, continuar
+                            if not is_token_in_age_range(age_hours):
+                                continue
+                                
+                            liquidity = float(token.get('liquidity') or 0)
+                            if liquidity < MIN_LIQUIDITY:
+                                continue
+                                
+                            all_tokens.append({
+                                'address': token.get('id'),
+                                'name': token.get('name',''),
+                                'symbol': token.get('symbol',''),
+                                'liquidity': liquidity,
+                                'age_hours': age_hours,
+                                'created_at': created_at,
+                                'marketcap': float(token.get('marketCapUsd') or token.get('fdvUsd') or 0),
+                                'holders': int(token.get('holderCount') or 0),
+                                'source': 'jupiter'
+                            })
+                        except Exception as e:
+                            logger.debug(f"Error procesando token Jupiter: {e}")
+                            continue
             except Exception as e:
-                logger.debug(f"Error procesando token Jupiter: {e}")
+                logger.debug(f"Error en endpoint {endpoint}: {e}")
                 continue
-        logger.info(f"[JUPITER] Encontrados {len(processed)} tokens en rango")
-        return processed
+        
+        logger.info(f"[JUPITER] Encontrados {len(all_tokens)} tokens en rango {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h")
+        return all_tokens
     except Exception as e:
-        logger.error(f"Error Jupiter recent: {e}")
+        logger.error(f"Error Jupiter: {e}")
         return []
 
 async def get_token_info_gecko(client: httpx.AsyncClient, address: str) -> Dict:
-    """Pide info detallada de token a GeckoTerminal (marketcap, holders, liquidez de pools)."""
+    """Pide info detallada de token a GeckoTerminal."""
     try:
         url = GECKO_TOKEN_INFO.format(address)
         res = await client.get(url, headers=HEADERS, timeout=15)
@@ -282,7 +285,6 @@ async def get_token_info_gecko(client: httpx.AsyncClient, address: str) -> Dict:
         data = res.json().get('data', {})
         attributes = data.get('attributes', {})
         token_info = attributes.get('token', {})
-        # Se retorna un dict con campos útiles
         return {
             'liquidity': float(attributes.get('reserve_in_usd', 0) or 0),
             'marketcap': float(token_info.get('market_cap_usd', 0) or 0),
@@ -323,13 +325,7 @@ async def get_token_info_birdeye(client: httpx.AsyncClient, address: str) -> Dic
 
 # -------------------- LÓGICA: INCUBADORA -> WATCHLIST --------------------
 def qualifies_for_watchlist(metrics: Dict[str, Any]) -> bool:
-    """
-    Decide si un token califica para pasar a watchlist según CRITERIA_MODE:
-    - liquidity_only: líquido >= WATCHLIST_LIQUIDITY_THRESHOLD
-    - marketcap_only: marketcap >= WATCHLIST_MARKETCAP_THRESHOLD
-    - either: liquidity >= threshold OR marketcap >= threshold
-    - both: liquidity >= threshold AND marketcap >= threshold
-    """
+    """Decide si un token califica para pasar a watchlist."""
     liq = metrics.get('liquidity', 0) or 0
     mcap = metrics.get('marketcap', 0) or 0
 
@@ -339,14 +335,13 @@ def qualifies_for_watchlist(metrics: Dict[str, Any]) -> bool:
         return mcap >= WATCHLIST_MARKETCAP_THRESHOLD
     if CRITERIA_MODE == "both":
         return (liq >= WATCHLIST_LIQUIDITY_THRESHOLD) and (mcap >= WATCHLIST_MARKETCAP_THRESHOLD)
-    # default either
     return (liq >= WATCHLIST_LIQUIDITY_THRESHOLD) or (mcap >= WATCHLIST_MARKETCAP_THRESHOLD)
 
 # -------------------- TAREAS PRINCIPALES --------------------
 async def get_all_tokens_combined(client: httpx.AsyncClient) -> List[Dict]:
-    """Combina Jupiter + GeckoTerminal para buscar tokens nuevos en rango de edad."""
+    """Combina Jupiter trending + GeckoTerminal para buscar tokens en rango de edad."""
     tasks = [
-        get_jupiter_recent_tokens_improved(client),
+        get_jupiter_tokens_improved(client),
         get_geckoterminal_new_pairs(client)
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -377,16 +372,12 @@ async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
                     for token in tokens:
                         address = token.get('address')
                         if not address: continue
-                        # Si ya está en watchlist, ignorar
                         if address in watchlist:
                             continue
-                        # Si ya está en incubator, actualizar timestamp y seguir
                         if address in incubator:
-                            # update basic token_info
                             incubator[address]['token_info'] = token
                             await db_add_to_incubator(address, incubator[address])
                             continue
-                        # Crear entrada en incubadora
                         created = time.time()
                         incub_data = {
                             'added_at': created,
@@ -397,7 +388,7 @@ async def combined_radar_task(context: ContextTypes.DEFAULT_TYPE):
                         await db_add_to_incubator(address, incub_data)
                         added += 1
 
-                        # Notificar que entró a incubadora (igual que antes, con enlaces)
+                        # Notificar que entró a incubadora
                         symbol = token.get('symbol','N/A')
                         name = token.get('name','N/A')
                         age_str = format_age_display(token.get('age_hours'))
@@ -445,10 +436,7 @@ async def incubator_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                 moved = 0
                 for addr, data in list(incubator.items()):
                     try:
-                        # obtener metrics en tiempo real desde Birdeye
                         birdeye_metrics = await get_token_info_birdeye(client, addr)
-                        
-                        # fallback a datos existentes si Birdeye falla
                         token_info = data.get('token_info', {})
                         metrics = {
                             'liquidity': birdeye_metrics.get('liquidity') or token_info.get('liquidity') or 0,
@@ -456,7 +444,6 @@ async def incubator_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                             'holders': birdeye_metrics.get('holders') or token_info.get('holders') or 0
                         }
                         
-                        # Si califica
                         if qualifies_for_watchlist(metrics):
                             approved_at = time.time()
                             watch_data = {
@@ -470,12 +457,10 @@ async def incubator_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                             }
                             watchlist[addr] = watch_data
                             await db_add_to_watchlist(addr, watch_data)
-                            # eliminar de incubadora
                             del incubator[addr]
                             await db_remove_from_incubator(addr)
                             moved += 1
 
-                            # Notificar ingreso a watchlist con métricas actuales de Birdeye
                             message = (
                                 f"🟢 *TOKEN A WATCHLIST* 🟢\n\n"
                                 f"*Address:* `{addr}`\n"
@@ -500,7 +485,6 @@ async def incubator_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                                     logger.warning(f"No se pudo notificar watchlist: {e}")
 
                         else:
-                            # actualizar datos en incubator con info de Birdeye
                             incubator[addr]['last_checked'] = now
                             incubator[addr]['last_metrics'] = metrics
                             incubator[addr]['birdeye_data'] = birdeye_metrics
@@ -529,15 +513,12 @@ async def watchlist_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                 removals = 0
                 for addr, data in list(watchlist.items()):
                     try:
-                        # Obtener métricas actualizadas desde Birdeye
                         birdeye_metrics = await get_token_info_birdeye(client, addr)
-                        
                         liq = birdeye_metrics.get('liquidity') or data.get('token_info', {}).get('liquidity') or 0
                         mcap = birdeye_metrics.get('marketcap') or data.get('token_info', {}).get('marketcap') or 0
                         holders = birdeye_metrics.get('holders') or data.get('token_info', {}).get('holders') or 0
                         volume_24h = birdeye_metrics.get('volume_24h', 0)
 
-                        # actualizar en memoria y DB con datos de Birdeye
                         watchlist[addr]['token_info'].update({
                             'liquidity': liq,
                             'marketcap': mcap,
@@ -548,7 +529,6 @@ async def watchlist_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                         })
                         await db_add_to_watchlist(addr, watchlist[addr])
 
-                        # enviar resumen breve al canal con datos de Birdeye
                         age_days = (now - data.get('approved_at', now)) / 86400.0
                         message = (
                             f"📈 *WATCHLIST UPDATE (Birdeye)*\n\n"
@@ -570,10 +550,8 @@ async def watchlist_monitor_task(context: ContextTypes.DEFAULT_TYPE):
                             except Exception as e:
                                 logger.debug(f"No se envió update watchlist: {e}")
 
-                        # regla de eliminación post-5-días
                         if now - data.get('approved_at', 0) > 5 * 86400:
                             if liq < LIQUIDITY_DISCARD_THRESHOLD:
-                                # eliminar
                                 del watchlist[addr]
                                 await db_remove_from_watchlist(addr)
                                 removals += 1
@@ -605,7 +583,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚀 *Bot Mejorado - Incubadora & Watchlist*\n\n"
         f"🎯 *Edad buscada:* {MIN_AGE_HOURS} a {MAX_AGE_HOURS} horas\n"
-        f"💧 *Liquidez mínima para incubadora:* ${MIN_LIQUIDITY:,}\n"
+        f"💧 *Liquidez mínima para incubadora:* ${MIN_LIQUIDITY:,}\n"  # 🔥 Actualizado a $35,000
         f"🟡 *Incubadora -> Watchlist:* Liquidez ≥ ${WATCHLIST_LIQUIDITY_THRESHOLD:,} (o marketcap según configuración)\n"
         "🔁 *Monitoreo incubadora/watchlist cada 4 horas*\n"
         f"🔍 *Fuente monitoreo:* Birdeye API\n"
@@ -630,7 +608,6 @@ async def hunt_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     incubator = await db_load_all_incubator()
     watchlist = await db_load_all_watchlist()
 
-    # lanzar tareas: radar, incubator monitor, watchlist monitor, cleanup
     context.bot_data['tasks'] = [
         asyncio.create_task(combined_radar_task(context)),
         asyncio.create_task(incubator_monitor_task(context)),
@@ -656,6 +633,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🟡 *Incubadora:* {len(incubator)} tokens\n"
             f"🏆 *Watchlist:* {len(watchlist)} tokens\n"
             f"🔍 *Edad buscada:* {MIN_AGE_HOURS}-{MAX_AGE_HOURS}h\n"
+            f"💧 *Liquidez mínima:* ${MIN_LIQUIDITY:,}\n"  # 🔥 Actualizado a $35,000
             f"⚖️ *Criterio:* {CRITERIA_MODE}\n"
             f"🔗 *Fuente monitoreo:* Birdeye API\n"
             f"⏰ *Delay Birdeye:* {TOKEN_CHECK_DELAY} segundos\n"
@@ -697,20 +675,18 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += (f"{i}. `{addr}`\n   📛 {ti.get('symbol','N/A')} | 💰 ${liq:,.0f} | 🏷 MC ${mcap:,.0f} | 👥 {holders} | 📊 ${volume_24h:,.0f} | ⏳ {age_days:.2f}d\n")
     await update.message.reply_text(message, parse_mode='Markdown')
 
-# -------------------- LIMPIEZA AUTOMÁTICA (ajustada) --------------------
+# -------------------- LIMPIEZA AUTOMÁTICA --------------------
 async def cleanup_task(context: ContextTypes.DEFAULT_TYPE):
     """Limpia tokens viejos en incubadora y watchlist según reglas."""
     logger.info("Iniciando tarea de limpieza...")
     while True:
         try:
-            await asyncio.sleep(3600)  # Revisar cada 1 hora
+            await asyncio.sleep(3600)
             now = time.time()
-            # Incubadora: eliminar entradas > 7 días (histórico)
             for token_address, data in list(incubator.items()):
                 if now - data.get('added_at', 0) > 7 * 86400:
                     del incubator[token_address]
                     await db_remove_from_incubator(token_address)
-            # Watchlist: no eliminamos automáticamente aquí (watchlist_monitor_task se encarga)
         except Exception as e:
             logger.error(f"Error en limpieza: {e}")
 
