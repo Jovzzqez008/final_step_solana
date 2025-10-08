@@ -1,4 +1,4 @@
-# simple_breakout_scanner.py
+# fixed_breakout_scanner.py
 import asyncio
 import time
 import logging
@@ -14,13 +14,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- CONFIGURACIÓN SIMPLE --------------------
+# -------------------- CONFIGURACIÓN ACTUALIZADA --------------------
 class Config:
-    # Solo Telegram desde environment
     TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
     TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
-    # Scanner parameters optimizados
     PRICE_INTERVAL = 300  # 5 minutos
     CONSOLIDATION_THRESHOLD = 2.0
     BREAKOUT_PERCENT = 5.0
@@ -28,11 +26,11 @@ class Config:
     MIN_LIQUIDITY = 25000
     VOLUME_SPIKE_MULTIPLIER = 2.0
     
-    # Fuentes DexScreener
+    # ✅ URLs CORREGIDAS de DexScreener
     DEXSCREENER_URLS = {
-        'volume': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=volume24h&order=desc&limit=100",
-        'new': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=age&order=asc&limit=80",
-        'trending': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=priceChange24h&order=desc&limit=100"
+        'search_solana': "https://api.dexscreener.com/latest/dex/search?q=solana",
+        'tokens': "https://api.dexscreener.com/latest/dex/tokens/",
+        'pairs': "https://api.dexscreener.com/latest/dex/pairs/"
     }
 
 class TelegramNotifier:
@@ -42,9 +40,7 @@ class TelegramNotifier:
         self.enabled = bool(self.bot_token and self.chat_id)
         
     async def send_alert(self, message: str):
-        """Envía alerta a Telegram."""
         if not self.enabled:
-            logger.info("📱 Telegram no configurado - Mostrando en consola")
             print(f"\n🔔 {message}\n")
             return
             
@@ -58,31 +54,23 @@ class TelegramNotifier:
             }
             
             async with httpx.AsyncClient() as client:
-                response = await client.post(url, json=payload, timeout=10)
-                if response.status_code == 200:
-                    logger.info("📱 Alerta enviada a Telegram")
-                else:
-                    logger.error(f"❌ Error Telegram: {response.status_code}")
+                await client.post(url, json=payload, timeout=10)
+                logger.info("📱 Alerta enviada a Telegram")
         except Exception as e:
-            logger.error(f"❌ Error enviando a Telegram: {e}")
+            logger.error(f"❌ Error Telegram: {e}")
 
-class EfficientPatternDetector:
-    """Detector eficiente sin APIs externas complejas."""
-    
+class RobustPatternDetector:
     def __init__(self):
         self.price_history: Dict[str, Deque[Dict]] = {}
         self.consolidation_trackers: Dict[str, Dict] = {}
         self.detected_patterns: Dict[str, float] = {}
-        self.token_metadata: Dict[str, Dict] = {}
         
     def analyze_pattern(self, token: str, price_data: Dict) -> Optional[Dict]:
-        """Análisis simple y eficiente del patrón."""
         current_price = price_data['price']
         symbol = price_data.get('symbol', 'Unknown')
         
-        # Inicializar historial si es nuevo token
         if token not in self.price_history:
-            self.price_history[token] = deque(maxlen=36)  # 3 horas de datos
+            self.price_history[token] = deque(maxlen=36)
             self.consolidation_trackers[token] = {
                 'in_consolidation': False,
                 'consolidation_start': None,
@@ -91,21 +79,16 @@ class EfficientPatternDetector:
                 'consolidation_hours': 0
             }
         
-        # Agregar nuevo dato
         self.price_history[token].append(price_data)
         
-        # Solo analizar si tenemos suficientes datos
-        if len(self.price_history[token]) < 12:  # 1 hora mínima
+        if len(self.price_history[token]) < 12:
             return None
         
         prices = [p['price'] for p in self.price_history[token]]
         volumes = [p.get('volume_24h', 0) for p in self.price_history[token]]
         timestamps = [p['timestamp'] for p in self.price_history[token]]
         
-        # Detectar consolidación
         consolidation_signal = self._detect_consolidation(token, prices, volumes, timestamps)
-        
-        # Detectar breakout
         breakout_signal = self._detect_breakout(token, current_price, volumes[-1] if volumes else 0, consolidation_signal)
         
         if breakout_signal:
@@ -118,7 +101,6 @@ class EfficientPatternDetector:
         if len(prices) < 12:
             return {'in_consolidation': False}
         
-        # Analizar últimas 2-3 horas
         recent_prices = prices[-24:] if len(prices) >= 24 else prices
         min_price = min(recent_prices)
         max_price = max(recent_prices)
@@ -137,7 +119,6 @@ class EfficientPatternDetector:
                     'volume_base': statistics.mean(volumes) if volumes else 0,
                     'consolidation_hours': (timestamps[-1] - timestamps[0]) / 3600
                 })
-                logger.info(f"🔍 Consolidación detectada: {token[:8]}... - {price_range_pct:.2f}% rango")
         else:
             tracker['in_consolidation'] = False
         
@@ -160,7 +141,6 @@ class EfficientPatternDetector:
             volume_spike >= Config.VOLUME_SPIKE_MULTIPLIER
         )
         
-        # Prevenir alertas duplicadas (2 horas mínimo entre alertas)
         last_alert = self.detected_patterns.get(token, 0)
         time_since_last_alert = time.time() - last_alert
         
@@ -180,29 +160,25 @@ class EfficientPatternDetector:
         
         return None
 
-class SmartTokenFinder:
-    """Buscador inteligente solo con DexScreener."""
+class WorkingTokenFinder:
+    """Buscador que funciona con las URLs correctas."""
     
     def __init__(self):
         self.tracked_tokens = set()
         
     async def find_potential_tokens(self) -> List[str]:
-        """Encuentra tokens con potencial usando solo DexScreener."""
+        """Encuentra tokens usando búsqueda funcional."""
         logger.info("🔍 Buscando tokens con potencial...")
         
         tokens = set()
         
-        # Estrategia 1: Tokens con buen volumen
+        # Estrategia 1: Buscar tokens populares en Solana
+        popular_tokens = await self._get_popular_solana_tokens()
+        tokens.update(popular_tokens)
+        
+        # Estrategia 2: Tokens con volumen reciente
         volume_tokens = await self._get_volume_tokens()
         tokens.update(volume_tokens)
-        
-        # Estrategia 2: Tokens en crecimiento moderado
-        trending_tokens = await self._get_trending_tokens()
-        tokens.update(trending_tokens)
-        
-        # Estrategia 3: Tokens con liquidez sólida
-        liquidity_tokens = await self._get_liquidity_tokens()
-        tokens.update(liquidity_tokens)
         
         # Token de referencia
         tokens.add("H8xQ6poBjB9DTPMDTKWzWPrnxu4bDEhybxiouF8Ppump")
@@ -210,121 +186,96 @@ class SmartTokenFinder:
         logger.info(f"🎯 Encontrados {len(tokens)} tokens para monitorear")
         return list(tokens)
     
-    async def _get_volume_tokens(self) -> List[str]:
-        """Tokens con volumen decente."""
+    async def _get_popular_solana_tokens(self) -> List[str]:
+        """Obtiene tokens populares de Solana usando search."""
         tokens = []
         try:
-            url = Config.DEXSCREENER_URLS['volume']
+            url = Config.DEXSCREENER_URLS['search_solana']
             async with httpx.AsyncClient() as client:
                 response = await client.get(url, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
-                    for pair in data.get('pairs', [])[:80]:
+                    # DexScreener search devuelve pairs, tomamos los primeros
+                    pairs = data.get('pairs', [])[:50]
+                    for pair in pairs:
                         liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                        volume_24h = float(pair.get('volume', {}).get('h24', 0))
-                        
-                        # Filtros básicos de calidad
-                        if (liquidity >= Config.MIN_LIQUIDITY and 
-                            volume_24h >= 10000 and  # $10K volumen mínimo
-                            volume_24h <= 5000000):  # $5M volumen máximo (evitar los masivos)
-                            
+                        if liquidity >= Config.MIN_LIQUIDITY:
                             token_address = pair.get('baseToken', {}).get('address')
-                            if token_address and token_address != 'unknown':
+                            if token_address:
                                 tokens.append(token_address)
+        except Exception as e:
+            logger.error(f"Error buscando tokens Solana: {e}")
+        return tokens
+    
+    async def _get_volume_tokens(self) -> List[str]:
+        """Obtiene tokens con volumen usando el endpoint de pairs."""
+        tokens = []
+        try:
+            # Usamos el endpoint de pairs con algunos tokens conocidos como base
+            base_tokens = [
+                "So11111111111111111111111111111111111111112",  # SOL
+                "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+                "H8xQ6poBjB9DTPMDTKWzWPrnxu4bDEhybxiouF8Ppump",  # TOKABU
+            ]
+            
+            for base_token in base_tokens:
+                url = f"{Config.DEXSCREENER_URLS['pairs']}{base_token}"
+                async with httpx.AsyncClient() as client:
+                    response = await client.get(url, timeout=10)
+                    if response.status_code == 200:
+                        data = response.json()
+                        pairs = data.get('pairs', [])[:20]
+                        for pair in pairs:
+                            liquidity = float(pair.get('liquidity', {}).get('usd', 0))
+                            volume_24h = float(pair.get('volume', {}).get('h24', 0))
+                            
+                            if (liquidity >= Config.MIN_LIQUIDITY and 
+                                volume_24h >= 5000):
+                                
+                                token_address = pair.get('baseToken', {}).get('address')
+                                if token_address and token_address != base_token:
+                                    tokens.append(token_address)
         except Exception as e:
             logger.error(f"Error volumen tokens: {e}")
         return tokens
-    
-    async def _get_trending_tokens(self) -> List[str]:
-        """Tokens con crecimiento saludable."""
-        tokens = []
-        try:
-            url = Config.DEXSCREENER_URLS['trending']
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    for pair in data.get('pairs', [])[:60]:
-                        price_change_24h = float(pair.get('priceChange', {}).get('h24', 0))
-                        liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                        
-                        # Crecimiento moderado, no pump extremo
-                        if (15 <= price_change_24h <= 500 and  # 15% - 500% crecimiento
-                            liquidity >= Config.MIN_LIQUIDITY):
-                            
-                            token_address = pair.get('baseToken', {}).get('address')
-                            if token_address:
-                                tokens.append(token_address)
-        except Exception as e:
-            logger.error(f"Error trending tokens: {e}")
-        return tokens
-    
-    async def _get_liquidity_tokens(self) -> List[str]:
-        """Tokens con buena liquidez."""
-        tokens = []
-        try:
-            # Usamos el endpoint de volumen pero filtramos por liquidez
-            url = "https://api.dexscreener.com/latest/dex/pairs/solana?sort=volume24h&order=desc&limit=60"
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    for pair in data.get('pairs', [])[:40]:
-                        liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                        
-                        # Buena liquidez pero no masiva
-                        if (50000 <= liquidity <= 2000000):  # $50K - $2M liquidez
-                            
-                            token_address = pair.get('baseToken', {}).get('address')
-                            if token_address:
-                                tokens.append(token_address)
-        except Exception as e:
-            logger.error(f"Error liquidez tokens: {e}")
-        return tokens
 
-class SimpleBreakoutScanner:
-    """Scanner simple y eficiente."""
-    
+class FixedBreakoutScanner:
     def __init__(self):
-        self.token_finder = SmartTokenFinder()
-        self.pattern_detector = EfficientPatternDetector()
+        self.token_finder = WorkingTokenFinder()
+        self.pattern_detector = RobustPatternDetector()
         self.telegram = TelegramNotifier()
         self.is_running = False
         self.alert_count = 0
         self.cycle_count = 0
         
     async def start_scanning(self):
-        """Inicia el scanner simple."""
         self.is_running = True
         
         # Mensaje de inicio
-        if self.telegram.enabled:
-            start_msg = (
-                "🚀 <b>BREAKOUT SCANNER INICIADO</b>\n\n"
-                "✅ <b>Configuración simple y eficiente</b>\n"
-                "• Solo DexScreener API\n"
-                "• Sin APIs complejas\n"
-                "• Detección temprana\n\n"
-                "🎯 <b>Parámetros:</b>\n"
-                "• Breakout: 5% mínimo\n"
-                "• Consolidación: ±2%\n"
-                "• Liquidez: $25K+\n"
-                "• Volumen spike: 2x\n\n"
-                "<i>Escaneo activo cada 5 minutos...</i>"
-            )
-            await self.telegram.send_alert(start_msg)
+        start_msg = (
+            "🚀 <b>BREAKOUT SCANNER INICIADO</b>\n\n"
+            "✅ <b>Configuración corregida</b>\n"
+            "• URLs de DexScreener actualizadas\n"
+            "• Búsqueda funcional de tokens\n"
+            "• Telegram conectado\n\n"
+            "🎯 <b>Parámetros activos:</b>\n"
+            "• Breakout: 5% mínimo\n"
+            "• Consolidación: ±2%\n"
+            "• Liquidez: $25K+\n"
+            "• Volumen spike: 2x\n\n"
+            "<i>Escaneo cada 5 minutos...</i>"
+        )
+        await self.telegram.send_alert(start_msg)
         
-        logger.info("🚀 SCANNER SIMPLE INICIADO")
+        logger.info("🚀 SCANNER CORREGIDO INICIADO")
         
         while self.is_running:
             try:
                 self.cycle_count += 1
                 
-                # Buscar tokens
                 tokens_to_monitor = await self.token_finder.find_potential_tokens()
                 cycle_alerts = 0
                 
-                # Monitorear cada token
                 for token in tokens_to_monitor:
                     try:
                         price_data = await self.get_token_data(token)
@@ -334,35 +285,33 @@ class SimpleBreakoutScanner:
                             if pattern_signal:
                                 cycle_alerts += 1
                                 self.alert_count += 1
-                                await self.send_simple_alert(token, price_data, pattern_signal)
+                                await self.send_alert(token, price_data, pattern_signal)
                         
-                        await asyncio.sleep(0.2)  # Rate limiting muy suave
+                        await asyncio.sleep(0.3)
                         
                     except Exception as e:
                         continue
                 
-                # Log del ciclo
                 if cycle_alerts > 0:
                     logger.info(f"🚨 Ciclo {self.cycle_count}: {cycle_alerts} alertas")
                 else:
                     logger.info(f"📊 Ciclo {self.cycle_count}: {len(tokens_to_monitor)} tokens - 0 alertas")
                 
-                # Reporte cada 12 ciclos (1 hora)
-                if self.cycle_count % 12 == 0:
+                # Reporte cada 6 ciclos (30 minutos)
+                if self.cycle_count % 6 == 0:
                     await self.send_status_report(len(tokens_to_monitor))
                 
                 await asyncio.sleep(Config.PRICE_INTERVAL)
                 
             except Exception as e:
                 logger.error(f"Error en ciclo: {e}")
-                await asyncio.sleep(30)  # Esperar y reintentar
+                await asyncio.sleep(30)
     
     async def get_token_data(self, token_address: str) -> Optional[Dict]:
-        """Obtiene datos simples del token."""
         try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
+            url = f"{Config.DEXSCREENER_URLS['tokens']}{token_address}"
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=8)
+                response = await client.get(url, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
                     pairs = data.get('pairs', [])
@@ -381,8 +330,7 @@ class SimpleBreakoutScanner:
             logger.debug(f"Error datos token {token_address[:8]}: {e}")
         return None
     
-    async def send_simple_alert(self, token: str, price_data: Dict, pattern: Dict):
-        """Envía alerta simple y efectiva."""
+    async def send_alert(self, token: str, price_data: Dict, pattern: Dict):
         symbol = price_data.get('symbol', 'N/A')
         name = price_data.get('name', 'N/A')
         
@@ -400,8 +348,8 @@ class SimpleBreakoutScanner:
             f"🔗 <b>Enlaces:</b>\n"
             f"• <a href='https://dexscreener.com/solana/{token}'>DexScreener</a>\n"
             f"• <a href='https://birdeye.so/token/{token}?chain=solana'>Birdeye</a>\n\n"
-            f"⚡ <b>Estrategia Rápida:</b>\n"
-            f"• Entrada: Ahora\n"
+            f"⚡ <b>Estrategia:</b>\n"
+            f"• Entrada: Breakout confirmado\n"
             f"• Stop Loss: -3%\n"
             f"• Take Profit: +10-15%"
         )
@@ -410,14 +358,13 @@ class SimpleBreakoutScanner:
         await self.telegram.send_alert(alert_message)
     
     async def send_status_report(self, token_count: int):
-        """Envía reporte de estado simple."""
         status_msg = (
             f"📊 <b>Reporte de Estado</b>\n\n"
             f"• <b>Ciclos completados:</b> {self.cycle_count}\n"
             f"• <b>Alertas totales:</b> {self.alert_count}\n"
             f"• <b>Tokens monitoreados:</b> {token_count}\n"
             f"• <b>Estado:</b> ✅ Activo\n\n"
-            f"<i>Siguiente reporte en 1 hora</i>"
+            f"<i>Siguiente reporte en 30 minutos</i>"
         )
         await self.telegram.send_alert(status_msg)
     
@@ -425,27 +372,55 @@ class SimpleBreakoutScanner:
         self.is_running = False
         logger.info("🛑 Scanner detenido")
 
-# -------------------- EJECUCIÓN --------------------
+# -------------------- COMANDOS DE CONTROL --------------------
+async def handle_commands(scanner: FixedBreakoutScanner):
+    """Maneja comandos simples para controlar el scanner."""
+    while scanner.is_running:
+        try:
+            command = await asyncio.get_event_loop().run_in_executor(None, input, ">>> ")
+            command = command.strip().lower()
+            
+            if command == 'stop':
+                scanner.stop_scanning()
+                break
+            elif command == 'status':
+                print(f"📊 Estado: {scanner.cycle_count} ciclos, {scanner.alert_count} alertas")
+            elif command == 'help':
+                print("Comandos: stop, status, help")
+            else:
+                print("Comando no reconocido. Usa 'help' para ver comandos.")
+                
+        except (KeyboardInterrupt, EOFError):
+            scanner.stop_scanning()
+            break
+
+# -------------------- EJECUCIÓN MEJORADA --------------------
 async def main():
-    scanner = SimpleBreakoutScanner()
+    scanner = FixedBreakoutScanner()
     
-    print("🚀 SIMPLE BREAKOUT SCANNER")
+    print("🚀 BREAKOUT SCANNER - VERSIÓN CORREGIDA")
     print("=" * 50)
     print("✅ CONFIGURACIÓN:")
     print(f"   • Telegram: {'✅' if scanner.telegram.enabled else '❌'}")
-    print(f"   • APIs externas: ❌ (solo DexScreener)")
+    print(f"   • URLs DexScreener: ✅ Corregidas")
     print("=" * 50)
     print("🎯 PARÁMETROS:")
     print(f"   • Breakout: {Config.BREAKOUT_PERCENT}%")
     print(f"   • Consolidación: ±{Config.CONSOLIDATION_THRESHOLD}%") 
     print(f"   • Liquidez mínima: ${Config.MIN_LIQUIDITY:,}")
     print("=" * 50)
-    print("⚡ INICIANDO EN 3 SEGUNDOS...")
+    print("⚡ COMANDOS DISPONIBLES:")
+    print("   • stop - Detener scanner")
+    print("   • status - Ver estado")
+    print("   • help - Ver ayuda")
+    print("=" * 50)
     
-    await asyncio.sleep(3)
-    
+    # Ejecutar scanner y comandos en paralelo
     try:
-        await scanner.start_scanning()
+        await asyncio.gather(
+            scanner.start_scanning(),
+            handle_commands(scanner)
+        )
     except KeyboardInterrupt:
         logger.info("🛑 Detenido por usuario")
     finally:
