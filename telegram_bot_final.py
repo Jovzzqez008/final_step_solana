@@ -1,4 +1,4 @@
-# telegram_bot_final8.py  (modificado con Birdeye y delay de 8 segundos)
+# telegram_bot_final8.py  (corregido datetime.utcnow())
 import asyncio
 import json
 import time
@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 import httpx
 import asyncpg
 from typing import Dict, Any, List
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -162,7 +162,7 @@ def calculate_token_age(created_at_str: str) -> float:
             return None
         created_at_str = created_at_str.replace('Z', '+00:00')
         created_dt = datetime.fromisoformat(created_at_str)
-        current_dt = datetime.utcnow().replace(tzinfo=created_dt.tzinfo)
+        current_dt = datetime.now(timezone.utc).replace(tzinfo=created_dt.tzinfo)
         age_seconds = (current_dt - created_dt).total_seconds()
         return age_seconds / 3600.0
     except Exception as e:
