@@ -1,7 +1,8 @@
-# early_breakout_scanner.py
+# simple_breakout_scanner.py
 import asyncio
 import time
 import logging
+import os
 from typing import Dict, List, Deque, Optional
 from collections import deque
 import httpx
@@ -13,57 +14,84 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# -------------------- CONFIGURACIÓN PARA DETECCIÓN TEMPRANA --------------------
-class EarlyBreakoutConfig:
-    # PARÁMETROS OPTIMIZADOS PARA DETECCIÓN TEMPRANA
-    PRICE_INTERVAL = 300  # 5 minutos (más frecuente para capturar movimientos tempranos)
-    CONSOLIDATION_THRESHOLD = 2.0  # ±2% para consolidación (más sensible)
-    BREAKOUT_PERCENT = 5.0  # 5% mínimo para alerta (más temprano)
-    MIN_CONSOLIDATION_HOURS = 4  # 4 horas mínimas de consolidación
-    MIN_LIQUIDITY = 25000  # $25K mínimo (para tokens más jóvenes)
-    VOLUME_SPIKE_MULTIPLIER = 2.0  # 2.0x volumen para confirmación
+# -------------------- CONFIGURACIÓN SIMPLE --------------------
+class Config:
+    # Solo Telegram desde environment
+    TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
     
-    # Fuentes para tokens con potencial (no solo los más populares)
-    DEXSCREENER_SOURCES = {
-        'rising': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=priceChange24h&order=desc&limit=100",
-        'new_pairs': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=age&order=asc&limit=80",
-        'volume_spikes': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=volume24h&order=desc&limit=100"
+    # Scanner parameters optimizados
+    PRICE_INTERVAL = 300  # 5 minutos
+    CONSOLIDATION_THRESHOLD = 2.0
+    BREAKOUT_PERCENT = 5.0
+    MIN_CONSOLIDATION_HOURS = 4
+    MIN_LIQUIDITY = 25000
+    VOLUME_SPIKE_MULTIPLIER = 2.0
+    
+    # Fuentes DexScreener
+    DEXSCREENER_URLS = {
+        'volume': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=volume24h&order=desc&limit=100",
+        'new': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=age&order=asc&limit=80",
+        'trending': "https://api.dexscreener.com/latest/dex/pairs/solana?sort=priceChange24h&order=desc&limit=100"
     }
 
-# -------------------- DETECTOR PARA PATRÓN TEMPRANO --------------------
-class EarlyPatternDetector:
-    """
-    Detector especializado en capturar el patrón INICIAL de consolidación + breakout
-    en tokens que están empezando a moverse.
-    """
+class TelegramNotifier:
+    def __init__(self):
+        self.bot_token = Config.TELEGRAM_BOT_TOKEN
+        self.chat_id = Config.TELEGRAM_CHAT_ID
+        self.enabled = bool(self.bot_token and self.chat_id)
+        
+    async def send_alert(self, message: str):
+        """Envía alerta a Telegram."""
+        if not self.enabled:
+            logger.info("📱 Telegram no configurado - Mostrando en consola")
+            print(f"\n🔔 {message}\n")
+            return
+            
+        try:
+            url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+            payload = {
+                'chat_id': self.chat_id,
+                'text': message,
+                'parse_mode': 'HTML',
+                'disable_web_page_preview': True
+            }
+            
+            async with httpx.AsyncClient() as client:
+                response = await client.post(url, json=payload, timeout=10)
+                if response.status_code == 200:
+                    logger.info("📱 Alerta enviada a Telegram")
+                else:
+                    logger.error(f"❌ Error Telegram: {response.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Error enviando a Telegram: {e}")
+
+class EfficientPatternDetector:
+    """Detector eficiente sin APIs externas complejas."""
     
     def __init__(self):
         self.price_history: Dict[str, Deque[Dict]] = {}
         self.consolidation_trackers: Dict[str, Dict] = {}
         self.detected_patterns: Dict[str, float] = {}
-        self.potential_tokens: Dict[str, Dict] = {}  # Tokens en fase de consolidación
+        self.token_metadata: Dict[str, Dict] = {}
         
-    def analyze_early_pattern(self, token: str, price_data: Dict) -> Optional[Dict]:
-        """
-        Analiza específicamente el patrón INICIAL de consolidación + breakout
-        """
+    def analyze_pattern(self, token: str, price_data: Dict) -> Optional[Dict]:
+        """Análisis simple y eficiente del patrón."""
         current_price = price_data['price']
-        current_time = time.time()
         symbol = price_data.get('symbol', 'Unknown')
         
         # Inicializar historial si es nuevo token
         if token not in self.price_history:
-            self.price_history[token] = deque(maxlen=48)  # 4 horas de datos (5min intervals)
+            self.price_history[token] = deque(maxlen=36)  # 3 horas de datos
             self.consolidation_trackers[token] = {
                 'in_consolidation': False,
                 'consolidation_start': None,
                 'price_range': (0, 0),
                 'volume_base': 0,
-                'consolidation_hours': 0,
-                'breakout_attempts': 0
+                'consolidation_hours': 0
             }
         
-        # Agregar nuevo dato al historial
+        # Agregar nuevo dato
         self.price_history[token].append(price_data)
         
         # Solo analizar si tenemos suficientes datos
@@ -74,64 +102,48 @@ class EarlyPatternDetector:
         volumes = [p.get('volume_24h', 0) for p in self.price_history[token]]
         timestamps = [p['timestamp'] for p in self.price_history[token]]
         
-        # 1. Detectar fase de consolidación TEMPRANA
-        consolidation_signal = self._detect_early_consolidation(token, prices, volumes, timestamps)
+        # Detectar consolidación
+        consolidation_signal = self._detect_consolidation(token, prices, volumes, timestamps)
         
-        # 2. Detectar breakout INICIAL (no necesariamente masivo)
-        breakout_signal = self._detect_early_breakout(token, current_price, volumes[-1] if volumes else 0, consolidation_signal)
-        
-        # 3. Seguimiento de tokens con potencial (aún en consolidación)
-        potential_signal = self._track_potential_tokens(token, price_data, consolidation_signal)
+        # Detectar breakout
+        breakout_signal = self._detect_breakout(token, current_price, volumes[-1] if volumes else 0, consolidation_signal)
         
         if breakout_signal:
-            logger.info(f"🚨 BREAKOUT TEMPRANO DETECTADO: {symbol} - Breakout +{breakout_signal['breakout_percent']:.2f}%")
-            # Remover de potenciales si ya hizo breakout
-            if token in self.potential_tokens:
-                del self.potential_tokens[token]
+            logger.info(f"🚨 BREAKOUT: {symbol} +{breakout_signal['breakout_percent']:.2f}%")
             return breakout_signal
         
         return None
     
-    def _detect_early_consolidation(self, token: str, prices: List[float], volumes: List[float], timestamps: List[float]) -> Dict:
-        """Detecta consolidación en etapas tempranas."""
-        if len(prices) < 12:  # Mínimo 1 hora
+    def _detect_consolidation(self, token: str, prices: List[float], volumes: List[float], timestamps: List[float]) -> Dict:
+        if len(prices) < 12:
             return {'in_consolidation': False}
         
-        # Analizar las últimas 2-4 horas para consolidación
+        # Analizar últimas 2-3 horas
         recent_prices = prices[-24:] if len(prices) >= 24 else prices
-        recent_volumes = volumes[-24:] if len(volumes) >= 24 else volumes
-        
         min_price = min(recent_prices)
         max_price = max(recent_prices)
         price_range_pct = ((max_price - min_price) / min_price) * 100
         
-        # Está en consolidación si el rango de precio es < threshold
-        is_consolidating = price_range_pct <= EarlyBreakoutConfig.CONSOLIDATION_THRESHOLD
+        is_consolidating = price_range_pct <= Config.CONSOLIDATION_THRESHOLD
         
         tracker = self.consolidation_trackers[token]
         
         if is_consolidating:
             if not tracker['in_consolidation']:
-                # Nueva consolidación detectada - POTENCIAL ALTO
                 tracker.update({
                     'in_consolidation': True,
                     'consolidation_start': timestamps[0],
                     'price_range': (min_price, max_price),
-                    'volume_base': statistics.mean(recent_volumes) if recent_volumes else 0,
-                    'consolidation_hours': (timestamps[-1] - timestamps[0]) / 3600,
-                    'breakout_attempts': 0
+                    'volume_base': statistics.mean(volumes) if volumes else 0,
+                    'consolidation_hours': (timestamps[-1] - timestamps[0]) / 3600
                 })
-                logger.info(f"🔍 NUEVA CONSOLIDACIÓN DETECTADA: {token} - {price_range_pct:.2f}% rango")
-            else:
-                # Actualizar duración existente
-                tracker['consolidation_hours'] = (timestamps[-1] - tracker['consolidation_start']) / 3600
+                logger.info(f"🔍 Consolidación detectada: {token[:8]}... - {price_range_pct:.2f}% rango")
         else:
             tracker['in_consolidation'] = False
         
         return tracker
     
-    def _detect_early_breakout(self, token: str, current_price: float, current_volume: float, consolidation_data: Dict) -> Optional[Dict]:
-        """Detecta breakout INICIAL (no necesariamente masivo)."""
+    def _detect_breakout(self, token: str, current_price: float, current_volume: float, consolidation_data: Dict) -> Optional[Dict]:
         if not consolidation_data['in_consolidation']:
             return None
         
@@ -139,24 +151,20 @@ class EarlyPatternDetector:
         consolidation_hours = consolidation_data['consolidation_hours']
         volume_base = consolidation_data['volume_base']
         
-        # Calcular movimiento desde el máximo de consolidación
         move_from_consolidation = ((current_price - consolidation_high) / consolidation_high) * 100
-        
-        # Verificar volumen spike (confirmación)
         volume_spike = current_volume / volume_base if volume_base > 0 else 1
         
-        # Criterios MÁS FLEXIBLES para detección temprana
         is_valid_breakout = (
-            move_from_consolidation >= EarlyBreakoutConfig.BREAKOUT_PERCENT and
-            consolidation_hours >= EarlyBreakoutConfig.MIN_CONSOLIDATION_HOURS and
-            volume_spike >= EarlyBreakoutConfig.VOLUME_SPIKE_MULTIPLIER
+            move_from_consolidation >= Config.BREAKOUT_PERCENT and
+            consolidation_hours >= Config.MIN_CONSOLIDATION_HOURS and
+            volume_spike >= Config.VOLUME_SPIKE_MULTIPLIER
         )
         
         # Prevenir alertas duplicadas (2 horas mínimo entre alertas)
         last_alert = self.detected_patterns.get(token, 0)
         time_since_last_alert = time.time() - last_alert
         
-        if is_valid_breakout and time_since_last_alert > 7200:  # 2 horas
+        if is_valid_breakout and time_since_last_alert > 7200:
             breakout_signal = {
                 'token': token,
                 'breakout_percent': move_from_consolidation,
@@ -164,227 +172,197 @@ class EarlyPatternDetector:
                 'volume_spike': volume_spike,
                 'current_price': current_price,
                 'consolidation_range': consolidation_data['price_range'],
-                'timestamp': time.time(),
-                'pattern': 'early_breakout',
-                'stage': 'initial_breakout'  # ¡Esta es la clave!
+                'timestamp': time.time()
             }
             
             self.detected_patterns[token] = time.time()
             return breakout_signal
         
         return None
-    
-    def _track_potential_tokens(self, token: str, price_data: Dict, consolidation_data: Dict) -> None:
-        """Hace seguimiento de tokens que están en consolidación (potencial futuro)."""
-        if consolidation_data['in_consolidation']:
-            consolidation_hours = consolidation_data['consolidation_hours']
-            
-            # Solo trackear si lleva al menos 2 horas en consolidación
-            if consolidation_hours >= 2 and token not in self.potential_tokens:
-                self.potential_tokens[token] = {
-                    'symbol': price_data.get('symbol', 'Unknown'),
-                    'consolidation_start': consolidation_data['consolidation_start'],
-                    'consolidation_hours': consolidation_hours,
-                    'price_range': consolidation_data['price_range'],
-                    'liquidity': price_data.get('liquidity', 0),
-                    'first_detected': time.time()
-                }
-                logger.info(f"🎯 NUEVO POTENCIAL: {price_data.get('symbol', 'Unknown')} - {consolidation_hours:.1f}h consolidación")
-        
-        # Reporte periódico de tokens en consolidación
-        if int(time.time()) % 1800 == 0:  # Cada 30 minutos
-            self._report_potential_tokens()
-    
-    def _report_potential_tokens(self):
-        """Reporta tokens que están en fase de consolidación (potenciales futuros)."""
-        if self.potential_tokens:
-            logger.info(f"🔍 TOKENS EN CONSOLIDACIÓN ({len(self.potential_tokens)}):")
-            for token, data in list(self.potential_tokens.items()):
-                # Limpiar tokens que ya no están en consolidación
-                if time.time() - data['first_detected'] > 86400:  # 24 horas máximo
-                    del self.potential_tokens[token]
-                    continue
-                
-                logger.info(f"   • {data['symbol']}: {data['consolidation_hours']:.1f}h consolidación | "
-                           f"Rango: ±{((data['price_range'][1]-data['price_range'][0])/data['price_range'][0]*100):.2f}%")
 
-# -------------------- BUSCADOR DE TOKENS CON POTENCIAL --------------------
-class PotentialTokenFinder:
-    """Encuentra tokens con potencial de breakout temprano."""
+class SmartTokenFinder:
+    """Buscador inteligente solo con DexScreener."""
     
     def __init__(self):
         self.tracked_tokens = set()
-    
+        
     async def find_potential_tokens(self) -> List[str]:
-        """Encuentra tokens con características de potencial breakout."""
-        logger.info("🔍 Buscando tokens con potencial de breakout temprano...")
+        """Encuentra tokens con potencial usando solo DexScreener."""
+        logger.info("🔍 Buscando tokens con potencial...")
         
         tokens = set()
         
-        # 1. Tokens con crecimiento reciente (pero no masivo)
-        rising_tokens = await self._get_rising_tokens()
-        tokens.update(rising_tokens)
-        
-        # 2. Tokens nuevos con buena liquidez
-        new_tokens = await self._get_new_tokens_with_potential()
-        tokens.update(new_tokens)
-        
-        # 3. Tokens con spikes de volumen reciente
-        volume_tokens = await self._get_volume_spike_tokens()
+        # Estrategia 1: Tokens con buen volumen
+        volume_tokens = await self._get_volume_tokens()
         tokens.update(volume_tokens)
         
-        # 4. Siempre incluir Tokabu para referencia
+        # Estrategia 2: Tokens en crecimiento moderado
+        trending_tokens = await self._get_trending_tokens()
+        tokens.update(trending_tokens)
+        
+        # Estrategia 3: Tokens con liquidez sólida
+        liquidity_tokens = await self._get_liquidity_tokens()
+        tokens.update(liquidity_tokens)
+        
+        # Token de referencia
         tokens.add("H8xQ6poBjB9DTPMDTKWzWPrnxu4bDEhybxiouF8Ppump")
         
-        self.tracked_tokens = tokens
-        logger.info(f"🎯 Encontrados {len(tokens)} tokens con potencial")
+        logger.info(f"🎯 Encontrados {len(tokens)} tokens para monitorear")
         return list(tokens)
     
-    async def _get_rising_tokens(self) -> List[str]:
-        """Obtiene tokens con crecimiento reciente pero no extremo."""
+    async def _get_volume_tokens(self) -> List[str]:
+        """Tokens con volumen decente."""
         tokens = []
         try:
-            url = EarlyBreakoutConfig.SOURCES['rising']
+            url = Config.DEXSCREENER_URLS['volume']
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=15)
+                response = await client.get(url, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
                     for pair in data.get('pairs', [])[:80]:
-                        price_change_24h = float(pair.get('priceChange', {}).get('h24', 0))
                         liquidity = float(pair.get('liquidity', {}).get('usd', 0))
+                        volume_24h = float(pair.get('volume', {}).get('h24', 0))
                         
-                        # Buscar tokens con crecimiento moderado (10%-100%)
-                        if (10 <= price_change_24h <= 200 and
-                            liquidity >= EarlyBreakoutConfig.MIN_LIQUIDITY):
+                        # Filtros básicos de calidad
+                        if (liquidity >= Config.MIN_LIQUIDITY and 
+                            volume_24h >= 10000 and  # $10K volumen mínimo
+                            volume_24h <= 5000000):  # $5M volumen máximo (evitar los masivos)
                             
                             token_address = pair.get('baseToken', {}).get('address')
                             if token_address and token_address != 'unknown':
                                 tokens.append(token_address)
         except Exception as e:
-            logger.error(f"Error obteniendo tokens en crecimiento: {e}")
-        
+            logger.error(f"Error volumen tokens: {e}")
         return tokens
     
-    async def _get_new_tokens_with_potential(self) -> List[str]:
-        """Obtiene tokens nuevos pero con métricas prometedoras."""
+    async def _get_trending_tokens(self) -> List[str]:
+        """Tokens con crecimiento saludable."""
         tokens = []
         try:
-            url = EarlyBreakoutConfig.SOURCES['new_pairs']
+            url = Config.DEXSCREENER_URLS['trending']
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=15)
+                response = await client.get(url, timeout=10)
                 if response.status_code == 200:
                     data = response.json()
                     for pair in data.get('pairs', [])[:60]:
-                        created_at = pair.get('pairCreatedAt')
-                        liquidity = float(pair.get('liquidity', {}).get('usd', 0))
-                        volume_24h = float(pair.get('volume', {}).get('h24', 0))
-                        
-                        # Tokens de 1-30 días con buena liquidez
-                        if created_at:
-                            age_days = (time.time() * 1000 - created_at) / (1000 * 86400)
-                            if (1 <= age_days <= 30 and
-                                liquidity >= EarlyBreakoutConfig.MIN_LIQUIDITY and
-                                volume_24h >= 5000):  # $5K volumen mínimo
-                                
-                                token_address = pair.get('baseToken', {}).get('address')
-                                if token_address:
-                                    tokens.append(token_address)
-        except Exception as e:
-            logger.error(f"Error obteniendo tokens nuevos: {e}")
-        
-        return tokens
-    
-    async def _get_volume_spike_tokens(self) -> List[str]:
-        """Obtiene tokens con spikes de volumen reciente."""
-        tokens = []
-        try:
-            url = EarlyBreakoutConfig.SOURCES['volume_spikes']
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=15)
-                if response.status_code == 200:
-                    data = response.json()
-                    for pair in data.get('pairs', [])[:70]:
-                        volume_24h = float(pair.get('volume', {}).get('h24', 0))
+                        price_change_24h = float(pair.get('priceChange', {}).get('h24', 0))
                         liquidity = float(pair.get('liquidity', {}).get('usd', 0))
                         
-                        # Tokens con volumen decente pero no masivo
-                        if (5000 <= volume_24h <= 500000 and  # $5K - $500K volumen
-                            liquidity >= 10000):  # $10K liquidez mínima
+                        # Crecimiento moderado, no pump extremo
+                        if (15 <= price_change_24h <= 500 and  # 15% - 500% crecimiento
+                            liquidity >= Config.MIN_LIQUIDITY):
                             
                             token_address = pair.get('baseToken', {}).get('address')
                             if token_address:
                                 tokens.append(token_address)
         except Exception as e:
-            logger.error(f"Error obteniendo tokens con volumen: {e}")
-        
+            logger.error(f"Error trending tokens: {e}")
+        return tokens
+    
+    async def _get_liquidity_tokens(self) -> List[str]:
+        """Tokens con buena liquidez."""
+        tokens = []
+        try:
+            # Usamos el endpoint de volumen pero filtramos por liquidez
+            url = "https://api.dexscreener.com/latest/dex/pairs/solana?sort=volume24h&order=desc&limit=60"
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    for pair in data.get('pairs', [])[:40]:
+                        liquidity = float(pair.get('liquidity', {}).get('usd', 0))
+                        
+                        # Buena liquidez pero no masiva
+                        if (50000 <= liquidity <= 2000000):  # $50K - $2M liquidez
+                            
+                            token_address = pair.get('baseToken', {}).get('address')
+                            if token_address:
+                                tokens.append(token_address)
+        except Exception as e:
+            logger.error(f"Error liquidez tokens: {e}")
         return tokens
 
-# -------------------- SISTEMA PRINCIPAL MEJORADO --------------------
-class EarlyBreakoutScanner:
-    """
-    Sistema especializado en detectar breakouts TEMPRANOS
-    en tokens que están empezando a moverse.
-    """
+class SimpleBreakoutScanner:
+    """Scanner simple y eficiente."""
     
     def __init__(self):
-        self.token_finder = PotentialTokenFinder()
-        self.pattern_detector = EarlyPatternDetector()
+        self.token_finder = SmartTokenFinder()
+        self.pattern_detector = EfficientPatternDetector()
+        self.telegram = TelegramNotifier()
         self.is_running = False
         self.alert_count = 0
-    
-    async def start_early_scan(self, telegram_context=None):
-        """Inicia el escaneo para breakouts tempranos."""
+        self.cycle_count = 0
+        
+    async def start_scanning(self):
+        """Inicia el scanner simple."""
         self.is_running = True
-        logger.info("🚀 INICIANDO EARLY BREAKOUT SCANNER")
-        logger.info("🎯 Objetivo: Tokens que empiezan patrón consolidación + breakout")
+        
+        # Mensaje de inicio
+        if self.telegram.enabled:
+            start_msg = (
+                "🚀 <b>BREAKOUT SCANNER INICIADO</b>\n\n"
+                "✅ <b>Configuración simple y eficiente</b>\n"
+                "• Solo DexScreener API\n"
+                "• Sin APIs complejas\n"
+                "• Detección temprana\n\n"
+                "🎯 <b>Parámetros:</b>\n"
+                "• Breakout: 5% mínimo\n"
+                "• Consolidación: ±2%\n"
+                "• Liquidez: $25K+\n"
+                "• Volumen spike: 2x\n\n"
+                "<i>Escaneo activo cada 5 minutos...</i>"
+            )
+            await self.telegram.send_alert(start_msg)
+        
+        logger.info("🚀 SCANNER SIMPLE INICIADO")
         
         while self.is_running:
             try:
-                # 1. Obtener lista de tokens con potencial
-                potential_tokens = await self.token_finder.find_potential_tokens()
+                self.cycle_count += 1
                 
-                # 2. Monitorear cada token
+                # Buscar tokens
+                tokens_to_monitor = await self.token_finder.find_potential_tokens()
                 cycle_alerts = 0
-                for token in potential_tokens:
+                
+                # Monitorear cada token
+                for token in tokens_to_monitor:
                     try:
                         price_data = await self.get_token_data(token)
                         if price_data and price_data['price'] > 0:
-                            # Analizar patrón de breakout TEMPRANO
-                            pattern_signal = self.pattern_detector.analyze_early_pattern(token, price_data)
+                            pattern_signal = self.pattern_detector.analyze_pattern(token, price_data)
                             
                             if pattern_signal:
                                 cycle_alerts += 1
                                 self.alert_count += 1
-                                await self.send_early_alert(token, price_data, pattern_signal, telegram_context)
+                                await self.send_simple_alert(token, price_data, pattern_signal)
                         
-                        # Rate limiting más agresivo
-                        await asyncio.sleep(0.5)
+                        await asyncio.sleep(0.2)  # Rate limiting muy suave
                         
                     except Exception as e:
-                        logger.debug(f"Error monitoreando {token}: {e}")
                         continue
                 
+                # Log del ciclo
                 if cycle_alerts > 0:
-                    logger.info(f"🚨 Ciclo completado: {cycle_alerts} alertas de breakout temprano")
+                    logger.info(f"🚨 Ciclo {self.cycle_count}: {cycle_alerts} alertas")
+                else:
+                    logger.info(f"📊 Ciclo {self.cycle_count}: {len(tokens_to_monitor)} tokens - 0 alertas")
                 
-                # Reporte de estado cada ciclo
-                logger.info(f"📊 Estadísticas: {self.alert_count} alertas totales - "
-                           f"Monitoreando {len(potential_tokens)} tokens - "
-                           f"{len(self.pattern_detector.potential_tokens)} en consolidación")
+                # Reporte cada 12 ciclos (1 hora)
+                if self.cycle_count % 12 == 0:
+                    await self.send_status_report(len(tokens_to_monitor))
                 
-                # Esperar hasta próximo ciclo
-                await asyncio.sleep(EarlyBreakoutConfig.PRICE_INTERVAL)
+                await asyncio.sleep(Config.PRICE_INTERVAL)
                 
             except Exception as e:
-                logger.error(f"Error en ciclo principal: {e}")
-                await asyncio.sleep(30)
+                logger.error(f"Error en ciclo: {e}")
+                await asyncio.sleep(30)  # Esperar y reintentar
     
     async def get_token_data(self, token_address: str) -> Optional[Dict]:
-        """Obtiene datos de precio y volumen para un token."""
+        """Obtiene datos simples del token."""
         try:
             url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
             async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=10)
+                response = await client.get(url, timeout=8)
                 if response.status_code == 200:
                     data = response.json()
                     pairs = data.get('pairs', [])
@@ -400,100 +378,78 @@ class EarlyBreakoutScanner:
                             'timestamp': time.time()
                         }
         except Exception as e:
-            logger.debug(f"Error obteniendo datos para {token_address}: {e}")
-        
+            logger.debug(f"Error datos token {token_address[:8]}: {e}")
         return None
     
-    async def send_early_alert(self, token: str, price_data: Dict, pattern: Dict, context=None):
-        """Envía alerta específica de breakout TEMPRANO."""
+    async def send_simple_alert(self, token: str, price_data: Dict, pattern: Dict):
+        """Envía alerta simple y efectiva."""
         symbol = price_data.get('symbol', 'N/A')
         name = price_data.get('name', 'N/A')
-        liquidity = price_data.get('liquidity', 0)
         
         alert_message = (
-            f"🚀 *BREAKOUT TEMPRANO DETECTADO* 🚀\n\n"
-            f"*Token:* {symbol} ({name})\n"
-            f"*Address:* `{token}`\n"
-            f"*Breakout:* +{pattern['breakout_percent']:.2f}% 📈\n"
-            f"*Consolidación previa:* {pattern['consolidation_hours']:.1f} horas\n"
-            f"*Spike de volumen:* {pattern['volume_spike']:.1f}x\n\n"
-            f"*Rango de consolidación:*\n"
-            f"• Mínimo: ${pattern['consolidation_range'][0]:.6f}\n"
-            f"• Máximo: ${pattern['consolidation_range'][1]:.6f}\n"
-            f"• Precio actual: ${pattern['current_price']:.6f}\n\n"
-            f"*Métricas de calidad:*\n"
-            f"• Liquidez: ${liquidity:,.2f}\n"
-            f"• Volumen 24h: ${price_data.get('volume_24h', 0):,.2f}\n\n"
-            f"🔗 *Análisis rápido:*\n"
-            f"- [DexScreener](https://dexscreener.com/solana/{token})\n"
-            f"- [Chart 6h](https://dexscreener.com/solana/{token}?chart=interval=6h)\n"
-            f"- [Birdeye](https://birdeye.so/token/{token}?chain=solana)\n\n"
-            f"⚡ *ESTRATEGIA RECOMENDADA:*\n"
-            f"• Entrada temprana en breakout inicial\n"
-            f"• Stop loss: -3% desde entrada\n"
-            f"• Take profit: +10-15% objetivo\n\n"
-            f"🎯 *PATRÓN: BREAKOUT INICIAL DETECTADO*"
+            f"🚀 <b>BREAKOUT DETECTADO</b>\n\n"
+            f"<b>Token:</b> {symbol}\n"
+            f"<b>Nombre:</b> {name}\n"
+            f"<b>Address:</b> <code>{token}</code>\n\n"
+            f"📊 <b>Métricas:</b>\n"
+            f"• <b>Breakout:</b> +{pattern['breakout_percent']:.2f}% 🚀\n"
+            f"• <b>Consolidación:</b> {pattern['consolidation_hours']:.1f} horas\n"
+            f"• <b>Volumen:</b> {pattern['volume_spike']:.1f}x spike\n"
+            f"• <b>Precio:</b> ${pattern['current_price']:.6f}\n"
+            f"• <b>Liquidez:</b> ${price_data.get('liquidity', 0):,.2f}\n\n"
+            f"🔗 <b>Enlaces:</b>\n"
+            f"• <a href='https://dexscreener.com/solana/{token}'>DexScreener</a>\n"
+            f"• <a href='https://birdeye.so/token/{token}?chain=solana'>Birdeye</a>\n\n"
+            f"⚡ <b>Estrategia Rápida:</b>\n"
+            f"• Entrada: Ahora\n"
+            f"• Stop Loss: -3%\n"
+            f"• Take Profit: +10-15%"
         )
         
-        logger.info(f"🚀 ALERTA BREAKOUT TEMPRANO: {symbol} +{pattern['breakout_percent']:.2f}% después de {pattern['consolidation_hours']:.1f}h consolidación")
-        
-        # Enviar a Telegram si hay contexto
-        if context:
-            try:
-                await context.bot.send_message(
-                    chat_id=context.job.chat_id,
-                    text=alert_message,
-                    parse_mode='Markdown',
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                logger.error(f"Error enviando alerta Telegram: {e}")
-        else:
-            # Solo log si no hay Telegram
-            print(f"\n{'='*60}")
-            print("🚀 ALERTA BREAKOUT TEMPRANO:")
-            print(f"Token: {symbol} ({name})")
-            print(f"Breakout: +{pattern['breakout_percent']:.2f}%")
-            print(f"Consolidación: {pattern['consolidation_hours']:.1f} horas")
-            print(f"Volumen: {pattern['volume_spike']:.1f}x spike")
-            print(f"ESTRATEGIA: Entrada temprana | Stop loss -3% | TP +10-15%")
-            print(f"{'='*60}\n")
+        logger.info(f"🚀 ALERTA: {symbol} +{pattern['breakout_percent']:.2f}%")
+        await self.telegram.send_alert(alert_message)
+    
+    async def send_status_report(self, token_count: int):
+        """Envía reporte de estado simple."""
+        status_msg = (
+            f"📊 <b>Reporte de Estado</b>\n\n"
+            f"• <b>Ciclos completados:</b> {self.cycle_count}\n"
+            f"• <b>Alertas totales:</b> {self.alert_count}\n"
+            f"• <b>Tokens monitoreados:</b> {token_count}\n"
+            f"• <b>Estado:</b> ✅ Activo\n\n"
+            f"<i>Siguiente reporte en 1 hora</i>"
+        )
+        await self.telegram.send_alert(status_msg)
     
     def stop_scanning(self):
-        """Detiene el escaneo."""
         self.is_running = False
-        logger.info("🛑 Early Breakout Scanner detenido")
+        logger.info("🛑 Scanner detenido")
 
-# -------------------- EJECUCIÓN INMEDIATA --------------------
+# -------------------- EJECUCIÓN --------------------
 async def main():
-    """Función principal para ejecutar el scanner temprano."""
-    scanner = EarlyBreakoutScanner()
+    scanner = SimpleBreakoutScanner()
     
-    print("🚀 EARLY BREAKOUT SCANNER")
+    print("🚀 SIMPLE BREAKOUT SCANNER")
     print("=" * 50)
-    print("OBJETIVO: Detectar tokens que EMPIEZAN patrón")
-    print("consolidación + breakout (CAPTURAR DESPEGUE)")
+    print("✅ CONFIGURACIÓN:")
+    print(f"   • Telegram: {'✅' if scanner.telegram.enabled else '❌'}")
+    print(f"   • APIs externas: ❌ (solo DexScreener)")
     print("=" * 50)
-    print("PARÁMETROS PARA DETECCIÓN TEMPRANA:")
-    print(f"• Consolidación: ±{EarlyBreakoutConfig.CONSOLIDATION_THRESHOLD}%")
-    print(f"• Breakout: {EarlyBreakoutConfig.BREAKOUT_PERCENT}% mínimo (MÁS TEMPRANO)")
-    print(f"• Liquidez mínima: ${EarlyBreakoutConfig.MIN_LIQUIDITY:,}")
-    print(f"• Consolidación mínima: {EarlyBreakoutConfig.MIN_CONSOLIDATION_HOURS}h")
+    print("🎯 PARÁMETROS:")
+    print(f"   • Breakout: {Config.BREAKOUT_PERCENT}%")
+    print(f"   • Consolidación: ±{Config.CONSOLIDATION_THRESHOLD}%") 
+    print(f"   • Liquidez mínima: ${Config.MIN_LIQUIDITY:,}")
     print("=" * 50)
+    print("⚡ INICIANDO EN 3 SEGUNDOS...")
+    
+    await asyncio.sleep(3)
     
     try:
-        # Ejecutar por 30 minutos para prueba
-        await asyncio.wait_for(
-            scanner.start_early_scan(),
-            timeout=1800  # 30 minutos
-        )
-    except asyncio.TimeoutError:
-        logger.info("⏰ Prueba completada (30 minutos)")
+        await scanner.start_scanning()
     except KeyboardInterrupt:
         logger.info("🛑 Detenido por usuario")
     finally:
         scanner.stop_scanning()
 
 if __name__ == "__main__":
-    # Ejecutar el scanner temprano
     asyncio.run(main())
