@@ -1,33 +1,12 @@
 """
-bot_jupiter_v2_pro_full.py
+bot_jupiter_v2_pro_optimized.py
 
-Monolítico y modularizado en un solo archivo para desplegar en Railway.
-Incluye:
- - Scanner de tokens 'FLAT' (estilo PESHI) usando Jupiter V2 + DexScreener
- - Monitor Pump.fun pre-graduación vía WebSocket (HELIUS_WSS_URL)
- - Verificación rápida con Jupiter V2 (audit: mintAuthority / freezeAuthority)
- - Alerta por Telegram (un único canal)
- - Almacenamiento simple de mints notificados en Postgres (asyncpg)
-
-Dependencias (requirements.txt):
-aiohttp
-asyncpg
-python-telegram-bot==20.3
-websockets
-sqlalchemy[aio]
-
-Notas importantes:
- - Ajusta los endpoints de DexScreener si tu cuenta/plan requiere API key.
- - Debes definir las variables de entorno que ya tienes en Railway:
-   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL,
-   HELIUS_RPC_URL, HELIUS_WSS_URL, DEXSCREENER_API (opcional),
-   JUPITER_LITE_URL (opcional, por defecto https://lite-api.jup.ag)
- - Define PUMPFUN_PROGRAM_ID si quieres filtrar por programa de Pump.fun en el WebSocket
-
-Uso:
- 1) Despliega a Railway con las variables de entorno
- 2) Ejecuta: python bot_jupiter_v2_pro_full.py
-
+Bot optimizado para encontrar tokens en planos reales con PostgreSQL
+- Filtros relajados para encontrar planos en cualquier dirección (rojo/verde)
+- Enfoque en patrón de volumen y precio, no en metrics absolutas
+- PostgreSQL mantenido para persistencia
+- Mejor visualización de mints en alertas
+- Sistema Pump.fun completo incluido
 """
 
 import os
@@ -37,7 +16,8 @@ import time
 import logging
 from datetime import datetime, timedelta
 from statistics import pstdev, mean
-from collections import deque, defaultdict
+from collections import defaultdict
+import re
 
 import aiohttp
 import asyncpg
@@ -45,102 +25,148 @@ import websockets
 from telegram import Bot
 from telegram.constants import ParseMode
 
-# ------------------ CONFIG & ENV ------------------
+# ------------------ CONFIGURACIÓN ------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")
 HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-DEXSCREENER_API = os.getenv("DEXSCREENER_API", "")  # optional
 JUPITER_BASE = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag")
-JUPITER_TOKENS_V2 = f"{JUPITER_BASE}/tokens/v2"
 
-# Pump.fun specifics
-PUMPFUN_PROGRAM_ID = os.getenv("PUMPFUN_PROGRAM_ID", "pumpfun1Mt11111111111111111111111111111111")
-PUMP_PRE_GRADUATION_THRESHOLD = float(os.getenv("PUMP_PRE_THRESHOLD", "60000"))  # 60k
+# Pump.fun
+PUMPFUN_PROGRAM_ID = os.getenv("PUMPFUN_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+PUMP_PRE_GRADUATION_THRESHOLD = float(os.getenv("PUMP_PRE_THRESHOLD", "60000"))
 
-# Monitoring params (editable)
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "70000"))
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "70000"))
-MIN_FLAT_MINUTES = int(os.getenv("MIN_FLAT_MINUTES", "22"))
-FLAT_STD_THRESHOLD = float(os.getenv("FLAT_STD_THRESHOLD", "0.12"))
-BREAKOUT_STEP = float(os.getenv("BREAKOUT_STEP", "10.0"))
+# FILTROS RELAJADOS - ENFOCADOS EN PATRONES, NO EN MÉTRICAS ABSOLUTAS
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "40000"))  # Mínimo razonable
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))  # Volumen muy bajo para encontrar planos
+MAX_VOLUME_24H = float(os.getenv("MAX_VOLUME_24H", "300000"))  # No demasiado popular
 
-# Candle settings
+# Detección FLAT mejorada - enfoque en patrón, no en precio
+MIN_FLAT_MINUTES = int(os.getenv("MIN_FLAT_MINUTES", "180"))
+FLAT_STD_THRESHOLD = float(os.getenv("FLAT_STD_THRESHOLD", "0.15"))
+VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "100"))
+MIN_CONSECUTIVE_LOW = int(os.getenv("MIN_CONSECUTIVE_LOW", "6"))
+
+# Configuración de análisis
 CANDLE_INTERVAL_MINUTES = 15
-CANDLES_TO_CHECK = 12  # lookback of 12 candles * 15m = 3 hours (adjustable)
+CANDLES_TO_CHECK = 16  # 4 horas de datos
 
 # DB tables
 DB_TABLE_NOTIFIED = "notified_mints"
 
 # Logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("jupiter_bot_full")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot_optimized.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("jupiter_bot_optimized")
 
-# ------------------ GLOBAL STATE ------------------
+# ------------------ ESTADO GLOBAL ------------------
 http_session: aiohttp.ClientSession | None = None
 pg_pool: asyncpg.Pool | None = None
 telegram_bot: Bot | None = None
 
-# price history per token (keep recent samples)
-price_histories = defaultdict(lambda: deque(maxlen=200))
-flat_tokens = {}  # token -> info
-monitored_tokens = set()
-
-# ------------------ UTIL HELPERS ------------------
+# ------------------ MANEJO DE CONEXIONES ------------------
 async def get_http_session():
     global http_session
-    if http_session is None:
-        http_session = aiohttp.ClientSession()
+    if http_session is None or http_session.closed:
+        timeout = aiohttp.ClientTimeout(total=15, connect=5)
+        http_session = aiohttp.ClientSession(timeout=timeout)
     return http_session
 
-async def send_telegram(text: str, parse_mode=ParseMode.MARKDOWN):
+async def safe_send_telegram(text: str, parse_mode=ParseMode.MARKDOWN):
     global telegram_bot
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram token/chat not configured. Skipping alert.")
-        return
+        logger.warning("Telegram no configurado")
+        return False
+    
     if telegram_bot is None:
         telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    
     try:
-        await telegram_bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode=parse_mode, disable_web_page_preview=False)
+        await telegram_bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID, 
+            text=text, 
+            parse_mode=parse_mode, 
+            disable_web_page_preview=False
+        )
+        logger.info("✅ Alerta enviada a Telegram")
+        return True
     except Exception as e:
-        logger.error(f"Error sending telegram: {e}")
+        logger.error(f"❌ Error enviando telegram: {e}")
+        return False
 
-# ------------------ DB ------------------
+# ------------------ POSTGRESQL ------------------
 async def init_db():
     global pg_pool
     if not DATABASE_URL:
-        logger.warning("DATABASE_URL not provided; running without persistence.")
+        logger.warning("DATABASE_URL no proporcionado; ejecutando sin persistencia.")
         return
-    pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with pg_pool.acquire() as conn:
-        await conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {DB_TABLE_NOTIFIED} (
-                mint TEXT PRIMARY KEY,
-                first_notified_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-                data JSONB
-            );
-        """)
-    logger.info("DB initialized")
+    
+    try:
+        pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        async with pg_pool.acquire() as conn:
+            await conn.execute(f"""
+                CREATE TABLE IF NOT EXISTS {DB_TABLE_NOTIFIED} (
+                    mint TEXT PRIMARY KEY,
+                    first_notified_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                    last_alert_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                    alert_count INTEGER DEFAULT 1,
+                    data JSONB,
+                    alert_type TEXT
+                );
+            """)
+            await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_notified_type ON {DB_TABLE_NOTIFIED}(alert_type)")
+            await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_notified_time ON {DB_TABLE_NOTIFIED}(first_notified_at)")
+        logger.info("✅ PostgreSQL inicializado")
+        return True
+    except Exception as e:
+        logger.error(f"❌ Error inicializando PostgreSQL: {e}")
+        return False
 
-async def mark_notified(mint: str, data: dict):
+async def mark_notified(mint: str, data: dict, alert_type="flat"):
     if pg_pool is None:
-        # no persistence
-        flat_tokens[mint] = flat_tokens.get(mint, {})
-        flat_tokens[mint]["notified"] = True
         return
-    async with pg_pool.acquire() as conn:
-        await conn.execute(f"INSERT INTO {DB_TABLE_NOTIFIED}(mint, data) VALUES($1, $2) ON CONFLICT (mint) DO NOTHING", mint, json.dumps(data))
+    
+    try:
+        async with pg_pool.acquire() as conn:
+            await conn.execute(f"""
+                INSERT INTO {DB_TABLE_NOTIFIED}(mint, data, alert_type) 
+                VALUES($1, $2, $3)
+                ON CONFLICT (mint) DO UPDATE SET 
+                    last_alert_at = now(),
+                    alert_count = {DB_TABLE_NOTIFIED}.alert_count + 1,
+                    data = EXCLUDED.data
+            """, mint, json.dumps(data), alert_type)
+        logger.debug(f"✅ Token {mint[:8]}... marcado como notificado")
+    except Exception as e:
+        logger.error(f"❌ Error marcando como notificado: {e}")
 
-async def is_notified(mint: str) -> bool:
+async def is_notified(mint: str, alert_type=None, cooldown_hours=4) -> bool:
     if pg_pool is None:
-        return flat_tokens.get(mint, {}).get("notified", False)
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint=$1", mint)
-        return bool(row)
+        return False
+    
+    try:
+        async with pg_pool.acquire() as conn:
+            if alert_type:
+                query = f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint = $1 AND alert_type = $2 AND last_alert_at > now() - interval '{cooldown_hours} hours'"
+                row = await conn.fetchrow(query, mint, alert_type)
+            else:
+                query = f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint = $1 AND last_alert_at > now() - interval '{cooldown_hours} hours'"
+                row = await conn.fetchrow(query, mint)
+            
+            return bool(row)
+    except Exception as e:
+        logger.error(f"❌ Error verificando notificación: {e}")
+        return False
 
-# ------------------ JUPITER V2 CLIENT (simplified) ------------------
+# ------------------ CLIENTE JUPITER OPTIMIZADO ------------------
 class JupiterClient:
     def __init__(self, base_url=JUPITER_BASE):
         self.base = base_url
@@ -150,11 +176,14 @@ class JupiterClient:
     async def request(self, path: str, cache_key: str = None, ttl: int = None):
         session = await get_http_session()
         ttl = ttl if ttl is not None else self.cache_ttl
+        
         if cache_key and cache_key in self.cache:
             cached, ts = self.cache[cache_key]
             if time.time() - ts < ttl:
                 return cached
+        
         url = f"{self.base}{path}" if path.startswith("/") else f"{self.base}/{path}"
+        
         try:
             async with session.get(url, timeout=10) as resp:
                 if resp.status == 200:
@@ -163,370 +192,531 @@ class JupiterClient:
                         self.cache[cache_key] = (data, time.time())
                     return data
                 else:
-                    logger.debug(f"Jupiter request {url} status {resp.status}")
+                    logger.debug(f"HTTP {resp.status} para {url}")
                     return None
         except Exception as e:
-            logger.debug(f"Jupiter request error: {e}")
+            logger.debug(f"Request error {url}: {e}")
             return None
 
-    async def get_multiple_token_sources(self):
-        # Gather candidates from endpoints similar to your previous script
+    async def get_potential_flat_tokens(self):
+        """Obtiene tokens con potencial de patrón FLAT - FILTROS RELAJADOS"""
         endpoints = [
-            f"/tokens/v2/toporganicscore/1h?limit=80",
-            f"/tokens/v2/toptraded/1h?limit=80",
-            f"/tokens/v2/tag?query=verified",
-            f"/tokens/v2/recent?limit=50"
+            "/tokens/v2/toporganicscore/1h?limit=40",
+            "/tokens/v2/toptraded/1h?limit=30",
+            "/tokens/v2/recent?limit=30"
         ]
-        results = []
+        
+        all_tokens = []
         for i, ep in enumerate(endpoints):
-            data = await self.request(ep, cache_key=f"jup_ep_{i}", ttl=600)
+            data = await self.request(ep, cache_key=f"jup_ep_{i}", ttl=300)
             if data:
-                results.extend(data)
-        return results
+                all_tokens.extend(data)
+            await asyncio.sleep(0.3)
+        
+        # FILTROS RELAJADOS - ENFOCADOS EN ENCONTRAR PLANOS
+        filtered_tokens = []
+        for token in all_tokens:
+            if not isinstance(token, dict):
+                continue
+                
+            mint = token.get('id')
+            liquidity = token.get('liquidity', 0)
+            volume24h = token.get('volume24h', 0) or 0
+            
+            # FILTROS MÍNIMOS RELAJADOS
+            has_liquidity = liquidity >= MIN_LIQUIDITY
+            has_recent_activity = volume24h >= MIN_VOLUME_24H and volume24h <= MAX_VOLUME_24H
+            
+            # No excluir por market cap alto/bajo - los planos pueden ocurrir en cualquier rango
+            # No excluir por score orgánico - los planos no discriminan
+            
+            if has_liquidity and has_recent_activity and mint:
+                filtered_tokens.append(token)
+        
+        logger.info(f"🎯 De {len(all_tokens)} tokens -> {len(filtered_tokens)} con potencial de plano")
+        return filtered_tokens
 
     async def get_token_by_id(self, mint: str):
-        data = await self.request(f"/tokens/v2/search?query={mint}", cache_key=f"jup_token_{mint}", ttl=60)
-        return data
+        return await self.request(f"/tokens/v2/search?query={mint}", cache_key=f"jup_token_{mint}", ttl=120)
 
 jupiter = JupiterClient(JUPITER_BASE)
 
-# ------------------ DEXSCREENER CANDLES (best-effort) ------------------
-async def fetch_candles_dexscreener(mint: str, interval_minutes=15, limit=CANDLES_TO_CHECK):
-    """
-    Best-effort: try common dexscreener endpoints. If your account has a specific API key or
-    endpoint, set DEXSCREENER_API env variable and adapt here.
-    Returns: list of candles with dicts: {"time", "open", "close", "high", "low", "volume"}
-    """
+# ------------------ DEXSCREENER OPTIMIZADO ------------------
+async def fetch_candles_dexscreener(mint: str, limit=CANDLES_TO_CHECK):
+    """Obtiene velas de DexScreener"""
     session = await get_http_session()
-    # Try generic /latest/dex/search?q= minted address
-    tried = []
-    # Endpoint 1: search
+    
     try:
         search_url = f"https://api.dexscreener.com/latest/dex/search/?q={mint}"
         async with session.get(search_url, timeout=8) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                # data may contain pairs array; find a pair on solana with token in path
-                pairs = data.get("pairs") or data.get("pairs", [])
-                if pairs:
-                    # Choose the first pair and fetch candles via pairType
-                    pair_id = pairs[0].get("pairAddress") or pairs[0].get("pair")
-                    # try pair candles
-                    pair_url = f"https://api.dexscreener.com/latest/dex/pair/{pair_id}"
-                    async with session.get(pair_url, timeout=8) as r2:
-                        if r2.status == 200:
-                            pair_data = await r2.json()
-                            # dexscreener responses often contain 'candles' or 'chart' keys
-                            candles = pair_data.get("candles") or pair_data.get("chart") or []
-                            if candles:
-                                # normalize
-                                normalized = []
-                                # candles may be [timestamp, open, high, low, close, volume]
-                                for c in candles[-limit:]:
-                                    if isinstance(c, list) and len(c) >= 6:
-                                        normalized.append({
-                                            "time": c[0],
-                                            "open": c[1],
-                                            "high": c[2],
-                                            "low": c[3],
-                                            "close": c[4],
-                                            "volume": c[5]
-                                        })
-                                return normalized
+            if resp.status != 200:
+                return []
+                
+            data = await resp.json()
+            pairs = data.get("pairs", [])
+            if not pairs:
+                return []
+            
+            # Encontrar par de Solana
+            solana_pair = next((p for p in pairs if p.get('chainId') == 'solana'), pairs[0])
+            pair_address = solana_pair.get('pairAddress')
+            
+            if not pair_address:
+                return []
+                
+            pair_url = f"https://api.dexscreener.com/latest/dex/pair/{pair_address}"
+            async with session.get(pair_url, timeout=8) as r2:
+                if r2.status != 200:
+                    return []
+                    
+                pair_data = await r2.json()
+                candles = pair_data.get("candles") or pair_data.get("chart") or []
+                
+                if not candles:
+                    return []
+                
+                # Normalizar velas
+                normalized = []
+                for c in candles[-limit:]:
+                    if isinstance(c, list) and len(c) >= 6:
+                        try:
+                            normalized.append({
+                                "time": c[0],
+                                "open": float(c[1]) if c[1] else 0,
+                                "high": float(c[2]) if c[2] else 0,
+                                "low": float(c[3]) if c[3] else 0,
+                                "close": float(c[4]) if c[4] else 0,
+                                "volume": float(c[5]) if c[5] else 0
+                            })
+                        except (ValueError, TypeError):
+                            continue
+                
+                logger.debug(f"📊 Obtenidas {len(normalized)} velas para {mint[:8]}...")
+                return normalized
+                
     except Exception as e:
-        tried.append(f"search_err:{e}")
+        logger.debug(f"DexScreener error para {mint[:8]}...: {e}")
+        return []
 
-    # Endpoint 2: page-based fallback (html) - try to scrape minimal json from page
-    try:
-        page_url = f"https://dexscreener.com/solana/{mint}"
-        async with session.get(page_url, timeout=8) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                # attempt to find a JSON blob in page (best-effort). Not robust; user can replace
-                import re
-                m = re.search(r"window\.__INITIAL_STATE__ = (\{.+?\});", text)
-                if m:
-                    blob = json.loads(m.group(1))
-                    # dig for candles - site structure may change
-                    # return empty if not found
-    except Exception as e:
-        tried.append(f"page_err:{e}")
-
-    logger.debug(f"Dexscreener attempts failed or returned no candles: {tried}")
-    return []
-
-# ------------------ FLAT DETECTION LOGIC ------------------
-
-def calculate_volatility_from_candles(candles):
-    prices = [c.get("close") for c in candles if c.get("close") is not None]
-    if len(prices) < 4:
-        return None
-    returns = []
-    for i in range(1, len(prices)):
-        prev = prices[i-1]
-        if prev == 0:
-            continue
-        ret = (prices[i] - prev) / prev * 100
-        returns.append(ret)
-    if not returns:
-        return None
-    return {
-        "std_dev": pstdev(returns) if len(returns) > 1 else 0,
-        "max_move": max(abs(x) for x in returns) if returns else 0,
-        "avg_move": mean([abs(x) for x in returns]) if returns else 0,
-        "min_price": min(prices) if prices else 0,
-        "max_price": max(prices) if prices else 0,
+# ------------------ DETECCIÓN FLAT MEJORADA ------------------
+def analyze_volume_pattern(volumes):
+    """Analiza el patrón de volumen para identificar planos - MEJORADO"""
+    if len(volumes) < 10:
+        return False, {}
+    
+    # Contar velas por categoría de volumen
+    very_low_vol = sum(1 for v in volumes if v < 10)     # Volumen casi cero
+    low_vol = sum(1 for v in volumes if 10 <= v < 50)    # Volumen bajo
+    medium_vol = sum(1 for v in volumes if 50 <= v <= 200) # Volumen moderado
+    high_vol = sum(1 for v in volumes if v > 200)        # Picos altos
+    
+    # Buscar picos aislados (patrón clave)
+    isolated_spikes = 0
+    for i in range(2, len(volumes)-2):
+        # Verificar si hay un pico rodeado de volumen bajo
+        if (volumes[i-2] < 15 and 
+            volumes[i-1] < 15 and 
+            volumes[i] > VOLUME_SPIKE_THRESHOLD and 
+            volumes[i+1] < 15 and 
+            volumes[i+2] < 15):
+            isolated_spikes += 1
+    
+    # Calcular métricas
+    avg_volume = sum(volumes) / len(volumes)
+    volume_std = pstdev(volumes) if len(volumes) > 1 else 0
+    
+    # CONDICIÓN PRINCIPAL RELAJADA - enfoque en patrón, no en valores absolutos
+    volume_condition = (
+        (very_low_vol + low_vol) >= MIN_CONSECUTIVE_LOW and  # Suficientes velas de volumen bajo
+        isolated_spikes >= 1 and                             # Al menos un pico aislado
+        avg_volume < 150 and                                 # Volumen promedio no muy alto
+        volume_std < 200                                     # Volumen no muy volátil
+    )
+    
+    return volume_condition, {
+        "very_low_volume_candles": very_low_vol,
+        "low_volume_candles": low_vol,
+        "medium_volume_candles": medium_vol,
+        "high_volume_candles": high_vol,
+        "isolated_spikes": isolated_spikes,
+        "avg_volume": round(avg_volume, 2),
+        "volume_volatility": round(volume_std, 2)
     }
 
+def calculate_price_stability(candles):
+    """Calcula estabilidad del precio - MEJORADO para detectar planos reales"""
+    if len(candles) < 8:
+        return None
+        
+    prices = [c.get("close", 0) for c in candles if c.get("close") is not None]
+    if len(prices) < 8:
+        return None
+    
+    # Calcular retornos porcentuales
+    returns = []
+    for i in range(1, len(prices)):
+        if prices[i-1] > 0:
+            ret = (prices[i] - prices[i-1]) / prices[i-1] * 100
+            returns.append(ret)
+    
+    if not returns:
+        return None
+    
+    # Calcular rango de precio (absoluto y porcentual)
+    price_range = max(prices) - min(prices)
+    avg_price = sum(prices) / len(prices)
+    range_percent = (price_range / avg_price * 100) if avg_price > 0 else 100
+    
+    # Calcular tendencia general (no importa si es bajista o alcista)
+    first_price = prices[0]
+    last_price = prices[-1]
+    total_change = ((last_price - first_price) / first_price * 100) if first_price > 0 else 0
+    
+    return {
+        "std_dev": round(pstdev(returns), 4) if len(returns) > 1 else 0,
+        "max_move": round(max(abs(r) for r in returns), 2) if returns else 0,
+        "price_range_percent": round(range_percent, 2),
+        "total_change_percent": round(total_change, 2),  # Puede ser negativo (planos bajistas)
+        "min_price": min(prices),
+        "max_price": max(prices),
+        "direction": "bajista" if total_change < -1 else "alcista" if total_change > 1 else "neutral"
+    }
 
-def analyze_flat_pattern(candles):
-    # Convert candle volumes (assume USD volumes from dexscreener if available)
-    volumes = [c.get("volume", 0) for c in candles]
-    if len(volumes) < 6:
-        return False, {}
-    # Conditions derived from your PESHI pattern
-    low_count = sum(1 for v in volumes if v < 10)
-    avg_vol = sum(volumes) / len(volumes)
-    # check for 3 consecutive green large volumes > 500
-    consec_big_buys = 0
-    found_big_seq = False
-    for i in range(2, len(candles)):
-        # crude: green if close >= open
-        o1, c1 = candles[i-2].get('open', 0), candles[i-2].get('close', 0)
-        o2, c2 = candles[i-1].get('open', 0), candles[i-1].get('close', 0)
-        o3, c3 = candles[i].get('open', 0), candles[i].get('close', 0)
-        v1, v2, v3 = candles[i-2].get('volume', 0), candles[i-1].get('volume', 0), candles[i].get('volume', 0)
-        if c1 >= o1 and c2 >= o2 and c3 >= o3 and v1 > 500 and v2 > 500 and v3 > 500:
-            found_big_seq = True
-            break
-    vol_condition = (low_count >= 3 and avg_vol < 150 and not found_big_seq)
-    vol_details = {"low_count": low_count, "avg_vol": avg_vol, "found_big_seq": found_big_seq}
-    metrics = calculate_volatility_from_candles(candles)
-    if metrics:
-        flat_condition = (vol_condition and metrics['std_dev'] < FLAT_STD_THRESHOLD and metrics['max_move'] < 0.6 and ((metrics['max_price'] - metrics['min_price']) / (metrics['min_price'] or 1) * 100) < 1.5)
-    else:
-        flat_condition = vol_condition
-    return flat_condition, {**vol_details, **({'metrics': metrics} if metrics else {})}
+def detect_flat_pattern(candles):
+    """Detección principal de patrón FLAT - ENFOCADO EN PATRONES REALES"""
+    if len(candles) < CANDLES_TO_CHECK:
+        return False, {"reason": "not_enough_candles"}
+    
+    volumes = [c.get('volume', 0) for c in candles]
+    
+    # Análisis de volumen
+    vol_condition, vol_analysis = analyze_volume_pattern(volumes)
+    
+    # Análisis de precio
+    price_analysis = calculate_price_stability(candles)
+    if not price_analysis:
+        return False, {"reason": "invalid_price_data"}
+    
+    # CONDICIONES RELAJADAS - enfoque en el patrón, no en valores absolutos
+    flat_detected = (
+        vol_condition and  # Patrón de volumen correcto
+        price_analysis['std_dev'] < FLAT_STD_THRESHOLD and  # Baja volatilidad
+        price_analysis['max_move'] < 1.0 and  # Movimientos máximos pequeños
+        abs(price_analysis['total_change_percent']) < 5.0  # Cambio total pequeño (puede ser negativo)
+    )
+    
+    return flat_detected, {
+        **vol_analysis,
+        "price_metrics": price_analysis,
+        "candles_analyzed": len(candles),
+        "pattern_type": f"flat_{price_analysis['direction']}" if flat_detected else "no_pattern"
+    }
 
-# ------------------ PROCESS TOKEN FLOW ------------------
-async def evaluate_token_flat(mint: str):
-    # get candles
-    candles = await fetch_candles_dexscreener(mint)
-    if not candles:
-        return False, {"reason": "no_candles"}
-    # reduce to last CANDLES_TO_CHECK candles
-    last_candles = candles[-CANDLES_TO_CHECK:]
-    is_flat, details = analyze_flat_pattern(last_candles)
-    return is_flat, {"candles_checked": len(last_candles), **details}
+# ------------------ FLUJO DE ANÁLISIS MEJORADO ------------------
+async def evaluate_token_flat(mint: str, token_meta: dict):
+    """Evaluación de token para patrón FLAT"""
+    if await is_notified(mint, "flat", 6):  # 6 horas de cooldown para planos
+        return False, {"reason": "already_notified"}
+    
+    # Obtener velas
+    candles = await fetch_candles_dexscreener(mint, CANDLES_TO_CHECK)
+    if not candles or len(candles) < 12:
+        return False, {"reason": "insufficient_candle_data"}
+    
+    # Analizar patrón
+    is_flat, analysis = detect_flat_pattern(candles)
+    
+    if is_flat:
+        logger.info(f"🎯 PATRÓN FLAT DETECTADO: {token_meta.get('symbol', 'N/A')} | {mint[:12]}... | Tipo: {analysis.get('pattern_type', 'N/A')}")
+        analysis['detected_at'] = datetime.utcnow().isoformat()
+        analysis['mint_short'] = mint[:12] + "..."  # Para logging
+    
+    return is_flat, analysis
 
 async def basic_jupiter_audit(mint: str):
-    # use Jupiter v2 token info to get audit fields
+    """Auditoría básica del token"""
     try:
         res = await jupiter.get_token_by_id(mint)
         if not res:
             return {}
-        # res could be list or object; normalize
-        if isinstance(res, list) and res:
-            token = res[0]
-        elif isinstance(res, dict):
-            token = res
-        else:
-            token = res
-        audit = token.get('audit', {}) if isinstance(token, dict) else {}
-        return audit
+            
+        token = res[0] if isinstance(res, list) and res else res
+        if isinstance(token, dict):
+            return token.get('audit', {})
+        return {}
     except Exception as e:
-        logger.debug(f"Jupiter audit error for {mint}: {e}")
+        logger.debug(f"Audit error: {e}")
         return {}
 
-# ------------------ ALERT FORMATTING ------------------
-
+# ------------------ FORMATO DE ALERTAS MEJORADO ------------------
 def format_links(mint: str) -> str:
+    """Formato mejorado de enlaces con mint completo"""
     return (
         f"• [DexScreener](https://dexscreener.com/solana/{mint})\n"
         f"• [Birdeye](https://birdeye.so/token/{mint}?chain=solana)\n"
         f"• [RugCheck](https://rugcheck.xyz/tokens/{mint})\n"
+        f"• [Jupiter](https://jup.ag/tokens/{mint})\n"
         f"• [Solscan](https://solscan.io/token/{mint})\n"
-        f"• [Jupiter token](https://jup.ag/tokens/{mint})\n"
     )
 
-async def alert_flat_found(mint: str, token_meta: dict, flat_info: dict):
-    # check notified
-    if await is_notified(mint):
-        logger.info(f"Mint {mint} already notified, skipping")
-        return
-    # build message
+def format_mint_for_display(mint: str) -> str:
+    """Formatea el mint para mostrar en Telegram"""
+    return f"`{mint[:12]}...{mint[-6:]}`"
+
+async def alert_flat_found(mint: str, token_meta: dict, flat_analysis: dict):
+    """Envía alerta de patrón FLAT detectado - MEJORADA"""
     symbol = token_meta.get('symbol', 'N/A')
     name = token_meta.get('name', 'N/A')
     liquidity = token_meta.get('liquidity', 0)
-    volume24 = token_meta.get('volume24h', 0)
-    organic = token_meta.get('organic_score', 'N/A')
-
+    volume24h = token_meta.get('volume24h', 0)
+    
     audit = await basic_jupiter_audit(mint)
-    mint_auth_disabled = audit.get('mintAuthorityDisabled', False)
+    mint_disabled = audit.get('mintAuthorityDisabled', False)
     freeze_disabled = audit.get('freezeAuthorityDisabled', False)
-
-    msg = (
-        f"🚨 *TOKEN EN PUNTO FRÍO DETECTADO* 🚨\n\n"
-        f"*Token:* {symbol} — _{name}_\n"
-        f"*Mint:* `{mint}`\n"
-        f"*Liquidez:* ${liquidity:,.0f}\n"
-        f"*Volumen 24h:* ${volume24:,.0f}\n"
-        f"*Score orgánico:* {organic}\n"
-        f"*Audit - MintDisabled:* {'✅' if mint_auth_disabled else '❌'}  | *FreezeDisabled:* {'✅' if freeze_disabled else '❌'}\n\n"
-        f"*Detalles Plano:* {json.dumps(flat_info, default=str)}\n\n"
-        f"🔗 Enlaces:\n{format_links(mint)}\n"
-        f"_Pattern: token en plano >= {MIN_FLAT_MINUTES} min → atento a breakout {BREAKOUT_STEP}% +_"
+    
+    # Análisis de volumen
+    vol_analysis = (
+        f"*📊 Análisis de Volumen:*\n"
+        f"  • Velas volumen muy bajo: {flat_analysis.get('very_low_volume_candles', 0)}\n"
+        f"  • Velas volumen bajo: {flat_analysis.get('low_volume_candles', 0)}\n"
+        f"  • Picos aislados: {flat_analysis.get('isolated_spikes', 0)}\n"
+        f"  • Volumen promedio: ${flat_analysis.get('avg_volume', 0)}\n"
+        f"  • Volatilidad volumen: {flat_analysis.get('volume_volatility', 0)}\n"
     )
+    
+    # Métricas de precio
+    price_metrics = flat_analysis.get('price_metrics', {})
+    price_analysis = (
+        f"*📈 Análisis de Precio:*\n"
+        f"  • Volatilidad: {price_metrics.get('std_dev', 0)}%\n"
+        f"  • Movimiento máximo: {price_metrics.get('max_move', 0)}%\n"
+        f"  • Rango total: {price_metrics.get('price_range_percent', 0)}%\n"
+        f"  • Cambio total: {price_metrics.get('total_change_percent', 0)}%\n"
+        f"  • Dirección: {price_metrics.get('direction', 'N/A')}\n"
+    )
+    
+    # Información del token
+    token_info = (
+        f"*🔍 Información del Token:*\n"
+        f"  • Símbolo: {symbol}\n"
+        f"  • Nombre: {name}\n"
+        f"  • Liquidez: ${liquidity:,.0f}\n"
+        f"  • Volumen 24h: ${volume24h:,.0f}\n"
+        f"  • Mint: {format_mint_for_display(mint)}\n"
+    )
+    
+    msg = (
+        f"🚨 *PATRÓN FLAT DETECTADO* 🚨\n\n"
+        f"{token_info}\n"
+        f"{vol_analysis}\n"
+        f"{price_analysis}\n"
+        f"*🛡️ Auditoría:* MintDisabled: {'✅' if mint_disabled else '❌'} | FreezeDisabled: {'✅' if freeze_disabled else '❌'}\n\n"
+        f"🔗 *Enlaces Rápidos:*\n{format_links(mint)}\n"
+        f"_⏰ Detectado: {datetime.now().strftime('%H:%M')} - Patrón de {MIN_FLAT_MINUTES}min_"
+    )
+    
+    if await safe_send_telegram(msg):
+        await mark_notified(mint, {
+            "meta": token_meta, 
+            "analysis": flat_analysis,
+            "type": "flat_pattern"
+        }, "flat")
 
-    await send_telegram(msg)
-    # mark notified
-    await mark_notified(mint, {"meta": token_meta, "flat_info": flat_info})
+async def alert_pumpfun_pre_graduation(mint: str, market_cap: float):
+    """Alerta de pre-graduación de Pump.fun"""
+    if await is_notified(mint, "pumpfun", 2):
+        return
+        
+    token_data = await jupiter.get_token_by_id(mint)
+    token_meta = token_data[0] if isinstance(token_data, list) and token_data else {}
+    
+    symbol = token_meta.get('symbol', 'N/A')
+    name = token_meta.get('name', 'N/A')
+    
+    msg = (
+        f"🔥 *PUMP.FUN PRE-GRADUACIÓN* 🔥\n\n"
+        f"*Token:* {symbol} - {name}\n"
+        f"*Mint:* {format_mint_for_display(mint)}\n"
+        f"*Market Cap:* ${market_cap:,.0f}\n"
+        f"*Umbral:* ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}\n\n"
+        f"🔗 *Enlaces:*\n{format_links(mint)}\n\n"
+        f"_⚠️ Cerca de graduación (69k) - Actuar con cautela_"
+    )
+    
+    if await safe_send_telegram(msg):
+        await mark_notified(mint, {
+            "market_cap": market_cap,
+            "meta": token_meta,
+            "type": "pumpfun_pre_graduation"
+        }, "pumpfun")
 
-# ------------------ WORKERS ------------------
+# ------------------ WORKERS OPTIMIZADOS ------------------
 async def flat_scanner_worker(stop_event: asyncio.Event):
-    """
-    Periodically get candidate tokens from Jupiter V2 and evaluate flat pattern.
-    """
-    logger.info("Flat scanner worker started")
+    """Worker optimizado para scanner FLAT"""
+    logger.info("🔄 Scanner FLAT iniciado - Buscando Planos Reales")
+    
     while not stop_event.is_set():
         try:
-            candidates = await jupiter.get_multiple_token_sources()
-            # normalize unique
-            uniq = {}
-            for t in candidates:
-                tid = t.get('id') if isinstance(t, dict) else None
-                if tid:
-                    uniq[tid] = t
-            token_list = list(uniq.keys())
-            logger.info(f"Flat scanner got {len(token_list)} candidates")
-            # Evaluate each token (bounded concurrency)
-            sem = asyncio.Semaphore(6)
-
-            async def eval_one(mint):
+            # Obtener tokens con potencial
+            potential_tokens = await jupiter.get_potential_flat_tokens()
+            
+            if not potential_tokens:
+                logger.warning("No se encontraron tokens con potencial")
+                await asyncio.sleep(45)
+                continue
+            
+            logger.info(f"🎯 Analizando {len(potential_tokens)} tokens con potencial de plano")
+            
+            # Procesar tokens
+            sem = asyncio.Semaphore(4)
+            
+            async def process_token(token):
                 async with sem:
-                    if await is_notified(mint):
+                    mint = token.get('id')
+                    if not mint:
                         return
-                    token_meta = uniq.get(mint, {})
-                    is_flat, details = await evaluate_token_flat(mint)
+                    
+                    is_flat, analysis = await evaluate_token_flat(mint, token)
                     if is_flat:
-                        # compute duration estimate based on candles
-                        details['detected_at'] = datetime.utcnow().isoformat()
-                        await alert_flat_found(mint, {
-                            'symbol': token_meta.get('symbol'),
-                            'name': token_meta.get('name'),
-                            'liquidity': token_meta.get('liquidity'),
-                            'volume24h': (token_meta.get('stats24h', {}).get('buyVolume', 0) + token_meta.get('stats24h', {}).get('sellVolume', 0)),
-                            'organic_score': token_meta.get('organicScore')
-                        }, details)
-
-            tasks = [asyncio.create_task(eval_one(m)) for m in token_list[:120]]
-            await asyncio.gather(*tasks)
-
+                        await alert_flat_found(mint, token, analysis)
+            
+            tasks = [process_token(token) for token in potential_tokens]
+            await asyncio.gather(*tasks, return_exceptions=True)
+            
+            logger.info(f"✅ Ciclo de análisis completado. Tokens procesados: {len(potential_tokens)}")
+            
         except Exception as e:
-            logger.error(f"Flat scanner error: {e}")
-        # Sleep between full scans
-        await asyncio.sleep(30)
-    logger.info("Flat scanner worker stopped")
+            logger.error(f"❌ Error en scanner FLAT: {e}")
+        
+        await asyncio.sleep(60)
 
 async def pumpfun_wss_worker(stop_event: asyncio.Event):
-    """
-    Connects to HELIUS_WSS_URL and listens for logs/events. This is a best-effort generic
-    websocket listener. For Pump.fun specific payloads, adapt parsing to the exact message schema
-    that your HELIUS WSS provides for program logs or transactions.
-    """
+    """Worker para Pump.fun WebSocket"""
     if not HELIUS_WSS_URL:
-        logger.warning("HELIUS_WSS_URL not configured, pumpfun_wss_worker will not run")
+        logger.warning("HELIUS_WSS_URL no configurado")
         return
-    logger.info("Pump.fun WSS worker started")
+        
+    logger.info("🔄 Pump.fun WebSocket iniciado")
+    
     while not stop_event.is_set():
         try:
-            async with websockets.connect(HELIUS_WSS_URL, ping_interval=20, ping_timeout=10) as ws:
-                logger.info("Connected to HELIUS WSS")
-                # Example subscription message - adapt if your provider uses different RPC
+            async with websockets.connect(
+                HELIUS_WSS_URL, 
+                ping_interval=30, 
+                ping_timeout=20
+            ) as ws:
+                logger.info("✅ Conectado a Helius WebSocket")
+                
                 subscribe_msg = {
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "logsSubscribe",
-                    "params": [{
-                        "mentions": [PUMPFUN_PROGRAM_ID]
-                    }, {"commitment": "processed"}]
+                    "params": [
+                        {"mentions": [PUMPFUN_PROGRAM_ID]},
+                        {"commitment": "confirmed"}
+                    ]
                 }
                 await ws.send(json.dumps(subscribe_msg))
+                
                 while not stop_event.is_set():
                     try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        msg = json.loads(raw)
-                        # Parse event - best-effort
-                        # Many Helius logSubscribe messages include 'params' -> 'result' -> 'value' -> 'logs'
-                        params = msg.get('params')
-                        if not params:
-                            continue
-                        result = params.get('result') if isinstance(params, dict) else params[0].get('result') if isinstance(params, list) else None
-                        if not result:
-                            continue
-                        value = result.get('value') if isinstance(result, dict) else None
-                        # Implement detection heuristics: search logs for 'market_cap' or 'graduat'
-                        logs = []
-                        if value:
-                            logs = value.get('logs') or []
-                        # Scan logs for pumpfun patterns
-                        text = "\n".join([str(l) for l in logs])
-                        # crude extraction: find decimal numbers that look like market cap
-                        import re
-                        for m in re.finditer(r"market_cap\W*[:=]\W*(\d+[.,]?\d*)", text, re.IGNORECASE):
-                            mc = float(m.group(1).replace(',', ''))
-                            if mc >= PUMP_PRE_GRADUATION_THRESHOLD:
-                                # try to extract mint address nearby
-                                mm = re.search(r"mint\W*[:=]\W*([A-Za-z0-9]{32,44})", text)
-                                mint = mm.group(1) if mm else None
-                                if mint and not await is_notified(mint):
-                                    # quick metadata via jupiter
-                                    meta = await jupiter.get_token_by_id(mint)
-                                    token_meta = meta[0] if isinstance(meta, list) and meta else (meta if isinstance(meta, dict) else {})
-                                    msg_text = (
-                                        f"🔥 *Pump.fun Pre-Graduation Alert* 🔥\n\n"
-                                        f"*Mint:* `{mint}`\n"
-                                        f"*Estim. MC:* ${mc:,.0f}\n"
-                                        f"*Nombre:* {token_meta.get('name', 'N/A')} ({token_meta.get('symbol', 'N/A')})\n\n"
-                                        f"🔗 Enlaces:\n{format_links(mint)}\n\n"
-                                        f"_Este token alcanzó MC >= {PUMP_PRE_GRADUATION_THRESHOLD}$. Esto es antes de la graduación (69k). Actúa con cautela._"
-                                    )
-                                    await send_telegram(msg_text)
-                                    await mark_notified(mint, {"pump_detected_mc": mc})
-                        # small sleep
+                        message = await asyncio.wait_for(ws.recv(), timeout=40)
+                        data = json.loads(message)
+                        await process_pumpfun_message(data)
+                        
                     except asyncio.TimeoutError:
-                        # keepalive
-                        await ws.send(json.dumps({"jsonrpc": "2.0", "id": 9999, "method": "ping"}))
+                        await ws.ping()
+                        continue
+                    except websockets.exceptions.ConnectionClosed:
+                        logger.warning("🔌 Conexión WebSocket cerrada")
+                        break
+                        
         except Exception as e:
-            logger.error(f"Pumpfun WSS connection error: {e}")
+            logger.error(f"❌ Error WebSocket Pump.fun: {e}")
             await asyncio.sleep(5)
-    logger.info("Pump.fun WSS worker stopped")
+
+async def process_pumpfun_message(data: dict):
+    """Procesa mensajes de Pump.fun"""
+    try:
+        result = data.get('params', {}).get('result', {})
+        logs = result.get('value', {}).get('logs', [])
+        
+        if not logs:
+            return
+        
+        logs_text = " ".join(str(log) for log in logs)
+        
+        # Buscar market cap
+        market_cap_patterns = [
+            r"market_cap[\s:=]+([\d,]+\.?\d*)",
+            r"marketcap[\s:=]+([\d,]+\.?\d*)", 
+            r"mc[\s:=]+([\d,]+\.?\d*)",
+        ]
+        
+        market_cap = None
+        for pattern in market_cap_patterns:
+            match = re.search(pattern, logs_text, re.IGNORECASE)
+            if match:
+                try:
+                    market_cap = float(match.group(1).replace(',', ''))
+                    break
+                except ValueError:
+                    continue
+        
+        if not market_cap or market_cap < PUMP_PRE_GRADUATION_THRESHOLD:
+            return
+        
+        # Buscar mint address
+        mint_pattern = r"([1-9A-HJ-NP-Za-km-z]{32,44})"
+        mint_match = re.search(mint_pattern, logs_text)
+        
+        if mint_match:
+            mint = mint_match.group(1)
+            logger.info(f"🎯 Pump.fun detectado: {mint[:12]}... MC: ${market_cap:,.0f}")
+            await alert_pumpfun_pre_graduation(mint, market_cap)
+            
+    except Exception as e:
+        logger.debug(f"Error procesando mensaje Pump.fun: {e}")
 
 # ------------------ MAIN ------------------
 async def main():
-    logger.info("Starting Jupiter v2 Pro - Full Bot")
-    await init_db()
+    logger.info("🚀 INICIANDO BOT JUPITER OPTIMIZADO v2.0")
+    logger.info("==========================================")
+    
+    # Mostrar configuración
+    logger.info(f"🎯 Configuración de Búsqueda:")
+    logger.info(f"   • Liquidez mínima: ${MIN_LIQUIDITY:,.0f}")
+    logger.info(f"   • Volumen 24h: ${MIN_VOLUME_24H:,.0f} - ${MAX_VOLUME_24H:,.0f}")
+    logger.info(f"   • Flat mínimo: {MIN_FLAT_MINUTES}min")
+    logger.info(f"   • Enfoque: Patrones reales (alcistas/bajistas)")
+    
+    # Inicializar PostgreSQL
+    if not await init_db():
+        logger.error("❌ No se pudo inicializar PostgreSQL")
+        return
+    
     stop_event = asyncio.Event()
-
-    # workers
-    flat_task = asyncio.create_task(flat_scanner_worker(stop_event))
-    pump_task = asyncio.create_task(pumpfun_wss_worker(stop_event))
-
+    
     try:
-        # run until cancelled
-        await asyncio.gather(flat_task, pump_task)
-    except asyncio.CancelledError:
-        logger.info("Cancelled")
+        await asyncio.gather(
+            flat_scanner_worker(stop_event),
+            pumpfun_wss_worker(stop_event),
+            return_exceptions=True
+        )
+    except KeyboardInterrupt:
+        logger.info("🛑 Bot detenido por usuario")
+    except Exception as e:
+        logger.error(f"❌ Error crítico: {e}")
     finally:
         stop_event.set()
         if http_session:
             await http_session.close()
         if pg_pool:
             await pg_pool.close()
-        logger.info("Shutdown complete")
+        logger.info("✅ Bot finalizado")
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Interrupted by user")
+        logger.info("🛑 Interrumpido por usuario")
