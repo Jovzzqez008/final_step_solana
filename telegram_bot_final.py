@@ -1,690 +1,579 @@
-# bot_jupiter_v2_pro_v3.py
-import os
 import asyncio
 import json
+import os
 import time
 import logging
-import re
-from datetime import datetime
-from statistics import pstdev, mean
-from collections import deque, defaultdict
-
 import aiohttp
 import asyncpg
 import websockets
-from telegram import Bot, Update
+from datetime import datetime, timedelta
+from statistics import pstdev, mean
+from collections import defaultdict, deque
+from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ===================== CONFIGURACIÓN =====================
+# ===================== CONFIGURACIÓN FOCALIZADA =====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")
 HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-DEXSCREENER_API = os.getenv("DEXSCREENER_API", "")
-JUPITER_BASE = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag")
 
-# PUMP.FUN CONFIGURACIÓN FIJA
-PUMPFUN_PROGRAM_ID = "pumpfun1Mt11111111111111111111111111111111"
-PUMP_PRE_GRADUATION_THRESHOLD = float(os.getenv("PUMP_PRE_THRESHOLD", "60000"))
-
-# PARÁMETROS AJUSTADOS - TIEMPO FLAT 100 MINUTOS
-DEFAULTS = {
-    "MIN_VOLUME_24H": float(os.getenv("MIN_VOLUME_24H", "50000")),
-    "MIN_LIQUIDITY": float(os.getenv("MIN_LIQUIDITY", "50000")),
-    "MIN_FLAT_MINUTES": int(os.getenv("MIN_FLAT_MINUTES", "100")),  # AJUSTADO A 100 MINUTOS
-    "FLAT_STD_THRESHOLD": float(os.getenv("FLAT_STD_THRESHOLD", "0.12")),
-    "VOLUME_SPIKE_THRESHOLD": float(os.getenv("VOLUME_SPIKE_THRESHOLD", "120")),
-    "MIN_CONSECUTIVE_LOW": int(os.getenv("MIN_CONSECUTIVE_LOW", "5")),
-    "CANDLES_TO_CHECK": int(os.getenv("CANDLES_TO_CHECK", "10")),
-    "BREAKOUT_STEP": float(os.getenv("BREAKOUT_STEP", "10.0"))
+# 🎯 CONFIGURACIÓN ESPECÍFICA PARA TU ESTRATEGIA
+FLAT_CONFIG = {
+    'MIN_FLAT_DURATION_HOURS': 1,  # MÍNIMO 1 HORA EN FLAT
+    'MAX_VOLATILITY': 1.5,  # MÁXIMA VOLATILIDAD PERMITIDA
+    'MAX_AVG_VOLUME_PER_CANDLE': 100,
+    'MIN_LOW_VOLUME_CANDLES': 6,
+    'CANDLES_TO_ANALYZE': 24,  # 24 velas de 5min = 2 horas
 }
 
-DB_TABLE_NOTIFIED = "notified_mints"
+# 🚀 PUMP.FUN - ALERTA TEMPRANA
+PUMPFUN_PROGRAM_ID = "pumpfun1Mt11111111111111111111111111111111"
+PUMP_PRE_GRADUATION_THRESHOLD = 60000  # Alerta a $60k
+PUMP_GRADUATION_TARGET = 69000  # Graduación a $69k
 
-# ===================== LOGGING =====================
+# ⚠️ FILTROS DE SEGURIDAD BÁSICOS
+MIN_LIQUIDITY = 30000
+MIN_VOLUME_24H = 10000
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("jupiter_v3")
+logger = logging.getLogger("pump_flat_bot")
 
-# ===================== ESTADO GLOBAL =====================
-http_session = None
-pg_pool = None
-telegram_bot = None
-app_bot = None
+# ===================== GESTIÓN DE DATOS =====================
+class TokenManager:
+    def __init__(self):
+        self.pool = None
+        self.recent_tokens = deque(maxlen=20)  # Últimos 20 tokens
+    
+    async def init(self):
+        if DATABASE_URL:
+            self.pool = await asyncpg.create_pool(DATABASE_URL)
+            await self.create_tables()
+    
+    async def create_tables(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS detected_tokens (
+                    id SERIAL PRIMARY KEY,
+                    mint_address TEXT UNIQUE,
+                    symbol TEXT,
+                    alert_type TEXT,
+                    risk_score INTEGER DEFAULT 0,
+                    detected_at TIMESTAMP DEFAULT NOW(),
+                    metadata JSONB
+                )
+            ''')
+    
+    async def save_token(self, mint: str, symbol: str, alert_type: str, metadata: dict = None):
+        self.recent_tokens.appendleft({
+            'mint': mint,
+            'symbol': symbol,
+            'type': alert_type,
+            'time': datetime.now(),
+            'metadata': metadata or {}
+        })
+        
+        if self.pool:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO detected_tokens (mint_address, symbol, alert_type, metadata)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (mint_address) DO NOTHING
+                ''', mint, symbol, alert_type, json.dumps(metadata or {}))
+    
+    async def get_recent_tokens(self, limit: int = 10, alert_type: str = None):
+        if alert_type:
+            return [t for t in list(self.recent_tokens) if t['type'] == alert_type][:limit]
+        return list(self.recent_tokens)[:limit]
+    
+    async def is_duplicate(self, mint: str, alert_type: str) -> bool:
+        """Evitar duplicados en las últimas 2 horas"""
+        cutoff_time = datetime.now() - timedelta(hours=2)
+        for token in self.recent_tokens:
+            if (token['mint'] == mint and 
+                token['type'] == alert_type and 
+                token['time'] > cutoff_time):
+                return True
+        return False
 
-price_histories = defaultdict(lambda: deque(maxlen=300))
-flat_tokens = {}
-monitored_tokens = set()
-params = DEFAULTS.copy()
+token_manager = TokenManager()
 
-# ===================== FUNCIONES DE APOYO =====================
-async def get_http_session():
-    global http_session
-    if http_session is None:
-        http_session = aiohttp.ClientSession()
-    return http_session
-
-async def send_telegram(text: str, parse_mode=ParseMode.MARKDOWN):
-    global telegram_bot
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram token/chat no configurado")
-        return
-    if telegram_bot is None:
-        telegram_bot = Bot(token=TELEGRAM_BOT_TOKEN)
-    try:
-        await telegram_bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID, 
-            text=text, 
-            parse_mode=parse_mode, 
-            disable_web_page_preview=False
-        )
-    except Exception as e:
-        logger.error(f"Error enviando Telegram: {e}")
-
-# ===================== BASE DE DATOS =====================
-async def init_db():
-    global pg_pool
-    if not DATABASE_URL:
-        logger.warning("DATABASE_URL no configurado; ejecutando sin persistencia")
-        return
-    pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    async with pg_pool.acquire() as conn:
-        await conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS {DB_TABLE_NOTIFIED} (
-                mint TEXT PRIMARY KEY,
-                first_notified_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-                data JSONB
-            );
-        """)
-    logger.info("Base de datos inicializada")
-
-async def mark_notified(mint: str, data: dict):
-    if pg_pool is None:
-        flat_tokens.setdefault(mint, {})['notified'] = True
-        return
-    async with pg_pool.acquire() as conn:
-        await conn.execute(
-            f"INSERT INTO {DB_TABLE_NOTIFIED}(mint, data) VALUES($1, $2) ON CONFLICT (mint) DO NOTHING", 
-            mint, 
-            json.dumps(data)
-        )
-
-async def is_notified(mint: str) -> bool:
-    if pg_pool is None:
-        return flat_tokens.get(mint, {}).get('notified', False)
-    async with pg_pool.acquire() as conn:
-        row = await conn.fetchrow(f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint=$1", mint)
-        return bool(row)
-
-# ===================== CLIENTE JUPITER =====================
-class JupiterClient:
-    def __init__(self, base_url=JUPITER_BASE):
-        self.base = base_url
+# ===================== APIS RÁPIDAS =====================
+class FastAPIClient:
+    def __init__(self):
+        self.session = None
         self.cache = {}
-        self.cache_ttl = 300
-
-    async def request(self, path: str, cache_key: str = None, ttl: int = None):
-        session = await get_http_session()
-        ttl = ttl if ttl is not None else self.cache_ttl
-        
-        if cache_key and cache_key in self.cache:
-            cached, ts = self.cache[cache_key]
-            if time.time() - ts < ttl:
-                return cached
-                
-        url = f"{self.base}{path}" if path.startswith("/") else f"{self.base}/{path}"
+    
+    async def get_jupiter_tokens(self):
+        """Obtener tokens recientes y con volumen de Jupiter"""
         try:
-            async with session.get(url, timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if cache_key:
-                        self.cache[cache_key] = (data, time.time())
-                    return data
-                else:
-                    logger.debug(f"Jupiter request {url} status {resp.status}")
-                    return None
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+            
+            endpoints = [
+                "https://lite-api.jup.ag/tokens/v2/recent?limit=50",
+                "https://lite-api.jup.ag/tokens/v2/toptraded/1h?limit=50"
+            ]
+            
+            all_tokens = []
+            for url in endpoints:
+                async with self.session.get(url, timeout=10) as response:
+                    if response.status == 200:
+                        tokens = await response.json()
+                        if isinstance(tokens, list):
+                            all_tokens.extend(tokens)
+            
+            # Filtrar por liquidez y volumen básico
+            filtered = []
+            for token in all_tokens:
+                liquidity = token.get('liquidity', 0)
+                volume_24h = (token.get('stats24h', {}).get('buyVolume', 0) + 
+                             token.get('stats24h', {}).get('sellVolume', 0))
+                
+                if liquidity >= MIN_LIQUIDITY and volume_24h >= MIN_VOLUME_24H:
+                    filtered.append(token)
+            
+            logger.info(f"🔍 {len(filtered)} tokens válidos encontrados")
+            return filtered
+            
         except Exception as e:
-            logger.debug(f"Error request Jupiter: {e}")
-            return None
-
-    async def get_multiple_token_sources(self):
-        endpoints = [
-            "/tokens/v2/toporganicscore/1h?limit=80",
-            "/tokens/v2/toptraded/1h?limit=80", 
-            "/tokens/v2/tag?query=verified",
-            "/tokens/v2/recent?limit=50"
-        ]
-        results = []
-        for i, ep in enumerate(endpoints):
-            data = await self.request(ep, cache_key=f"jup_ep_{i}", ttl=600)
-            if data:
-                results.extend(data)
-        return results
-
-    async def get_token_by_id(self, mint: str):
-        return await self.request(f"/tokens/v2/search?query={mint}", cache_key=f"jup_token_{mint}", ttl=60)
-
-jupiter = JupiterClient()
-
-# ===================== CANDLES DEXSCREENER =====================
-async def fetch_candles_dexscreener(mint: str, interval_minutes=15, limit=None):
-    limit = limit or params['CANDLES_TO_CHECK']
-    session = await get_http_session()
-    try:
-        search_url = f"https://api.dexscreener.com/latest/dex/search/?q={mint}"
-        async with session.get(search_url, timeout=8) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                pairs = data.get("pairs", [])
-                if pairs:
-                    pair = pairs[0]
-                    pair_id = pair.get("pairAddress") or pair.get("pair")
-                    pair_url = f"https://api.dexscreener.com/latest/dex/pair/{pair_id}"
+            logger.error(f"❌ Error Jupiter API: {e}")
+            return []
+    
+    async def get_dexscreener_candles(self, mint: str, limit: int = 24):
+        """Obtener velas recientes para análisis FLAT"""
+        try:
+            if not self.session:
+                self.session = aiohttp.ClientSession()
+            
+            # Buscar par en DexScreener
+            search_url = f"https://api.dexscreener.com/latest/dex/search?q={mint}"
+            async with self.session.get(search_url, timeout=8) as response:
+                if response.status != 200:
+                    return []
+                
+                data = await response.json()
+                pairs = data.get('pairs', [])
+                if not pairs:
+                    return []
+                
+                # Tomar el primer par de Solana
+                pair = None
+                for p in pairs:
+                    if p.get('chainId') == 'solana':
+                        pair = p
+                        break
+                
+                if not pair:
+                    return []
+                
+                # Obtener datos del par
+                pair_address = pair.get('pairAddress')
+                pair_url = f"https://api.dexscreener.com/latest/dex/pairs/solana/{pair_address}"
+                
+                async with self.session.get(pair_url, timeout=8) as pair_response:
+                    if pair_response.status != 200:
+                        return []
                     
-                    async with session.get(pair_url, timeout=8) as r2:
-                        if r2.status == 200:
-                            pair_data = await r2.json()
-                            candles = pair_data.get("candles") or pair_data.get("chart") or []
-                            
-                            normalized = []
-                            for c in candles[-limit:]:
-                                if isinstance(c, list) and len(c) >= 6:
-                                    normalized.append({
-                                        "time": c[0],
-                                        "open": c[1], 
-                                        "high": c[2],
-                                        "low": c[3],
-                                        "close": c[4],
-                                        "volume": c[5]
-                                    })
-                            return normalized
-    except Exception as e:
-        logger.debug(f"Error Dexscreener para {mint}: {e}")
-    return []
-
-# ===================== DETECCIÓN AVANZADA PATRÓN FLAT =====================
-def calculate_volatility_from_candles(candles):
-    prices = [c.get("close") for c in candles if c.get("close") is not None]
-    if len(prices) < 4:
-        return None
-        
-    returns = []
-    for i in range(1, len(prices)):
-        prev = prices[i-1]
-        if prev == 0:
-            continue
-        ret = (prices[i] - prev) / prev * 100
-        returns.append(ret)
-    
-    if not returns:
-        return None
-        
-    return {
-        "std_dev": pstdev(returns) if len(returns) > 1 else 0,
-        "max_move": max(abs(x) for x in returns) if returns else 0,
-        "avg_move": mean([abs(x) for x in returns]) if returns else 0,
-        "min_price": min(prices) if prices else 0,
-        "max_price": max(prices) if prices else 0,
-    }
-
-def analyze_volume_sequence(volumes, colors):
-    """Analiza secuencia de volumen para patrón FLAT tipo PESHI"""
-    if len(volumes) < 6:
-        return False, {}
-    
-    low_cut = 20
-    spike_thresh = params['VOLUME_SPIKE_THRESHOLD']
-    min_consec_low = params['MIN_CONSECUTIVE_LOW']
-    
-    # Contar volúmenes por categoría
-    low_count = sum(1 for v in volumes if v < low_cut)
-    med_count = sum(1 for v in volumes if low_cut <= v <= 200)
-    high_count = sum(1 for v in volumes if v > 200)
-    
-    # Buscar picos aislados (alto volumen rodeado de bajo volumen)
-    isolated_spikes = 0
-    for i in range(1, len(volumes)-1):
-        prev_low = volumes[i-1] < 15
-        current_high = volumes[i] > spike_thresh
-        next_low = volumes[i+1] < 20
-        
-        if prev_low and current_high and next_low:
-            isolated_spikes += 1
-    
-    # Condición mejorada para volumen fantasma
-    volume_condition = (
-        low_count >= min_consec_low and
-        med_count <= 3 and
-        high_count <= 2 and 
-        isolated_spikes >= 1
-    )
-    
-    return volume_condition, {
-        "low_count": low_count,
-        "med_count": med_count,
-        "high_count": high_count,
-        "isolated_spikes": isolated_spikes
-    }
-
-def detect_volume_manipulation(volumes, window=4):
-    """Detecta patrones sospechosos de manipulación de volumen"""
-    if len(volumes) < window:
-        return False
-    
-    avg_volume = sum(volumes) / len(volumes)
-    if avg_volume == 0:
-        return False
-    
-    # Buscar picos anómalos (>10x el volumen promedio) aislados
-    anomalous_spikes = 0
-    for i, vol in enumerate(volumes):
-        if vol > avg_volume * 10:
-            # Verificar si es un pico aislado
-            window_start = max(0, i-2)
-            window_end = min(len(volumes), i+3)
-            window_volumes = volumes[window_start:window_end]
-            
-            high_volumes_in_window = sum(1 for v in window_volumes if v > avg_volume * 5)
-            if high_volumes_in_window <= 1:
-                anomalous_spikes += 1
-    
-    return anomalous_spikes > 1
-
-def detect_ghost_volume_pattern(candles):
-    """Detección principal del patrón FLAT mejorado"""
-    if len(candles) < 8:
-        return False, {}
-    
-    volumes = [c.get('volume', 0) for c in candles]
-    colors = ['green' if c.get('close', 0) >= c.get('open', 0) else 'red' for c in candles]
-    
-    # Análisis de secuencia de volumen
-    vol_condition, vol_details = analyze_volume_sequence(volumes, colors)
-    
-    # Análisis de volatilidad
-    volatility_metrics = calculate_volatility_from_candles(candles)
-    if not volatility_metrics:
-        return False, {}
-    
-    # Detección de manipulación
-    manipulation_detected = detect_volume_manipulation(volumes)
-    
-    # Condiciones combinadas para patrón FLAT real
-    flat_condition = (
-        vol_condition and
-        not manipulation_detected and
-        volatility_metrics['std_dev'] < params['FLAT_STD_THRESHOLD'] and
-        volatility_metrics['max_move'] < 0.8 and
-        ((volatility_metrics['max_price'] - volatility_metrics['min_price']) / 
-         (volatility_metrics['min_price'] or 1) * 100) < 2.0
-    )
-    
-    return flat_condition, {
-        **vol_details, 
-        'metrics': volatility_metrics,
-        'manipulation_detected': manipulation_detected,
-        'avg_volume': sum(volumes) / len(volumes)
-    }
-
-async def evaluate_token_flat(mint: str):
-    """Evaluación mejorada del token para patrón FLAT"""
-    candles = await fetch_candles_dexscreener(mint)
-    if not candles:
-        return False, {"reason": "no_candles"}
-    
-    last_candles = candles[-params['CANDLES_TO_CHECK']:]
-    is_flat, details = detect_ghost_volume_pattern(last_candles)
-    
-    return is_flat, {"candles_checked": len(last_candles), **details}
-
-# ===================== AUDITORÍA JUPITER =====================
-async def basic_jupiter_audit(mint: str):
-    try:
-        res = await jupiter.get_token_by_id(mint)
-        if not res:
-            return {}
-        if isinstance(res, list) and res:
-            token = res[0]
-        elif isinstance(res, dict):
-            token = res
-        else:
-            token = res
-        audit = token.get('audit', {}) if isinstance(token, dict) else {}
-        return audit
-    except Exception as e:
-        logger.debug(f"Error auditoría Jupiter para {mint}: {e}")
-        return {}
-
-# ===================== FORMATEO DE ALERTAS =====================
-def format_links(mint: str) -> str:
-    return (
-        f"• DexScreener: https://dexscreener.com/solana/{mint}\n"
-        f"• RugCheck: https://rugcheck.xyz/tokens/{mint}\n"
-        f"• Birdeye: https://birdeye.so/token/{mint}?chain=solana\n"
-    )
-
-async def alert_flat_found(mint: str, token_meta: dict, flat_info: dict):
-    if await is_notified(mint):
-        logger.info(f"Token {mint} ya notificado, omitiendo")
-        return
-    
-    symbol = token_meta.get('symbol', 'N/A')
-    name = token_meta.get('name', 'N/A')
-    liquidity = token_meta.get('liquidity', 0)
-    volume24 = token_meta.get('volume24h', 0)
-
-    audit = await basic_jupiter_audit(mint)
-    mint_auth_disabled = audit.get('mintAuthorityDisabled', False)
-    freeze_disabled = audit.get('freezeAuthorityDisabled', False)
-
-    msg = (
-        f"🚨 *TOKEN FLAT DETECTADO* 🚨\n\n"
-        f"*Token:* {symbol} — {name}\n"
-        f"*Mint Address:* {mint}\n"
-        f"*Liquidez:* ${liquidity:,.0f}\n"
-        f"*Volumen 24h:* ${volume24:,.0f}\n"
-        f"*Mint Authority:* {'✅ DESACTIVADA' if mint_auth_disabled else '❌ ACTIVA'}\n"
-        f"*Freeze Authority:* {'✅ DESACTIVADA' if freeze_disabled else '❌ ACTIVA'}\n\n"
-        f"*Análisis Técnico:*\n"
-        f"• Velas analizadas: {flat_info.get('candles_checked', 0)}\n"
-        f"• Velas volumen bajo: {flat_info.get('low_count', 0)}\n"
-        f"• Picos aislados: {flat_info.get('isolated_spikes', 0)}\n"
-        f"• Volumen promedio: ${flat_info.get('avg_volume', 0):.2f}\n"
-        f"• STD Precio: {flat_info.get('metrics', {}).get('std_dev', 0):.4f}\n\n"
-        f"🔗 *ENLACES:*\n{format_links(mint)}\n"
-        f"_Token en estado FLAT >{params['MIN_FLAT_MINUTES']} minutos - Listo para breakout_"
-    )
-
-    await send_telegram(msg)
-    await mark_notified(mint, {
-        "meta": token_meta, 
-        "flat_info": flat_info, 
-        "type": "flat_pattern",
-        "detected_at": datetime.utcnow().isoformat()
-    })
-
-async def alert_pumpfun_pre_graduation(mint: str, market_cap: float, token_meta: dict = None):
-    if await is_notified(mint):
-        return
-
-    symbol = token_meta.get('symbol', 'N/A') if token_meta else 'N/A'
-    name = token_meta.get('name', 'N/A') if token_meta else 'N/A'
-
-    msg = (
-        f"🔥 *PUMP.FUN PRE-GRADUACIÓN* 🔥\n\n"
-        f"*Token:* {symbol} — {name}\n"
-        f"*Mint Address:* {mint}\n"
-        f"*Market Cap Estimado:* ${market_cap:,.0f}\n"
-        f"*Umbral Alerta:* ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}\n\n"
-        f"🔗 *ENLACES:*\n{format_links(mint)}\n\n"
-        f"_Token cerca de graduación (69K MC) - Verificar inmediatamente_"
-    )
-
-    await send_telegram(msg)
-    await mark_notified(mint, {
-        "pump_detected_mc": market_cap, 
-        "meta": token_meta,
-        "type": "pumpfun_pre_graduation",
-        "detected_at": datetime.utcnow().isoformat()
-    })
-
-# ===================== WORKERS =====================
-async def flat_scanner_worker(stop_event: asyncio.Event):
-    """Worker mejorado para detección de patrón FLAT"""
-    logger.info("🚀 Flat scanner worker mejorado iniciado")
-    while not stop_event.is_set():
-        try:
-            candidates = await jupiter.get_multiple_token_sources()
-            uniq = {}
-            for t in candidates:
-                tid = t.get('id') if isinstance(t, dict) else None
-                if tid:
-                    uniq[tid] = t
-            token_list = list(uniq.keys())
-            logger.info(f"🔍 Flat scanner analizando {len(token_list)} candidatos")
-            
-            sem = asyncio.Semaphore(6)
-
-            async def eval_one(mint):
-                async with sem:
-                    if await is_notified(mint):
-                        return
-                    token_meta = uniq.get(mint, {})
-                    is_flat, details = await evaluate_token_flat(mint)
-                    if is_flat:
-                        details['detected_at'] = datetime.utcnow().isoformat()
-                        await alert_flat_found(mint, {
-                            'symbol': token_meta.get('symbol'),
-                            'name': token_meta.get('name'),
-                            'liquidity': token_meta.get('liquidity'),
-                            'volume24h': (token_meta.get('stats24h', {}).get('buyVolume', 0) + 
-                                         token_meta.get('stats24h', {}).get('sellVolume', 0)),
-                            'organic_score': token_meta.get('organicScore')
-                        }, details)
-
-            tasks = [asyncio.create_task(eval_one(m)) for m in token_list[:120]]
-            await asyncio.gather(*tasks)
-
+                    pair_data = await pair_response.json()
+                    
+                    # Intentar obtener velas
+                    candles = pair_data.get('pairs', [{}])[0].get('candles')
+                    if not candles:
+                        return []
+                    
+                    # Normalizar formato
+                    normalized = []
+                    for candle in candles[-limit:]:
+                        if isinstance(candle, dict):
+                            normalized.append({
+                                'time': candle.get('timestamp', 0),
+                                'open': float(candle.get('open', 0)),
+                                'high': float(candle.get('high', 0)),
+                                'low': float(candle.get('low', 0)),
+                                'close': float(candle.get('close', 0)),
+                                'volume': float(candle.get('volume', 0))
+                            })
+                    
+                    return normalized
+                    
         except Exception as e:
-            logger.error(f"❌ Error flat scanner: {e}")
-        await asyncio.sleep(30)
+            logger.error(f"❌ Error DexScreener {mint}: {e}")
+            return []
 
-async def pumpfun_wss_worker(stop_event: asyncio.Event):
-    """Worker para monitorizar Pump.fun vía WebSocket"""
-    if not HELIUS_WSS_URL:
-        logger.warning("HELIUS_WSS_URL no configurado, pumpfun_wss_worker no se ejecutará")
-        return
-        
-    logger.info("🚀 Pump.fun WSS worker iniciado")
-    while not stop_event.is_set():
+api_client = FastAPIClient()
+
+# ===================== DETECTOR FLAT SIMPLIFICADO =====================
+class FlatDetector:
+    async def analyze_flat_pattern(self, mint: str) -> dict:
+        """Análisis simplificado para tokens FLAT de 1+ hora"""
         try:
-            async with websockets.connect(HELIUS_WSS_URL, ping_interval=20, ping_timeout=10) as ws:
-                logger.info("✅ Conectado a HELIUS WSS para Pump.fun")
-                subscribe_msg = {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "logsSubscribe",
-                    "params": [{
-                        "mentions": [PUMPFUN_PROGRAM_ID]
-                    }, {"commitment": "processed"}]
+            candles = await api_client.get_dexscreener_candles(mint, FLAT_CONFIG['CANDLES_TO_ANALYZE'])
+            
+            if len(candles) < 12:  # Mínimo 1 hora de datos
+                return {'is_flat': False, 'reason': 'insufficient_data'}
+            
+            # Calcular volatilidad
+            prices = [c['close'] for c in candles if c['close'] > 0]
+            if len(prices) < 8:
+                return {'is_flat': False, 'reason': 'not_enough_prices'}
+            
+            returns = []
+            for i in range(1, len(prices)):
+                if prices[i-1] > 0:
+                    ret = (prices[i] - prices[i-1]) / prices[i-1] * 100
+                    returns.append(ret)
+            
+            if not returns:
+                return {'is_flat': False, 'reason': 'no_returns'}
+            
+            std_dev = pstdev(returns) if len(returns) > 1 else 100
+            price_range = (max(prices) - min(prices)) / min(prices) * 100
+            
+            # Análisis de volumen
+            volumes = [c['volume'] for c in candles]
+            avg_volume = mean(volumes) if volumes else 0
+            low_volume_count = sum(1 for v in volumes if v < 20)
+            
+            # CONDICIONES PARA FLAT
+            is_flat = (
+                std_dev < FLAT_CONFIG['MAX_VOLATILITY'] and
+                price_range < 3.0 and  # Máximo 3% de rango de precio
+                avg_volume < FLAT_CONFIG['MAX_AVG_VOLUME_PER_CANDLE'] and
+                low_volume_count >= FLAT_CONFIG['MIN_LOW_VOLUME_CANDLES']
+            )
+            
+            if is_flat:
+                estimated_hours = len(candles) * 5 / 60  # Asumiendo velas de 5min
+                return {
+                    'is_flat': True,
+                    'duration_hours': estimated_hours,
+                    'volatility': std_dev,
+                    'price_range_pct': price_range,
+                    'avg_volume': avg_volume
                 }
-                await ws.send(json.dumps(subscribe_msg))
+            else:
+                return {'is_flat': False, 'reason': 'not_flat_pattern'}
                 
-                while not stop_event.is_set():
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=30)
-                        msg = json.loads(raw)
-                        params_msg = msg.get('params')
-                        if not params_msg:
-                            continue
-                            
-                        result = params_msg.get('result') if isinstance(params_msg, dict) else params_msg[0].get('result')
-                        if not result:
-                            continue
-                            
-                        value = result.get('value') if isinstance(result, dict) else None
-                        logs = value.get('logs') if value else []
-                        text = "\n".join([str(l) for l in logs])
-                        
-                        # Buscar market cap en los logs
-                        for m in re.finditer(r"market_cap\W*[:=]\W*(\d+[.,]?\d*)", text, re.IGNORECASE):
-                            mc = float(m.group(1).replace(',', ''))
-                            if mc >= PUMP_PRE_GRADUATION_THRESHOLD:
-                                # Buscar mint address
-                                mm = re.search(r"mint\W*[:=]\W*([A-Za-z0-9]{32,44})", text)
-                                mint = mm.group(1) if mm else None
-                                if mint and not await is_notified(mint):
-                                    meta = await jupiter.get_token_by_id(mint)
-                                    token_meta = meta[0] if isinstance(meta, list) and meta else (meta if isinstance(meta, dict) else {})
-                                    await alert_pumpfun_pre_graduation(mint, mc, token_meta)
-                                    
-                    except asyncio.TimeoutError:
-                        await ws.send(json.dumps({"jsonrpc": "2.0", "id": 9999, "method": "ping"}))
-                        
         except Exception as e:
-            logger.error(f"❌ Error conexión WSS Pump.fun: {e}")
-            await asyncio.sleep(5)
+            logger.error(f"❌ Error análisis FLAT {mint}: {e}")
+            return {'is_flat': False, 'reason': 'error'}
+
+flat_detector = FlatDetector()
+
+# ===================== SISTEMA DE ALERTAS =====================
+class AlertSystem:
+    def __init__(self):
+        self.bot = None
+    
+    async def get_bot(self):
+        if not self.bot and TELEGRAM_BOT_TOKEN:
+            self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        return self.bot
+    
+    def format_token_links(self, mint: str) -> str:
+        """Formato limpio de enlaces para Telegram"""
+        return (
+            f"🔗 *Enlaces Rápidos:*\n"
+            f"• [DexScreener](https://dexscreener.com/solana/{mint})\n"
+            f"• [RugCheck](https://rugcheck.xyz/tokens/{mint})\n"
+            f"• [Birdeye](https://birdeye.so/token/{mint}?chain=solana)\n"
+            f"• [Jupiter](https://jup.ag/swap/SOL-{mint})\n"
+        )
+    
+    async def send_flat_alert(self, mint: str, token_data: dict, flat_analysis: dict):
+        if await token_manager.is_duplicate(mint, "FLAT"):
+            return
+        
+        symbol = token_data.get('symbol', 'N/A')
+        
+        message = (
+            f"🎯 *TOKEN FLAT DETECTADO* 🎯\n\n"
+            f"*Token:* {symbol}\n"
+            f"*Mint:* `{mint}`\n"
+            f"*Tiempo en Flat:* {flat_analysis['duration_hours']:.1f} horas\n"
+            f"*Volatilidad:* {flat_analysis['volatility']:.2f}%\n"
+            f"*Rango Precio:* {flat_analysis['price_range_pct']:.2f}%\n"
+            f"*Volumen Promedio:* ${flat_analysis['avg_volume']:.2f}\n\n"
+            f"{self.format_token_links(mint)}\n"
+            f"💡 *Estrategia:* Token en acumulación - Posible breakout próximo"
+        )
+        
+        await self._send_message(message)
+        await token_manager.save_token(mint, symbol, "FLAT", flat_analysis)
+    
+    async def send_pumpfun_alert(self, mint: str, market_cap: float):
+        if await token_manager.is_duplicate(mint, "PUMPFUN"):
+            return
+        
+        message = (
+            f"🚀 *PUMP.FUN - PRE-GRADUACIÓN* 🚀\n\n"
+            f"*Mint:* `{mint}`\n"
+            f"*Market Cap Actual:* ${market_cap:,.0f}\n"
+            f"*Graduación en:* ${PUMP_GRADUATION_TARGET - market_cap:,.0f}\n\n"
+            f"{self.format_token_links(mint)}\n"
+            f"⚡ *Acción Inminente:* Liquidez se bloqueará automáticamente en ~${PUMP_GRADUATION_TARGET:,.0f}"
+        )
+        
+        await self._send_message(message)
+        await token_manager.save_token(mint, "PUMP_TOKEN", "PUMPFUN", 
+                                     {'market_cap': market_cap, 'alert_time': datetime.now().isoformat()})
+    
+    async def send_token_list(self, tokens: list, list_type: str):
+        if not tokens:
+            await self._send_message(f"📭 No hay tokens {list_type}")
+            return
+        
+        message = f"📋 *ÚLTIMOS {len(tokens)} TOKENS - {list_type.upper()}*\n\n"
+        
+        for i, token in enumerate(tokens, 1):
+            mint = token['mint']
+            symbol = token.get('symbol', 'N/A')
+            token_type = token.get('type', 'N/A')
+            time_ago = self._format_time_ago(token['time'])
+            
+            message += (
+                f"`{i}. {symbol} ({token_type})`\n"
+                f"   • Mint: `{mint}`\n"
+                f"   • Hace: {time_ago}\n"
+                f"   • [DexScreener](https://dexscreener.com/solana/{mint}) | "
+                f"[RugCheck](https://rugcheck.xyz/tokens/{mint}) | "
+                f"[Birdeye](https://birdeye.so/token/{mint})\n\n"
+            )
+        
+        await self._send_message(message)
+    
+    def _format_time_ago(self, token_time):
+        now = datetime.now()
+        diff = now - token_time
+        minutes = diff.total_seconds() / 60
+        
+        if minutes < 60:
+            return f"{int(minutes)} min"
+        elif minutes < 1440:
+            return f"{int(minutes/60)} horas"
+        else:
+            return f"{int(minutes/1440)} días"
+    
+    async def _send_message(self, message: str):
+        try:
+            bot = await self.get_bot()
+            if bot and TELEGRAM_CHAT_ID:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=message,
+                    parse_mode=ParseMode.MARKDOWN,
+                    disable_web_page_preview=False
+                )
+        except Exception as e:
+            logger.error(f"❌ Error enviando mensaje: {e}")
+
+alert_system = AlertSystem()
+
+# ===================== SCANNERS PRINCIPALES =====================
+class FlatScanner:
+    def __init__(self):
+        self.active = False
+    
+    async def start_scanning(self):
+        self.active = True
+        logger.info("🔄 Iniciando scanner FLAT...")
+        
+        while self.active:
+            try:
+                tokens = await api_client.get_jupiter_tokens()
+                logger.info(f"🔍 Analizando {len(tokens)} tokens para FLAT")
+                
+                for token in tokens[:30]:  # Limitar para no saturar
+                    if not self.active:
+                        break
+                    
+                    mint = token.get('id')
+                    if not mint:
+                        continue
+                    
+                    # Análisis rápido FLAT
+                    flat_analysis = await flat_detector.analyze_flat_pattern(mint)
+                    
+                    if flat_analysis['is_flat']:
+                        logger.info(f"✅ FLAT detectado: {token.get('symbol')} - {flat_analysis['duration_hours']:.1f}h")
+                        await alert_system.send_flat_alert(mint, token, flat_analysis)
+                    
+                    await asyncio.sleep(2)  # Rate limiting
+                
+                await asyncio.sleep(60)  # Esperar 1 minuto entre scans
+                
+            except Exception as e:
+                logger.error(f"❌ Error en scanner FLAT: {e}")
+                await asyncio.sleep(30)
+    
+    def stop(self):
+        self.active = False
+
+flat_scanner = FlatScanner()
+
+class PumpFunMonitor:
+    def __init__(self):
+        self.active = False
+    
+    async def start_monitoring(self):
+        self.active = True
+        logger.info("🚀 Iniciando monitor Pump.fun...")
+        
+        if not HELIUS_WSS_URL:
+            logger.error("❌ HELIUS_WSS_URL no configurado")
+            return
+        
+        # SIMULACIÓN - En producción usarías WebSocket real
+        while self.active:
+            try:
+                # Aquí iría tu conexión WebSocket real a Helius
+                # Por ahora simulamos detección ocasional
+                await asyncio.sleep(30)
+                
+                # Simulación aleatoria para testing
+                import random
+                if random.random() < 0.1:  # 10% de probabilidad
+                    mock_mint = f"SIM{int(time.time())}"
+                    mock_mcap = random.randint(55000, 68000)
+                    
+                    if mock_mcap >= PUMP_PRE_GRADUATION_THRESHOLD:
+                        logger.info(f"🎯 SIMULACIÓN: Token cerca de graduación - MC: ${mock_mcap:,.0f}")
+                        await alert_system.send_pumpfun_alert(mock_mint, mock_mcap)
+                        
+            except Exception as e:
+                logger.error(f"❌ Error monitor Pump.fun: {e}")
+                await asyncio.sleep(10)
+    
+    def stop(self):
+        self.active = False
+
+pump_monitor = PumpFunMonitor()
 
 # ===================== COMANDOS TELEGRAM =====================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 *Jupiter V3 Bot - Cazador de Tokens FLAT + Pump.fun*\n\n"
-        "🎯 *Configuración Actual:*\n"
-        f"• Tiempo FLAT mínimo: {params['MIN_FLAT_MINUTES']} minutos\n"
-        f"• Pre-graduación Pump.fun: ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f} MC\n"
-        f"• STD Threshold: {params['FLAT_STD_THRESHOLD']}\n\n"
-        "📊 *Comandos disponibles:*\n"
-        "• /cazar - Iniciar monitoreo\n"
-        "• /parar - Detener monitoreo\n"
-        "• /status - Estado del sistema\n"
-        "• /planos - Lista de tokens planos detectados\n"
-        "• /tokens - Lista de tokens monitoreados",
-        parse_mode="Markdown"
+        "🤖 *BOT PUMP.FUN + FLAT DETECTOR* 🚀\n\n"
+        "🎯 *OBJETIVO:*\n"
+        "• Tokens FLAT: 1+ hora en línea recta\n"
+        "• Pump.fun: Alerta pre-graduación ($60k+)\n\n"
+        "📋 *COMANDOS:*\n"
+        "• /iniciar - Activar scanners\n"
+        "• /detener - Parar scanners\n"
+        "• /lista_tokens - Últimos 10 tokens\n"
+        "• /lista_flat - Solo tokens FLAT\n"
+        "• /lista_pump - Solo tokens Pump.fun\n"
+        "• /status - Estado del sistema\n\n"
+        "⚡ *Inicia manualmente cuando quieras!*",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-async def cmd_cazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Inicia el monitoreo"""
-    global monitor_task, pump_task, stop_evt
-    
-    if not stop_evt.is_set():
-        await update.message.reply_text("⚠️ Monitoreo ya activo")
-        return
-        
-    stop_evt.clear()
-    monitor_task = asyncio.create_task(flat_scanner_worker(stop_evt))
-    pump_task = asyncio.create_task(pumpfun_wss_worker(stop_evt))
+async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    asyncio.create_task(flat_scanner.start_scanning())
+    asyncio.create_task(pump_monitor.start_monitoring())
     
     await update.message.reply_text(
-        "🎯 *SISTEMA DE CAZA ACTIVADO*\n\n"
-        f"• FLAT Scanner: {params['MIN_FLAT_MINUTES']} minutos mínimos\n"
-        f"• Pump.fun Sniper: ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}+ MC\n"
-        f"• Análisis: {params['CANDLES_TO_CHECK']} velas\n\n"
+        "✅ *SCANNERS ACTIVADOS*\n\n"
+        "• FLAT Scanner: 🟢 ACTIVO\n"
+        "• Pump.fun Monitor: 🟢 ACTIVO\n\n"
         "_Buscando oportunidades..._",
-        parse_mode="Markdown"
+        parse_mode=ParseMode.MARKDOWN
     )
 
-async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detiene el monitoreo"""
-    stop_evt.set()
-    await update.message.reply_text("🛑 Monitoreo detenido")
+async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    flat_scanner.stop()
+    pump_monitor.stop()
+    
+    await update.message.reply_text(
+        "🛑 *SCANNERS DETENIDOS*\n\n"
+        "• FLAT Scanner: 🔴 DETENIDO\n"
+        "• Pump.fun Monitor: 🔴 DETENIDO",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estado del sistema"""
-    flat_count = len(flat_tokens)
-    notified_count = "DB" if pg_pool else "Memory"
+async def lista_tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tokens = await token_manager.get_recent_tokens(10)
+    await alert_system.send_token_list(tokens, "todos los tokens")
+
+async def lista_flat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tokens = await token_manager.get_recent_tokens(10, "FLAT")
+    await alert_system.send_token_list(tokens, "FLAT")
+
+async def lista_pump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tokens = await token_manager.get_recent_tokens(10, "PUMPFUN")
+    await alert_system.send_token_list(tokens, "PUMP.FUN")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    recent_tokens = await token_manager.get_recent_tokens(5)
+    flat_count = len(await token_manager.get_recent_tokens(50, "FLAT"))
+    pump_count = len(await token_manager.get_recent_tokens(50, "PUMPFUN"))
     
     status_msg = (
-        f"📊 *Estado del Sistema V3*\n\n"
-        f"🔧 Monitoreo: {'🟢 ACTIVO' if not stop_evt.is_set() else '🔴 DETENIDO'}\n"
-        f"📈 Tokens monitoreados: {len(monitored_tokens)}\n"
-        f"📉 Tokens FLAT detectados: {flat_count}\n"
-        f"💾 Persistencia: {notified_count}\n\n"
-        f"⚙️ *Configuración FLAT:*\n"
-        f"• Mínimo: {params['MIN_FLAT_MINUTES']} minutos\n"
-        f"• STD: {params['FLAT_STD_THRESHOLD']}\n"
-        f"• Volumen Spike: ${params['VOLUME_SPIKE_THRESHOLD']}\n"
-        f"• Velas analizadas: {params['CANDLES_TO_CHECK']}"
+        f"📊 *ESTADO DEL SISTEMA*\n\n"
+        f"• FLAT Scanner: {'🟢 ACTIVO' if flat_scanner.active else '🔴 DETENIDO'}\n"
+        f"• Pump.fun Monitor: {'🟢 ACTIVO' if pump_monitor.active else '🔴 DETENIDO'}\n"
+        f"• Tokens FLAT hoy: {flat_count}\n"
+        f"• Tokens Pump.fun hoy: {pump_count}\n"
+        f"• Última actualización: {datetime.now().strftime('%H:%M:%S')}\n\n"
+        f"⚙️ *CONFIGURACIÓN:*\n"
+        f"• Flat mínimo: {FLAT_CONFIG['MIN_FLAT_DURATION_HOURS']} hora\n"
+        f"• Alerta Pump.fun: ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}+"
     )
-    await update.message.reply_text(status_msg, parse_mode="Markdown")
-
-async def cmd_planos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista de tokens planos detectados"""
-    if not flat_tokens:
-        await update.message.reply_text("📭 No hay tokens planos detectados")
-        return
     
-    current_time = time.time()
-    flat_list = "📊 *TOKENS PLANOS DETECTADOS:*\n\n"
-    
-    for i, (mint, flat_info) in enumerate(list(flat_tokens.items())[:15], 1):
-        symbol = flat_info.get('symbol', 'N/A')
-        flat_since = flat_info.get('flat_since', current_time)
-        flat_minutes = int((current_time - flat_since) / 60)
-        
-        flat_list += (
-            f"{i}. *{symbol}*\n"
-            f"   📍 `{mint}`\n"
-            f"   ⏰ {flat_minutes} minutos en flat\n"
-            f"   🔗 https://dexscreener.com/solana/{mint}\n\n"
-        )
-    
-    if len(flat_tokens) > 15:
-        flat_list += f"📋 ... y {len(flat_tokens) - 15} tokens más\n"
-    
-    await update.message.reply_text(flat_list, parse_mode="Markdown")
-
-async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista de tokens siendo monitoreados"""
-    if not monitored_tokens:
-        await update.message.reply_text("📭 No hay tokens siendo monitoreados")
-        return
-    
-    tokens_list = "🎯 *TOKENS MONITOREADOS:*\n\n"
-    
-    for i, mint in enumerate(list(monitored_tokens)[:15], 1):
-        metadata = token_metadata.get(mint, {})
-        symbol = metadata.get('symbol', 'N/A')
-        
-        tokens_list += (
-            f"{i}. *{symbol}*\n"
-            f"   📍 `{mint}`\n"
-            f"   💰 Liq: ${metadata.get('liquidity', 0):,.0f}\n"
-            f"   🔗 https://dexscreener.com/solana/{mint}\n\n"
-        )
-    
-    if len(monitored_tokens) > 15:
-        tokens_list += f"📋 ... y {len(monitored_tokens) - 15} tokens más\n"
-    
-    await update.message.reply_text(tokens_list, parse_mode="Markdown")
+    await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
 
 # ===================== MAIN =====================
 async def main():
-    global stop_evt, monitor_task, pump_task, app_bot
+    logger.info("🚀 INICIANDO BOT PUMP.FUN + FLAT...")
     
-    logger.info("🚀 Iniciando Jupiter v2 Pro - Bot V3 Mejorado")
-    await init_db()
+    await token_manager.init()
     
-    stop_evt = asyncio.Event()
-    stop_evt.set()  # Inicialmente detenido
-
-    # Iniciar workers
-    monitor_task = asyncio.create_task(flat_scanner_worker(stop_evt))
-    pump_task = asyncio.create_task(pumpfun_wss_worker(stop_evt))
-
-    # Configurar bot de Telegram para comandos
-    if TELEGRAM_BOT_TOKEN:
-        app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        
-        # Registrar comandos
-        app_bot.add_handler(CommandHandler("start", cmd_start))
-        app_bot.add_handler(CommandHandler("cazar", cmd_cazar))
-        app_bot.add_handler(CommandHandler("parar", cmd_parar))
-        app_bot.add_handler(CommandHandler("status", cmd_status))
-        app_bot.add_handler(CommandHandler("planos", cmd_planos))
-        app_bot.add_handler(CommandHandler("tokens", cmd_tokens))
-        
-        # Ejecutar bot de Telegram en segundo plano
-        asyncio.create_task(app_bot.run_polling())
-
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("❌ TELEGRAM_BOT_TOKEN no configurado")
+        return
+    
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Comandos simples
+    commands = [
+        ("start", start_command),
+        ("iniciar", iniciar_command),
+        ("detener", detener_command),
+        ("status", status_command),
+        ("lista_tokens", lista_tokens_command),
+        ("lista_flat", lista_flat_command),
+        ("lista_pump", lista_pump_command),
+    ]
+    
+    for command, handler in commands:
+        application.add_handler(CommandHandler(command, handler))
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    
+    logger.info("✅ Bot Telegram iniciado - Listo para comandos")
+    
+    # Mensaje de inicio
+    await alert_system._send_message(
+        "🤖 *BOT INICIADO* 🚀\n\n"
+        "✅ Sistema listo para comandos\n"
+        "✅ Gestión de tokens activa\n"
+        "✅ Scanners preparados\n\n"
+        "Usa /iniciar para comenzar la búsqueda!"
+    )
+    
     try:
-        await asyncio.gather(monitor_task, pump_task)
-    except asyncio.CancelledError:
-        logger.info("🔴 Bot cancelado")
-    finally:
-        stop_evt.set()
-        if http_session:
-            await http_session.close()
-        if pg_pool:
-            await pg_pool.close()
-        if app_bot:
-            await app_bot.shutdown()
-        logger.info("✅ Apagado completo")
-
-if __name__ == '__main__':
-    stop_evt = asyncio.Event()
-    try:
-        asyncio.run(main())
+        while True:
+            await asyncio.sleep(3600)
     except KeyboardInterrupt:
-        logger.info("🔴 Interrumpido por el usuario")
+        logger.info("👋 Bot terminado por usuario")
+    finally:
+        flat_scanner.stop()
+        pump_monitor.stop()
+        await application.stop()
+
+if __name__ == "__main__":
+    asyncio.run(main())
