@@ -1,12 +1,7 @@
 """
-bot_jupiter_v2_pro_optimized.py
+bot_jupiter_v2_pro_optimized_fixed.py
 
-Bot optimizado para encontrar tokens en planos reales con PostgreSQL
-- Filtros relajados para encontrar planos en cualquier dirección (rojo/verde)
-- Enfoque en patrón de volumen y precio, no en metrics absolutas
-- PostgreSQL mantenido para persistencia
-- Mejor visualización de mints en alertas
-- Sistema Pump.fun completo incluido
+Bot optimizado con corrección para PostgreSQL existente
 """
 
 import os
@@ -38,12 +33,12 @@ JUPITER_BASE = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag")
 PUMPFUN_PROGRAM_ID = os.getenv("PUMPFUN_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
 PUMP_PRE_GRADUATION_THRESHOLD = float(os.getenv("PUMP_PRE_THRESHOLD", "60000"))
 
-# FILTROS RELAJADOS - ENFOCADOS EN PATRONES, NO EN MÉTRICAS ABSOLUTAS
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "40000"))  # Mínimo razonable
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))  # Volumen muy bajo para encontrar planos
-MAX_VOLUME_24H = float(os.getenv("MAX_VOLUME_24H", "300000"))  # No demasiado popular
+# FILTROS RELAJADOS
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY", "40000"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000"))
+MAX_VOLUME_24H = float(os.getenv("MAX_VOLUME_24H", "300000"))
 
-# Detección FLAT mejorada - enfoque en patrón, no en precio
+# Detección FLAT
 MIN_FLAT_MINUTES = int(os.getenv("MIN_FLAT_MINUTES", "180"))
 FLAT_STD_THRESHOLD = float(os.getenv("FLAT_STD_THRESHOLD", "0.15"))
 VOLUME_SPIKE_THRESHOLD = float(os.getenv("VOLUME_SPIKE_THRESHOLD", "100"))
@@ -51,7 +46,7 @@ MIN_CONSECUTIVE_LOW = int(os.getenv("MIN_CONSECUTIVE_LOW", "6"))
 
 # Configuración de análisis
 CANDLE_INTERVAL_MINUTES = 15
-CANDLES_TO_CHECK = 16  # 4 horas de datos
+CANDLES_TO_CHECK = 16
 
 # DB tables
 DB_TABLE_NOTIFIED = "notified_mints"
@@ -102,7 +97,7 @@ async def safe_send_telegram(text: str, parse_mode=ParseMode.MARKDOWN):
         logger.error(f"❌ Error enviando telegram: {e}")
         return False
 
-# ------------------ POSTGRESQL ------------------
+# ------------------ POSTGRESQL CORREGIDO ------------------
 async def init_db():
     global pg_pool
     if not DATABASE_URL:
@@ -112,55 +107,94 @@ async def init_db():
     try:
         pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
         async with pg_pool.acquire() as conn:
-            await conn.execute(f"""
-                CREATE TABLE IF NOT EXISTS {DB_TABLE_NOTIFIED} (
-                    mint TEXT PRIMARY KEY,
-                    first_notified_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-                    last_alert_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
-                    alert_count INTEGER DEFAULT 1,
-                    data JSONB,
-                    alert_type TEXT
+            # Primero verificar si la tabla existe
+            table_exists = await conn.fetchval("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = $1
                 );
-            """)
-            await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_notified_type ON {DB_TABLE_NOTIFIED}(alert_type)")
-            await conn.execute(f"CREATE INDEX IF NOT EXISTS idx_notified_time ON {DB_TABLE_NOTIFIED}(first_notified_at)")
-        logger.info("✅ PostgreSQL inicializado")
+            """, DB_TABLE_NOTIFIED)
+            
+            if table_exists:
+                logger.info("✅ Tabla existente detectada, verificando columnas...")
+                # Verificar y agregar columnas faltantes si es necesario
+                columns = await conn.fetch("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = $1;
+                """, DB_TABLE_NOTIFIED)
+                
+                existing_columns = {row['column_name'] for row in columns}
+                required_columns = {'mint', 'first_notified_at', 'data'}
+                
+                # Solo crear columnas faltantes
+                if not required_columns.issubset(existing_columns):
+                    logger.info("🔧 Actualizando estructura de tabla...")
+                    await conn.execute(f"""
+                        CREATE TABLE IF NOT EXISTS {DB_TABLE_NOTIFIED} (
+                            mint TEXT PRIMARY KEY,
+                            first_notified_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                            data JSONB
+                        );
+                    """)
+            else:
+                # Crear tabla nueva
+                await conn.execute(f"""
+                    CREATE TABLE {DB_TABLE_NOTIFIED} (
+                        mint TEXT PRIMARY KEY,
+                        first_notified_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+                        data JSONB
+                    );
+                """)
+                logger.info("✅ Tabla creada exitosamente")
+            
+        logger.info("✅ PostgreSQL inicializado correctamente")
         return True
     except Exception as e:
         logger.error(f"❌ Error inicializando PostgreSQL: {e}")
         return False
 
-async def mark_notified(mint: str, data: dict, alert_type="flat"):
+async def mark_notified(mint: str, data: dict):
     if pg_pool is None:
         return
     
     try:
         async with pg_pool.acquire() as conn:
-            await conn.execute(f"""
-                INSERT INTO {DB_TABLE_NOTIFIED}(mint, data, alert_type) 
-                VALUES($1, $2, $3)
-                ON CONFLICT (mint) DO UPDATE SET 
-                    last_alert_at = now(),
-                    alert_count = {DB_TABLE_NOTIFIED}.alert_count + 1,
-                    data = EXCLUDED.data
-            """, mint, json.dumps(data), alert_type)
+            # Verificar estructura de la tabla
+            columns = await conn.fetch("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = $1;
+            """, DB_TABLE_NOTIFIED)
+            
+            existing_columns = {row['column_name'] for row in columns}
+            
+            if 'data' in existing_columns:
+                await conn.execute(f"""
+                    INSERT INTO {DB_TABLE_NOTIFIED}(mint, data) 
+                    VALUES($1, $2)
+                    ON CONFLICT (mint) DO UPDATE SET 
+                        data = EXCLUDED.data
+                """, mint, json.dumps(data))
+            else:
+                # Fallback para estructura simple
+                await conn.execute(f"""
+                    INSERT INTO {DB_TABLE_NOTIFIED}(mint) 
+                    VALUES($1)
+                    ON CONFLICT (mint) DO NOTHING
+                """, mint)
+                
         logger.debug(f"✅ Token {mint[:8]}... marcado como notificado")
     except Exception as e:
         logger.error(f"❌ Error marcando como notificado: {e}")
 
-async def is_notified(mint: str, alert_type=None, cooldown_hours=4) -> bool:
+async def is_notified(mint: str) -> bool:
     if pg_pool is None:
         return False
     
     try:
         async with pg_pool.acquire() as conn:
-            if alert_type:
-                query = f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint = $1 AND alert_type = $2 AND last_alert_at > now() - interval '{cooldown_hours} hours'"
-                row = await conn.fetchrow(query, mint, alert_type)
-            else:
-                query = f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint = $1 AND last_alert_at > now() - interval '{cooldown_hours} hours'"
-                row = await conn.fetchrow(query, mint)
-            
+            row = await conn.fetchrow(f"SELECT mint FROM {DB_TABLE_NOTIFIED} WHERE mint=$1", mint)
             return bool(row)
     except Exception as e:
         logger.error(f"❌ Error verificando notificación: {e}")
@@ -226,9 +260,6 @@ class JupiterClient:
             # FILTROS MÍNIMOS RELAJADOS
             has_liquidity = liquidity >= MIN_LIQUIDITY
             has_recent_activity = volume24h >= MIN_VOLUME_24H and volume24h <= MAX_VOLUME_24H
-            
-            # No excluir por market cap alto/bajo - los planos pueden ocurrir en cualquier rango
-            # No excluir por score orgánico - los planos no discriminan
             
             if has_liquidity and has_recent_activity and mint:
                 filtered_tokens.append(token)
@@ -300,20 +331,19 @@ async def fetch_candles_dexscreener(mint: str, limit=CANDLES_TO_CHECK):
 
 # ------------------ DETECCIÓN FLAT MEJORADA ------------------
 def analyze_volume_pattern(volumes):
-    """Analiza el patrón de volumen para identificar planos - MEJORADO"""
+    """Analiza el patrón de volumen para identificar planos"""
     if len(volumes) < 10:
         return False, {}
     
     # Contar velas por categoría de volumen
-    very_low_vol = sum(1 for v in volumes if v < 10)     # Volumen casi cero
-    low_vol = sum(1 for v in volumes if 10 <= v < 50)    # Volumen bajo
-    medium_vol = sum(1 for v in volumes if 50 <= v <= 200) # Volumen moderado
-    high_vol = sum(1 for v in volumes if v > 200)        # Picos altos
+    very_low_vol = sum(1 for v in volumes if v < 10)
+    low_vol = sum(1 for v in volumes if 10 <= v < 50)
+    medium_vol = sum(1 for v in volumes if 50 <= v <= 200)
+    high_vol = sum(1 for v in volumes if v > 200)
     
     # Buscar picos aislados (patrón clave)
     isolated_spikes = 0
     for i in range(2, len(volumes)-2):
-        # Verificar si hay un pico rodeado de volumen bajo
         if (volumes[i-2] < 15 and 
             volumes[i-1] < 15 and 
             volumes[i] > VOLUME_SPIKE_THRESHOLD and 
@@ -325,12 +355,12 @@ def analyze_volume_pattern(volumes):
     avg_volume = sum(volumes) / len(volumes)
     volume_std = pstdev(volumes) if len(volumes) > 1 else 0
     
-    # CONDICIÓN PRINCIPAL RELAJADA - enfoque en patrón, no en valores absolutos
+    # CONDICIÓN PRINCIPAL RELAJADA
     volume_condition = (
-        (very_low_vol + low_vol) >= MIN_CONSECUTIVE_LOW and  # Suficientes velas de volumen bajo
-        isolated_spikes >= 1 and                             # Al menos un pico aislado
-        avg_volume < 150 and                                 # Volumen promedio no muy alto
-        volume_std < 200                                     # Volumen no muy volátil
+        (very_low_vol + low_vol) >= MIN_CONSECUTIVE_LOW and
+        isolated_spikes >= 1 and
+        avg_volume < 150 and
+        volume_std < 200
     )
     
     return volume_condition, {
@@ -344,7 +374,7 @@ def analyze_volume_pattern(volumes):
     }
 
 def calculate_price_stability(candles):
-    """Calcula estabilidad del precio - MEJORADO para detectar planos reales"""
+    """Calcula estabilidad del precio"""
     if len(candles) < 8:
         return None
         
@@ -362,12 +392,12 @@ def calculate_price_stability(candles):
     if not returns:
         return None
     
-    # Calcular rango de precio (absoluto y porcentual)
+    # Calcular rango de precio
     price_range = max(prices) - min(prices)
     avg_price = sum(prices) / len(prices)
     range_percent = (price_range / avg_price * 100) if avg_price > 0 else 100
     
-    # Calcular tendencia general (no importa si es bajista o alcista)
+    # Calcular tendencia general
     first_price = prices[0]
     last_price = prices[-1]
     total_change = ((last_price - first_price) / first_price * 100) if first_price > 0 else 0
@@ -376,14 +406,14 @@ def calculate_price_stability(candles):
         "std_dev": round(pstdev(returns), 4) if len(returns) > 1 else 0,
         "max_move": round(max(abs(r) for r in returns), 2) if returns else 0,
         "price_range_percent": round(range_percent, 2),
-        "total_change_percent": round(total_change, 2),  # Puede ser negativo (planos bajistas)
+        "total_change_percent": round(total_change, 2),
         "min_price": min(prices),
         "max_price": max(prices),
         "direction": "bajista" if total_change < -1 else "alcista" if total_change > 1 else "neutral"
     }
 
 def detect_flat_pattern(candles):
-    """Detección principal de patrón FLAT - ENFOCADO EN PATRONES REALES"""
+    """Detección principal de patrón FLAT"""
     if len(candles) < CANDLES_TO_CHECK:
         return False, {"reason": "not_enough_candles"}
     
@@ -397,12 +427,12 @@ def detect_flat_pattern(candles):
     if not price_analysis:
         return False, {"reason": "invalid_price_data"}
     
-    # CONDICIONES RELAJADAS - enfoque en el patrón, no en valores absolutos
+    # CONDICIONES RELAJADAS
     flat_detected = (
-        vol_condition and  # Patrón de volumen correcto
-        price_analysis['std_dev'] < FLAT_STD_THRESHOLD and  # Baja volatilidad
-        price_analysis['max_move'] < 1.0 and  # Movimientos máximos pequeños
-        abs(price_analysis['total_change_percent']) < 5.0  # Cambio total pequeño (puede ser negativo)
+        vol_condition and
+        price_analysis['std_dev'] < FLAT_STD_THRESHOLD and
+        price_analysis['max_move'] < 1.0 and
+        abs(price_analysis['total_change_percent']) < 5.0
     )
     
     return flat_detected, {
@@ -415,7 +445,7 @@ def detect_flat_pattern(candles):
 # ------------------ FLUJO DE ANÁLISIS MEJORADO ------------------
 async def evaluate_token_flat(mint: str, token_meta: dict):
     """Evaluación de token para patrón FLAT"""
-    if await is_notified(mint, "flat", 6):  # 6 horas de cooldown para planos
+    if await is_notified(mint):
         return False, {"reason": "already_notified"}
     
     # Obtener velas
@@ -429,7 +459,7 @@ async def evaluate_token_flat(mint: str, token_meta: dict):
     if is_flat:
         logger.info(f"🎯 PATRÓN FLAT DETECTADO: {token_meta.get('symbol', 'N/A')} | {mint[:12]}... | Tipo: {analysis.get('pattern_type', 'N/A')}")
         analysis['detected_at'] = datetime.utcnow().isoformat()
-        analysis['mint_short'] = mint[:12] + "..."  # Para logging
+        analysis['mint_short'] = mint[:12] + "..."
     
     return is_flat, analysis
 
@@ -464,7 +494,7 @@ def format_mint_for_display(mint: str) -> str:
     return f"`{mint[:12]}...{mint[-6:]}`"
 
 async def alert_flat_found(mint: str, token_meta: dict, flat_analysis: dict):
-    """Envía alerta de patrón FLAT detectado - MEJORADA"""
+    """Envía alerta de patrón FLAT detectado"""
     symbol = token_meta.get('symbol', 'N/A')
     name = token_meta.get('name', 'N/A')
     liquidity = token_meta.get('liquidity', 0)
@@ -520,11 +550,11 @@ async def alert_flat_found(mint: str, token_meta: dict, flat_analysis: dict):
             "meta": token_meta, 
             "analysis": flat_analysis,
             "type": "flat_pattern"
-        }, "flat")
+        })
 
 async def alert_pumpfun_pre_graduation(mint: str, market_cap: float):
     """Alerta de pre-graduación de Pump.fun"""
-    if await is_notified(mint, "pumpfun", 2):
+    if await is_notified(mint):
         return
         
     token_data = await jupiter.get_token_by_id(mint)
@@ -548,7 +578,7 @@ async def alert_pumpfun_pre_graduation(mint: str, market_cap: float):
             "market_cap": market_cap,
             "meta": token_meta,
             "type": "pumpfun_pre_graduation"
-        }, "pumpfun")
+        })
 
 # ------------------ WORKERS OPTIMIZADOS ------------------
 async def flat_scanner_worker(stop_event: asyncio.Event):
