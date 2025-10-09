@@ -11,12 +11,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TARGET_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # 🛡️ FILTROS OPTIMIZADOS
-MIN_VOLUME_24H = 50000.0          # Volumen 24h mínimo
-MIN_LIQUIDITY = 25000.0           # Liquidez mínima
-MIN_AGE_HOURS = 12                # Antigüedad mínima
-FLAT_STD_THRESHOLD = 0.15         # Para tokens planos
-BREAKOUT_STEP = 10.0              # Breakout al 30%
-UPDATE_INTERVAL = 25              # Intervalo de actualización
+MIN_VOLUME_24H = 50000.0        # Volumen 24h mínimo
+MIN_LIQUIDITY = 25000.0         # Liquidez mínima
+MIN_AGE_HOURS = 12              # Antigüedad mínima
+FLAT_STD_THRESHOLD = 0.15       # Para tokens planos
+BREAKOUT_STEP = 10.0            # Breakout al 10%
+UPDATE_INTERVAL = 25            # Intervalo de actualización
 
 # JUPITER LITE v2 ENDPOINTS
 JUPITER_BASE_URL = "https://lite-api.jup.ag"
@@ -157,7 +157,7 @@ class JupiterV2ProAPI:
             # Datos básicos
             liquidity = token.get('liquidity', 0)
             volume_24h = (token.get('stats24h', {}).get('buyVolume', 0) + 
-                         token.get('stats24h', {}).get('sellVolume', 0))
+                          token.get('stats24h', {}).get('sellVolume', 0))
             
             # Filtros principales
             if liquidity < MIN_LIQUIDITY:
@@ -197,7 +197,7 @@ class JupiterV2ProAPI:
                 if token.get('id') == token_id:
                     price = token.get('usdPrice', 0)
                     volume_24h = (token.get('stats24h', {}).get('buyVolume', 0) + 
-                                 token.get('stats24h', {}).get('sellVolume', 0))
+                                  token.get('stats24h', {}).get('sellVolume', 0))
                     liquidity = token.get('liquidity', 0)
                     
                     if price > 0 and volume_24h >= MIN_VOLUME_24H and liquidity >= MIN_LIQUIDITY:
@@ -393,9 +393,9 @@ async def process_token_monitoring(token_addr: str, token_data: dict, context: C
 
 async def send_breakout_alert(context, token_addr, breakout_pct, token_data, base_info):
     """Envía alerta de breakout"""
+    # <--- MODIFICADO SEGÚN PETICIÓN: Muestra dirección completa y sin enlaces.
     try:
         symbol = token_data.get('symbol', 'N/A')
-        short_addr = token_addr[:8] + "..." + token_addr[-6:]
         
         # Determinar nivel de riesgo
         if breakout_pct > 50:
@@ -407,18 +407,15 @@ async def send_breakout_alert(context, token_addr, breakout_pct, token_data, bas
         
         msg = (
             f"{emoji} *BREAKOUT {breakout_pct:.1f}% DETECTADO* 🎯\n\n"
-            f"*Token:* {symbol} (`{short_addr}`)\n"
+            f"*Token:* {symbol}\n"
+            f"*Dirección:* `{token_addr}`\n\n"
             f"*Cambio:* +{breakout_pct:.2f}% (desde base plana)\n"
             f"*Precio Actual:* ${token_data['price']:.6f}\n"
             f"*Volumen 24h:* ${token_data['volume24h']:,.0f}\n"
             f"*Liquidez:* ${token_data['liquidity']:,.0f}\n"
             f"*Score Orgánico:* {token_data.get('organic_score', 'N/A')}\n"
             f"*Verificado:* {'✅' if token_data.get('is_verified') else '❌'}\n"
-            f"*Nivel Riesgo:* {risk}\n\n"
-            f"🔍 *Análisis Rápido:*\n"
-            f"- [Jupiter Swap](https://jup.ag/swap/SOL-{token_addr})\n"
-            f"- [DexScreener](https://dexscreener.com/solana/{token_addr})\n"
-            f"- [Birdeye](https://birdeye.so/token/{token_addr}?chain=solana)"
+            f"*Nivel Riesgo:* {risk}"
         )
         
         await context.bot.send_message(
@@ -465,7 +462,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Múltiples fuentes de tokens\n"
         "• Filtros de calidad automáticos\n"
         "• Score orgánico integrado\n"
-        "• Breakout detection 30%+\n\n"
+        f"• Breakout detection {BREAKOUT_STEP}%+\n\n"
         f"🎯 *Configuración actual:*\n"
         f"• Breakout: +{BREAKOUT_STEP}%\n"
         f"• Volumen: ${MIN_VOLUME_24H:,.0f}+\n"
@@ -536,20 +533,46 @@ async def cmd_tokens(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def cmd_planos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra tokens planos"""
+    """Muestra tokens planos uno por uno con detalles y enlaces"""
+    # <--- MODIFICADO SEGÚN PETICIÓN
     if not flat_tokens:
-        await update.message.reply_text("📊 No hay tokens planos detectados")
+        await update.message.reply_text("📊 No hay tokens planos detectados en este momento.")
         return
         
-    msg = "📊 *Tokens en Condición Plana:*\n\n"
-    for i, (addr, info) in enumerate(list(flat_tokens.items())[:8], 1):
+    await update.message.reply_text(f"🔎 Encontré {len(flat_tokens)} tokens planos. Enviando detalles...")
+    
+    # Itera sobre todos los tokens planos, sin límite
+    for i, (addr, info) in enumerate(list(flat_tokens.items()), 1):
         symbol = info.get('symbol', 'N/A')
         since = datetime.fromtimestamp(info["flat_since"]).strftime("%H:%M")
         alert_pct = info.get("max_alert", 0)
-        status = f"🚀 +{alert_pct:.1f}%" if alert_pct > 0 else "⏳ Plano"
-        msg += f"{i}. {symbol} (`{addr[:8]}...`) | {since} | {status}\n"
-    
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        status = f"🚀 Ha subido un {alert_pct:.1f}%" if alert_pct > 0 else "⏳ Aún plano"
+        
+        # Crear los enlaces
+        dexscreener_link = f"https://dexscreener.com/solana/{addr}"
+        birdeye_link = f"https://birdeye.so/token/{addr}?chain=solana"
+        rugcheck_link = f"https://rugcheck.xyz/tokens/{addr}"
+        
+        # Construir el mensaje para este token
+        msg = (
+            f"*{i}. {symbol}*\n\n"
+            f"*{'Estado'.ljust(12)}:* {status}\n"
+            f"*{'Detectado'.ljust(12)}:* {since}\n\n"
+            f"*Dirección (Mint):*\n`{addr}`\n\n"
+            f"🔗 *Análisis:*\n"
+            f"• [DexScreener]({dexscreener_link})\n"
+            f"• [Birdeye]({birdeye_link})\n"
+            f"• [Rugcheck]({rugcheck_link})"
+        )
+        
+        # Enviar un mensaje por cada token
+        await update.message.reply_text(
+            text=msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+        # Pequeña pausa para no saturar el API de Telegram
+        await asyncio.sleep(0.5)
 
 # ===================== MAIN =====================
 def main():
