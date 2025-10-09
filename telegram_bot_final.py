@@ -1,4 +1,4 @@
-# bot_jupiter_complete.py - VERSIÓN COMPLETA CON TODOS LOS COMANDOS Y PUMP.FUN
+# bot_jupiter_complete_fixed.py - VERSIÓN CORREGIDA
 import asyncio
 import json
 import os
@@ -86,7 +86,6 @@ class DatabaseManager:
     
     async def create_tables(self):
         async with self.pool.acquire() as conn:
-            # Tabla de tokens notificados
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS notified_tokens (
                     mint_address TEXT PRIMARY KEY,
@@ -100,7 +99,6 @@ class DatabaseManager:
                 )
             ''')
             
-            # Tabla de tokens FLAT
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS flat_tokens (
                     mint_address TEXT PRIMARY KEY,
@@ -113,7 +111,6 @@ class DatabaseManager:
                 )
             ''')
             
-            # Tabla de watchlist
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS token_watchlist (
                     id SERIAL PRIMARY KEY,
@@ -128,7 +125,6 @@ class DatabaseManager:
                 )
             ''')
             
-            # Tabla de tokens Pump.fun
             await conn.execute('''
                 CREATE TABLE IF NOT EXISTS pumpfun_tokens (
                     mint_address TEXT PRIMARY KEY,
@@ -193,7 +189,6 @@ class DatabaseManager:
                     detected_at = NOW()
             ''', mint, symbol, market_cap)
     
-    # 🆕 MÉTODOS PARA GESTIÓN DE TOKENS
     async def add_to_watchlist(self, mint: str, symbol: str, name: str = None, 
                              category: str = "flat", added_by: str = "system", notes: str = None):
         async with self.pool.acquire() as conn:
@@ -804,22 +799,23 @@ pumpfun_monitor = PumpFunMonitor()
 
 # ===================== COMANDOS TELEGRAM COMPLETOS =====================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando start simplificado para evitar errores de Markdown"""
     welcome_msg = (
         "🤖 *JUPITER BOT COMPLETO* 🚀\n\n"
         "🎯 *SISTEMAS DISPONIBLES:*\n"
-        "• 🔍 Detector FLAT (Patrón PESHI)\n"
-        "• 🚀 Monitor Pump.fun Pre-Graduación\n"
-        "• ⚠️ Analizador de Riesgo Automático\n"
-        "• 📋 Gestión de Lista de Tokens\n\n"
+        "• Detector FLAT (Patrón PESHI)\n"
+        "• Monitor Pump.fun Pre-Graduación\n"
+        "• Analizador de Riesgo Automático\n"
+        "• Gestión de Lista de Tokens\n\n"
         
         "📊 *CONFIGURACIÓN OPTIMIZADA:*\n"
-        f"• Liquidez mínima: ${MIN_LIQUIDITY:,.0f}\n"
-        f"• Volumen mínimo: ${MIN_VOLUME_24H:,.0f}\n"
+        f"• Liquidez mínima: ${MIN_LIQUIDITY:,}\n"
+        f"• Volumen mínimo: ${MIN_VOLUME_24H:,}\n"
         f"• Duración FLAT: {FLAT_CONFIG['MIN_FLAT_DURATION_HOURS']}h\n"
         f"• Máx riesgo: {MAX_RISK_SCORE}/100\n\n"
         
         "📋 *COMANDOS DE LISTAS:*\n"
-        "• /lista_tokens - Todos los tokens detectados\n"
+        "• /lista_tokens - Todos los tokens\n"
         "• /lista_flat - Solo tokens FLAT\n"
         "• /lista_pump - Tokens Pump.fun\n"
         "• /watchlist - Tu lista personal\n\n"
@@ -828,8 +824,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /iniciar - Activar todos los sistemas\n"
         "• /detener - Parar todo\n"
         "• /status - Estado del sistema\n"
-        "• /agregar_token <mint> <notas>\n"
-        "• /eliminar_token <mint>\n"
+        "• /agregar_token - Añadir token\n"
+        "• /eliminar_token - Quitar token\n"
     )
     await update.message.reply_text(welcome_msg, parse_mode=ParseMode.MARKDOWN)
 
@@ -969,11 +965,11 @@ async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "✅ *SISTEMAS ACTIVADOS*\n\n"
-        "• Scanner FLAT: 🟢 ACTIVO\n"
-        "• Monitor Pump.fun: 🟢 ACTIVO\n"
-        "• Analizador Riesgo: 🟢 ACTIVO\n"
-        "• Gestor Tokens: 🟢 ACTIVO\n\n"
-        "_Todos los sistemas funcionando..._",
+        "• Scanner FLAT: ACTIVO\n"
+        "• Monitor Pump.fun: ACTIVO\n"
+        "• Analizador Riesgo: ACTIVO\n"
+        "• Gestor Tokens: ACTIVO\n\n"
+        "Todos los sistemas funcionando...",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -984,9 +980,9 @@ async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(
         "🛑 *SISTEMAS DETENIDOS*\n\n"
-        "• Scanner FLAT: 🔴 DETENIDO\n"
-        "• Monitor Pump.fun: 🔴 DETENIDO\n"
-        "• Analizador Riesgo: 🔴 DETENIDO",
+        "• Scanner FLAT: DETENIDO\n"
+        "• Monitor Pump.fun: DETENIDO\n"
+        "• Analizador Riesgo: DETENIDO",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -999,26 +995,35 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = (
         f"📊 *ESTADO DEL SISTEMA*\n\n"
-        f"• Scanner FLAT: {'🟢 ACTIVO' if flat_scanner.active else '🔴 DETENIDO'}\n"
-        f"• Monitor Pump.fun: {'🟢 ACTIVO' if pumpfun_monitor.active else '🔴 DETENIDO'}\n"
-        f"• Base datos: {'🟢 CONECTADA' if db.pool else '🔴 NO CONECTADA'}\n"
+        f"• Scanner FLAT: {'ACTIVO' if flat_scanner.active else 'DETENIDO'}\n"
+        f"• Monitor Pump.fun: {'ACTIVO' if pumpfun_monitor.active else 'DETENIDO'}\n"
+        f"• Base datos: {'CONECTADA' if db.pool else 'NO CONECTADA'}\n"
         f"• Tokens FLAT: {len(flat_tokens)}\n"
         f"• Tokens Pump.fun: {len(pump_tokens)}\n"
         f"• Tokens notificados: {len(notified_tokens)}\n"
         f"• Watchlist: {len(watchlist_tokens)} tokens\n\n"
         
         f"⚙️ *CONFIGURACIÓN:*\n"
-        f"• Liquidez mínima: ${MIN_LIQUIDITY:,.0f}\n"
-        f"• Volumen mínimo: ${MIN_VOLUME_24H:,.0f}\n"
+        f"• Liquidez mínima: ${MIN_LIQUIDITY:,}\n"
+        f"• Volumen mínimo: ${MIN_VOLUME_24H:,}\n"
         f"• Duración FLAT: {FLAT_CONFIG['MIN_FLAT_DURATION_HOURS']}h\n"
-        f"• Alerta Pump.fun: ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}\n"
+        f"• Alerta Pump.fun: ${PUMP_PRE_GRADUATION_THRESHOLD:,}\n"
     )
     
     await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
 
-# ===================== MAIN COMPLETO =====================
+# ===================== MAIN CORREGIDO =====================
 async def main():
     logger.info("🚀 INICIANDO BOT COMPLETO...")
+    
+    # Verificar si ya hay otra instancia corriendo
+    try:
+        test_bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        await test_bot.get_me()
+        logger.info("✅ Token de bot válido")
+    except Exception as e:
+        logger.error(f"❌ Error con el token del bot: {e}")
+        return
     
     await db.init()
     
@@ -1026,7 +1031,12 @@ async def main():
         logger.error("❌ Configuración de Telegram faltante")
         return
     
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Crear aplicación con configuración para evitar conflictos
+    application = (
+        Application.builder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
     
     # Registrar TODOS los comandos
     commands = [
@@ -1045,40 +1055,44 @@ async def main():
     for command, handler in commands:
         application.add_handler(CommandHandler(command, handler))
     
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    
-    logger.info("✅ Bot Telegram completo iniciado")
-    
-    await alert_system._send_telegram_message(
-        "🤖 *JUPITER BOT COMPLETO INICIADO* 🚀\n\n"
-        "✅ Todos los sistemas cargados\n"
-        "✅ Base de datos conectada\n"
-        "✅ APIs operativas\n"
-        "✅ Scanner FLAT listo\n"
-        "✅ Monitor Pump.fun listo\n"
-        "✅ Gestión de tokens activa\n\n"
-        
-        "📋 *COMANDOS DISPONIBLES:*\n"
-        "• /iniciar - Activar todos los sistemas\n"
-        "• /lista_tokens - Ver todos los tokens\n"
-        "• /lista_flat - Tokens FLAT\n"
-        "• /lista_pump - Tokens Pump.fun\n"
-        "• /watchlist - Tu lista personal\n\n"
-        "_Esperando comandos..._"
-    )
-    
     try:
+        # Inicializar con drop_pending_updates para evitar conflictos
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(drop_pending_updates=True)
+        
+        logger.info("✅ Bot Telegram completo iniciado correctamente")
+        
+        await alert_system._send_telegram_message(
+            "🤖 *JUPITER BOT COMPLETO INICIADO* 🚀\n\n"
+            "✅ Todos los sistemas cargados\n"
+            "✅ Base de datos conectada\n"
+            "✅ APIs operativas\n\n"
+            "📋 *COMANDOS DISPONIBLES:*\n"
+            "• /iniciar - Activar todos los sistemas\n"
+            "• /lista_tokens - Ver todos los tokens\n"
+            "• /lista_flat - Tokens FLAT\n"
+            "• /lista_pump - Tokens Pump.fun\n"
+            "• /watchlist - Tu lista personal\n\n"
+            "Esperando comandos..."
+        )
+        
+        # Mantener el bot corriendo
         while True:
             await asyncio.sleep(3600)
-    except KeyboardInterrupt:
-        logger.info("🛑 Bot interrumpido por usuario")
+            
+    except Exception as e:
+        logger.error(f"❌ Error iniciando el bot: {e}")
     finally:
+        # Limpieza adecuada
         flat_scanner.stop()
         pumpfun_monitor.stop()
-        await application.stop()
-        await application.shutdown()
+        
+        try:
+            await application.stop()
+            await application.shutdown()
+        except:
+            pass
         
         if api_client.session:
             await api_client.session.close()
@@ -1092,5 +1106,35 @@ if __name__ == "__main__":
     if missing_vars:
         logger.error(f"❌ Variables faltantes: {missing_vars}")
         exit(1)
+    
+    # Verificar que no hay otra instancia corriendo
+    import psutil
+    current_pid = os.getpid()
+    bot_processes = []
+    
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+        try:
+            if (proc.info['pid'] != current_pid and 
+                proc.info['cmdline'] and 
+                any('python' in cmd for cmd in proc.info['cmdline']) and
+                any('bot_jupiter' in cmd for cmd in proc.info['cmdline'])):
+                bot_processes.append(proc.info['pid'])
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    
+    if bot_processes:
+        logger.warning(f"⚠️ Se encontraron otras instancias del bot: {bot_processes}")
+        logger.warning("⚠️ Cerrando otras instancias...")
+        for pid in bot_processes:
+            try:
+                p = psutil.Process(pid)
+                p.terminate()
+                p.wait(timeout=5)
+            except:
+                try:
+                    p.kill()
+                except:
+                    pass
+        logger.info("✅ Otras instancias cerradas")
     
     asyncio.run(main())
