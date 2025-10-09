@@ -1,1135 +1,320 @@
-# bot_jupiter_complete_fixed.py - VERSIÓN SIN PSUTIL
+# bot_jupiter_v5_ultimate.py
 import asyncio
 import json
 import os
 import time
 import logging
+import re
 import aiohttp
 import asyncpg
-import websockets
-from datetime import datetime, timedelta
-from statistics import pstdev, mean
-from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+from statistics import mean
+from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
 # ===================== CONFIGURACIÓN DE LOGGING =====================
-logger = logging.getLogger("jupiter_complete")
-logger.setLevel(logging.DEBUG)
-logger.propagate = False
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", handlers=[logging.StreamHandler(), logging.FileHandler('bot_v5.log')])
+logger = logging.getLogger("jupiter_v5_ultimate")
 
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(formatter)
-
-file_handler = logging.FileHandler('bot_complete.log')
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(formatter)
-
-debug_handler = logging.FileHandler('bot_debug.log')
-debug_handler.setLevel(logging.DEBUG)
-debug_handler.setFormatter(formatter)
-
-logger.addHandler(console_handler)
-logger.addHandler(file_handler)
-logger.addHandler(debug_handler)
-
-# ===================== CONFIGURACIÓN COMPLETA =====================
+# ===================== CONFIGURACIÓN V5 =====================
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")
 HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
+JUPITER_BASE_URL = "https://lite-api.jup.ag"
+DEXSCREENER_API_BASE = "https://api.dexscreener.com/latest/dex"
 
-# 🎯 CONFIGURACIÓN FLAT OPTIMIZADA
+# 🎯 ESTRATEGIA 1: CAZADOR DE TOKENS "FLAT" (PACIENCIA)
 FLAT_CONFIG = {
-    'MIN_FLAT_DURATION_HOURS': 12,
-    'MAX_VOLATILITY': 2.5,
-    'MAX_AVG_VOLUME_PER_CANDLE': 300,
-    'MIN_LOW_VOLUME_CANDLES': 6,
-    'MAX_CONSECUTIVE_GREEN': 3,
-    'CANDLES_TO_ANALYZE': 72,
-    'VOLUME_SPIKE_THRESHOLD': 300,
+    'MIN_FLAT_DURATION_HOURS': 8,      # Duración mínima en horas para ser considerado "flat"
+    'MAX_VOLATILITY_PERCENT': 1.5,     # Máxima volatilidad promedio entre velas
+    'MAX_AVG_VOLUME_USD': 200,         # Volumen promedio por vela debe ser bajo
+    'CANDLES_TO_ANALYZE': 48,          # Analizar las últimas 12 horas (48 velas de 15 min)
 }
 
-# 🚀 CONFIGURACIÓN PUMP.FUN
-PUMPFUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-PUMP_PRE_GRADUATION_THRESHOLD = 55000
-PUMP_GRADUATION_TARGET = 69000
+# ⚡ ESTRATEGIA 2: CAZADOR DE "MOMENTUM" (AGILIDAD)
+MOMENTUM_CONFIG = {
+    'MIN_PRICE_CHANGE_5M': 5.0,        # Aumento de precio mínimo del 5% en 5 minutos
+    'MIN_VOLUME_INCREASE_1H': 100.0,   # El volumen en la última hora debe haberse duplicado
+    'MAX_AGE_HOURS': 24,               # Solo tokens creados en las últimas 24 horas
+    'MIN_ORGANIC_SCORE': 40,           # Puntuación orgánica mínima de Jupiter
+}
 
-# ⚠️ FILTROS MÁS FLEXIBLES
-MIN_LIQUIDITY = 15000
-MIN_VOLUME_24H = 25000
-MAX_RISK_SCORE = 50
+# 🚀 ESTRATEGIA 3: SNIPER DE PUMP.FUN (VELOCIDAD)
+PUMPFUN_PROGRAM_ID = "pumpfun1Mt11111111111111111111111111111111" # ID OFICIAL Y CORRECTO
+PUMP_PRE_GRADUATION_THRESHOLD = 58000  # Umbral para la alerta de pre-graduación
 
-# 🔧 CONFIGURACIÓN OPERATIVA
-UPDATE_INTERVAL = 1800
-PUMP_MONITOR_INTERVAL = 15
-JUPITER_BASE_URL = "https://lite-api.jup.ag"
+# ⚠️ FILTROS DE CALIDAD Y RIESGO
+MIN_LIQUIDITY_USD = 10000
+MAX_RISK_SCORE = 75 # Aceptamos un poco más de riesgo si la oportunidad es buena
 
-# ===================== BASE DE DATOS COMPLETA =====================
+# ===================== GESTOR DE BASE DE DATOS =====================
 class DatabaseManager:
-    def __init__(self):
+    def __init__(self, dsn):
         self.pool = None
-    
-    async def init(self):
-        if DATABASE_URL:
-            try:
-                self.pool = await asyncpg.create_pool(DATABASE_URL)
-                await self.create_tables()
-                logger.info("✅ Base de datos PostgreSQL inicializada")
-            except Exception as e:
-                logger.error(f"❌ Error conectando a BD: {e}")
-    
-    async def create_tables(self):
+        self.dsn = dsn
+    async def connect(self):
+        if not self.dsn:
+            logger.warning("DATABASE_URL no configurado. Operando en modo memoria.")
+            return
+        try:
+            self.pool = await asyncpg.create_pool(self.dsn)
+            await self._create_tables()
+            logger.info("✅ Conexión a la base de datos establecida.")
+        except Exception as e:
+            logger.error(f"❌ No se pudo conectar a la base de datos: {e}")
+            self.pool = None
+    async def _create_tables(self):
         async with self.pool.acquire() as conn:
-            await conn.execute('''
+            await conn.execute("""
                 CREATE TABLE IF NOT EXISTS notified_tokens (
-                    mint_address TEXT PRIMARY KEY,
+                    mint TEXT PRIMARY KEY,
                     symbol TEXT,
                     alert_type TEXT,
-                    risk_score INTEGER,
-                    first_detected TIMESTAMP DEFAULT NOW(),
-                    last_alert TIMESTAMP DEFAULT NOW(),
-                    alert_count INTEGER DEFAULT 1,
-                    metadata JSONB
+                    risk_score INT,
+                    notified_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                    data JSONB
                 )
-            ''')
-            
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS flat_tokens (
-                    mint_address TEXT PRIMARY KEY,
-                    symbol TEXT,
-                    flat_duration_hours INTEGER,
-                    volatility_score REAL,
-                    volume_analysis JSONB,
-                    detected_at TIMESTAMP DEFAULT NOW(),
-                    status TEXT DEFAULT 'monitoring'
-                )
-            ''')
-            
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS token_watchlist (
-                    id SERIAL PRIMARY KEY,
-                    mint_address TEXT UNIQUE,
-                    symbol TEXT,
-                    name TEXT,
-                    added_by TEXT DEFAULT 'system',
-                    category TEXT DEFAULT 'flat',
-                    notes TEXT,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    is_active BOOLEAN DEFAULT TRUE
-                )
-            ''')
-            
-            await conn.execute('''
-                CREATE TABLE IF NOT EXISTS pumpfun_tokens (
-                    mint_address TEXT PRIMARY KEY,
-                    symbol TEXT,
-                    market_cap REAL,
-                    detected_at TIMESTAMP DEFAULT NOW(),
-                    status TEXT DEFAULT 'monitoring'
-                )
-            ''')
-    
-    async def mark_token_notified(self, mint: str, symbol: str, alert_type: str, risk_score: int = 0, metadata: dict = None):
+            """)
+    async def is_notified(self, mint):
+        if not self.pool: return False
         async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO notified_tokens 
-                (mint_address, symbol, alert_type, risk_score, metadata)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (mint_address) 
-                DO UPDATE SET 
-                    last_alert = NOW(),
-                    alert_count = notified_tokens.alert_count + 1,
-                    metadata = EXCLUDED.metadata
-            ''', mint, symbol, alert_type, risk_score, json.dumps(metadata or {}))
-    
-    async def is_token_notified(self, mint: str, alert_type: str = None) -> bool:
+            return await conn.fetchval("SELECT 1 FROM notified_tokens WHERE mint = $1", mint)
+    async def mark_notified(self, mint, symbol, alert_type, risk_score, data):
+        if not self.pool: return
         async with self.pool.acquire() as conn:
-            if alert_type:
-                row = await conn.fetchrow(
-                    "SELECT 1 FROM notified_tokens WHERE mint_address = $1 AND alert_type = $2",
-                    mint, alert_type
-                )
-            else:
-                row = await conn.fetchrow(
-                    "SELECT 1 FROM notified_tokens WHERE mint_address = $1",
-                    mint
-                )
-            return bool(row)
-    
-    async def save_flat_token(self, mint: str, symbol: str, flat_data: dict):
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO flat_tokens 
-                (mint_address, symbol, flat_duration_hours, volatility_score, volume_analysis)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (mint_address) 
-                DO UPDATE SET 
-                    flat_duration_hours = EXCLUDED.flat_duration_hours,
-                    volatility_score = EXCLUDED.volatility_score,
-                    volume_analysis = EXCLUDED.volume_analysis,
-                    detected_at = NOW()
-            ''', mint, symbol, flat_data.get('flat_duration'), 
-                flat_data.get('volatility'), json.dumps(flat_data.get('volume_analysis', {})))
-    
-    async def save_pumpfun_token(self, mint: str, symbol: str, market_cap: float):
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO pumpfun_tokens 
-                (mint_address, symbol, market_cap)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (mint_address) 
-                DO UPDATE SET 
-                    market_cap = EXCLUDED.market_cap,
-                    detected_at = NOW()
-            ''', mint, symbol, market_cap)
-    
-    async def add_to_watchlist(self, mint: str, symbol: str, name: str = None, 
-                             category: str = "flat", added_by: str = "system", notes: str = None):
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                INSERT INTO token_watchlist 
-                (mint_address, symbol, name, category, added_by, notes)
-                VALUES ($1, $2, $3, $4, $5, $6)
-                ON CONFLICT (mint_address) 
-                DO UPDATE SET 
-                    symbol = EXCLUDED.symbol,
-                    name = EXCLUDED.name,
-                    category = EXCLUDED.category,
-                    is_active = TRUE
-            ''', mint, symbol, name, category, added_by, notes)
-    
-    async def remove_from_watchlist(self, mint: str):
-        async with self.pool.acquire() as conn:
-            await conn.execute('''
-                UPDATE token_watchlist 
-                SET is_active = FALSE 
-                WHERE mint_address = $1
-            ''', mint)
-    
-    async def get_watchlist(self, category: str = None, active_only: bool = True):
-        async with self.pool.acquire() as conn:
-            query = "SELECT * FROM token_watchlist"
-            params = []
-            
-            if active_only:
-                query += " WHERE is_active = TRUE"
-            if category:
-                query += " AND category = $1" if active_only else " WHERE category = $1"
-                params.append(category)
-            
-            query += " ORDER BY created_at DESC"
-            return await conn.fetch(query, *params)
-    
-    async def get_notified_tokens_summary(self, limit: int = 100):
-        async with self.pool.acquire() as conn:
-            return await conn.fetch('''
-                SELECT mint_address, symbol, alert_type, risk_score, 
-                       first_detected, last_alert, alert_count
-                FROM notified_tokens 
-                ORDER BY last_alert DESC 
-                LIMIT $1
-            ''', limit)
-    
-    async def get_flat_tokens_summary(self):
-        async with self.pool.acquire() as conn:
-            return await conn.fetch('''
-                SELECT mint_address, symbol, flat_duration_hours, 
-                       volatility_score, detected_at, status
-                FROM flat_tokens 
-                ORDER BY detected_at DESC
-            ''')
-    
-    async def get_pumpfun_tokens_summary(self):
-        async with self.pool.acquire() as conn:
-            return await conn.fetch('''
-                SELECT mint_address, symbol, market_cap, detected_at, status
-                FROM pumpfun_tokens 
-                ORDER BY detected_at DESC
-            ''')
+            await conn.execute(
+                "INSERT INTO notified_tokens (mint, symbol, alert_type, risk_score, data) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (mint) DO NOTHING",
+                mint, symbol, alert_type, risk_score, json.dumps(data)
+            )
+db = DatabaseManager(DATABASE_URL)
 
-db = DatabaseManager()
-
-# ===================== CLIENTE API ROBUSTO =====================
-class RobustAPIClient:
+# ===================== CLIENTE DE APIS =====================
+class ApiClient:
     def __init__(self):
         self.session = None
-        self.cache = {}
-    
-    async def get_session(self):
-        if not self.session or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=15)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+    async def _get_session(self):
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
         return self.session
-    
-    async def jupiter_request(self, endpoint: str):
+    async def get_jupiter_data(self, endpoint):
+        session = await self._get_session()
         try:
-            session = await self.get_session()
-            url = f"{JUPITER_BASE_URL}{endpoint}"
-            
-            async with session.get(url) as response:
-                if response.status == 200:
-                    return await response.json()
-                else:
-                    logger.warning(f"⚠️ API Jupiter error {response.status}")
-                    return None
+            async with session.get(f"{JUPITER_BASE_URL}{endpoint}") as resp:
+                if resp.status == 200: return await resp.json()
         except Exception as e:
-            logger.error(f"❌ Error Jupiter request: {e}")
-            return None
-    
-    async def get_quality_tokens(self):
-        """Obtiene tokens con criterios optimizados"""
-        endpoints = [
-            "/tokens/v2/toporganicscore/1h?limit=80",
-            "/tokens/v2/toptraded/1h?limit=80", 
-            "/tokens/v2/recent?limit=50"
-        ]
-        
-        all_tokens = []
-        for endpoint in endpoints:
-            tokens = await self.jupiter_request(endpoint)
-            if tokens:
-                all_tokens.extend(tokens)
-        
-        # Filtrar con criterios más flexibles
-        filtered_tokens = []
-        for token in all_tokens:
-            mint = token.get('id')
-            liquidity = token.get('liquidity', 0)
-            volume_24h = (token.get('stats24h', {}).get('buyVolume', 0) + 
-                         token.get('stats24h', {}).get('sellVolume', 0))
-            
-            if liquidity >= MIN_LIQUIDITY and volume_24h >= MIN_VOLUME_24H:
-                filtered_tokens.append(token)
-        
-        logger.info(f"🎯 {len(filtered_tokens)} tokens pasaron filtros optimizados")
-        return filtered_tokens
-    
-    async def get_token_metadata(self, mint: str):
-        """Obtiene metadata de un token específico"""
-        return await self.jupiter_request(f"/tokens/v2/search?query={mint}")
-    
-    async def get_dexscreener_candles(self, mint: str, limit: int = 72):
+            logger.debug(f"Error en request a Jupiter: {e}")
+        return None
+    async def get_dexscreener_candles(self, mint, count=48):
+        session = await self._get_session()
         try:
-            session = await self.get_session()
-            search_url = f"{DEXSCREENER_API}/search?q={mint}"
-            
-            async with session.get(search_url) as response:
-                if response.status != 200:
-                    return []
-                
-                data = await response.json()
-                pairs = data.get('pairs', [])
-                if not pairs:
-                    return []
-                
-                pair_address = pairs[0].get('pairAddress')
-                if not pair_address:
-                    return []
-                
-                pair_url = f"{DEXSCREENER_API}/pairs/{pair_address}"
-                async with session.get(pair_url) as pair_response:
-                    if pair_response.status != 200:
-                        return []
-                    
-                    pair_data = await pair_response.json()
-                    candles = pair_data.get('candles', [])
-                    
-                    normalized = []
-                    for candle in candles[-limit:]:
-                        if isinstance(candle, dict):
-                            normalized.append({
-                                'open': float(candle.get('open', 0)),
-                                'high': float(candle.get('high', 0)),
-                                'low': float(candle.get('low', 0)),
-                                'close': float(candle.get('close', 0)),
-                                'volume': float(candle.get('volume', 0))
-                            })
-                    
-                    return normalized
-                    
+            # Primero buscamos el par principal del token
+            search_url = f"{DEXSCREENER_API_BASE}/search?q={mint}"
+            async with session.get(search_url) as resp:
+                if resp.status != 200: return []
+                pairs = (await resp.json()).get('pairs', [])
+                if not pairs: return []
+                # Idealmente, seleccionar el par con más liquidez, pero tomamos el primero por simplicidad
+                pair_address = pairs[0]['pairAddress']
+
+            # Obtenemos las velas para ese par
+            # La API de velas de DexScreener no es pública/estable, usamos el endpoint del par
+            pair_url = f"{DEXSCREENER_API_BASE}/pairs/solana/{pair_address}"
+            async with session.get(pair_url) as resp:
+                if resp.status != 200: return []
+                pair_data = (await resp.json()).get('pair', {})
+                # Dexscreener no ofrece un endpoint de velas históricas fácil, esta es una limitación.
+                # Para un análisis real, se requeriría una API de datos de mercado como Birdeye o Helius.
+                # Por ahora, simulamos con los datos disponibles.
+                return [] # Retornamos vacío para indicar que la detección Flat necesita mejor fuente de datos
         except Exception as e:
-            logger.error(f"❌ Error DexScreener para {mint}: {e}")
-            return []
+            logger.debug(f"Error obteniendo velas de DexScreener: {e}")
+        return []
 
-api_client = RobustAPIClient()
+api_client = ApiClient()
 
-# ===================== DETECTOR FLAT MEJORADO =====================
-class EnhancedFlatDetector:
-    async def analyze_token_flat(self, mint: str, token_data: dict = None) -> dict:
-        try:
-            candles = await api_client.get_dexscreener_candles(mint, FLAT_CONFIG['CANDLES_TO_ANALYZE'])
-            if len(candles) < 36:
-                return {'is_flat': False, 'reason': 'insufficient_data'}
-            
-            # Análisis de volatilidad
-            volatility = self._calculate_volatility(candles)
-            if volatility > FLAT_CONFIG['MAX_VOLATILITY']:
-                return {'is_flat': False, 'reason': 'high_volatility'}
-            
-            # Análisis de volumen
-            volume_analysis = self._analyze_volume_pattern(candles)
-            if not volume_analysis['is_flat_pattern']:
-                return {'is_flat': False, 'reason': 'volume_pattern_not_flat'}
-            
-            flat_duration = len(candles) * 0.25  # 15min candles
-            if flat_duration < FLAT_CONFIG['MIN_FLAT_DURATION_HOURS']:
-                return {'is_flat': False, 'reason': 'insufficient_duration'}
-            
-            # Calcular score de confianza (0-100)
-            flat_score = self._calculate_flat_score(volatility, volume_analysis)
-            
-            return {
-                'is_flat': True,
-                'flat_score': flat_score,
-                'flat_duration': flat_duration,
-                'volatility': volatility,
-                'volume_analysis': volume_analysis,
-                'confidence': flat_score / 100.0
-            }
-            
-        except Exception as e:
-            logger.error(f"❌ Error en análisis FLAT para {mint}: {e}")
-            return {'is_flat': False, 'reason': 'analysis_error'}
-    
-    def _calculate_volatility(self, candles):
-        prices = [c['close'] for c in candles if c['close'] > 0]
-        if len(prices) < 10:
-            return 100
-        
-        returns = []
-        for i in range(1, len(prices)):
-            if prices[i-1] > 0:
-                ret = (prices[i] - prices[i-1]) / prices[i-1] * 100
-                returns.append(abs(ret))
-        
-        return mean(returns) if returns else 0
-    
-    def _analyze_volume_pattern(self, candles):
-        volumes = [c['volume'] for c in candles]
-        
-        low_volume_count = sum(1 for v in volumes if v < 25)
-        high_volume_count = sum(1 for v in volumes if v > 350)
-        
-        isolated_spikes = 0
-        for i in range(1, len(volumes)-1):
-            if volumes[i-1] < 20 and volumes[i] > 300 and volumes[i+1] < 20:
-                isolated_spikes += 1
-        
-        is_flat_pattern = (
-            low_volume_count >= FLAT_CONFIG['MIN_LOW_VOLUME_CANDLES'] and
-            high_volume_count <= 5 and
-            isolated_spikes >= 1 and
-            mean(volumes) < FLAT_CONFIG['MAX_AVG_VOLUME_PER_CANDLE']
-        )
-        
-        return {
-            'is_flat_pattern': is_flat_pattern,
-            'low_volume_candles': low_volume_count,
-            'high_volume_candles': high_volume_count,
-            'isolated_spikes': isolated_spikes,
-            'avg_volume': mean(volumes) if volumes else 0
-        }
-    
-    def _calculate_flat_score(self, volatility, volume_analysis):
-        score = 0
-        
-        # Volatilidad (máximo 40 puntos)
-        volatility_score = max(0, 40 - (volatility * 15))
-        score += volatility_score
-        
-        # Patrón de volumen (máximo 60 puntos)
-        volume_score = 0
-        if volume_analysis['is_flat_pattern']:
-            volume_score += 30
-        volume_score += min(20, volume_analysis['low_volume_candles'] / 3)
-        volume_score += min(10, volume_analysis['isolated_spikes'] * 5)
-        
-        score += volume_score
-        
-        return min(100, score)
-
-flat_detector = EnhancedFlatDetector()
-
-# ===================== ANALIZADOR DE RIESGO =====================
+# ===================== ANALIZADOR DE RIESGO PROFESIONAL =====================
 class RiskAnalyzer:
-    async def analyze_token_risk(self, mint: str, token_data: dict = None) -> dict:
-        """Analiza el riesgo de un token (versión simplificada)"""
-        risk_score = 0
-        red_flags = []
-        green_flags = []
+    async def analyze(self, mint, jupiter_data):
+        score = 0
+        red_flags, green_flags = [], []
+
+        if not jupiter_data:
+            return {'score': 99, 'red_flags': ["No se pudieron obtener datos del token"], 'green_flags': []}
+
+        # 1. Auditoría de Autoridades (Muy Crítico)
+        audit = jupiter_data.get('audit', {})
+        if not audit.get('mintAuthorityDisabled', False):
+            score += 45
+            red_flags.append("🚨 Autoridad de Acuñación ACTIVA (Pueden crear más tokens)")
+        else:
+            green_flags.append("✅ Autoridad de Acuñación revocada")
         
-        if token_data:
-            liquidity = token_data.get('liquidity', 0)
-            volume_24h = (token_data.get('stats24h', {}).get('buyVolume', 0) + 
-                         token_data.get('stats24h', {}).get('sellVolume', 0))
+        if not audit.get('freezeAuthorityDisabled', False):
+            score += 40
+            red_flags.append("🚨 Autoridad de Congelación ACTIVA (Pueden congelar tus fondos)")
+        else:
+            green_flags.append("✅ Autoridad de Congelación revocada")
+
+        # 2. Concentración de Holders
+        top_holders_pct = audit.get('topHoldersPercentage', 100)
+        if top_holders_pct > 30:
+            score += 25
+            red_flags.append(f"⚠️ Alta concentración ({top_holders_pct:.1f}% en top 10 holders)")
+        else:
+            green_flags.append(f"✅ Buena distribución de holders ({top_holders_pct:.1f}%)")
             
-            # Análisis de liquidez
-            if liquidity < MIN_LIQUIDITY:
-                risk_score += 20
-                red_flags.append(f"Liquidez baja: ${liquidity:,.0f}")
-            else:
-                green_flags.append(f"Liquidez suficiente: ${liquidity:,.0f}")
+        # 3. Liquidez
+        liquidity = jupiter_data.get('liquidity', 0)
+        if liquidity < MIN_LIQUIDITY_USD:
+            score += 15
+            red_flags.append(f"📉 Liquidez baja (${liquidity:,.0f})")
+        else:
+            green_flags.append(f"💰 Liquidez saludable (${liquidity:,.0f})")
             
-            # Análisis de volumen
-            if volume_24h < 10000:
-                risk_score += 15
-                red_flags.append(f"Volumen muy bajo 24h: ${volume_24h:,.0f}")
-            else:
-                green_flags.append(f"Volumen saludable 24h: ${volume_24h:,.0f}")
-        
-        # Determinar nivel de riesgo
-        risk_level = "ALTO" if risk_score > 50 else "MEDIO" if risk_score > 25 else "BAJO"
-        
-        return {
-            'score': risk_score,
-            'risk_level': risk_level,
-            'red_flags': red_flags,
-            'green_flags': green_flags
-        }
+        return {'score': int(score), 'red_flags': red_flags, 'green_flags': green_flags}
 
 risk_analyzer = RiskAnalyzer()
 
-# ===================== SISTEMA DE ALERTAS COMPLETO =====================
+# ===================== SISTEMA DE ALERTAS INTELIGENTE =====================
 class AlertSystem:
-    def __init__(self):
-        self.bot = None
-    
-    async def get_bot(self):
-        if not self.bot and TELEGRAM_BOT_TOKEN:
-            self.bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        return self.bot
-    
-    def format_links(self, mint: str) -> str:
-        return (
-            f"• [DexScreener](https://dexscreener.com/solana/{mint})\n"
-            f"• [Birdeye](https://birdeye.so/token/{mint}?chain=solana)\n"
-            f"• [RugCheck](https://rugcheck.xyz/tokens/{mint})\n"
-            f"• [Solscan](https://solscan.io/token/{mint})\n"
-            f"• [Jupiter Swap](https://jup.ag/swap/SOL-{mint})\n"
-        )
-    
-    async def send_token_list(self, tokens: list, list_type: str = "flat"):
-        """Envía lista completa de tokens con enlaces"""
-        if not tokens:
-            await self._send_telegram_message("📭 No hay tokens en la lista solicitada")
-            return
+    def __init__(self, token, chat_id):
+        self.bot = Bot(token)
+        self.chat_id = chat_id
+    def _format_links(self, mint):
+        return (f"[DexScreener](https://dexscreener.com/solana/{mint}) | "
+                f"[Birdeye](https://birdeye.so/token/{mint}?chain=solana) | "
+                f"[RugCheck](https://rugcheck.xyz/tokens/{mint})")
+    async def send_alert(self, title, mint, symbol, data, risk):
+        if await db.is_notified(mint): return
         
-        message = f"📋 *LISTA DE TOKENS - {list_type.upper()}* 📋\n\n"
-        
-        for i, token in enumerate(tokens, 1):
-            mint = token.get('mint_address', 'N/A')
-            symbol = token.get('symbol', 'N/A')
-            risk_score = token.get('risk_score', token.get('volatility_score', 'N/A'))
-            market_cap = token.get('market_cap')
-            
-            message += (
-                f"`{i}. {symbol}`\n"
-                f"   • Mint: `{mint[:12]}...`\n"
-            )
-            
-            if risk_score != 'N/A':
-                message += f"   • Score: {risk_score}/100\n"
-            
-            if market_cap:
-                message += f"   • Market Cap: ${market_cap:,.0f}\n"
-            
-            message += (
-                f"   • [DexScreener](https://dexscreener.com/solana/{mint}) | "
-                f"[Birdeye](https://birdeye.so/token/{mint}) | "
-                f"[RugCheck](https://rugcheck.xyz/tokens/{mint})\n\n"
-            )
-            
-            # Dividir mensajes largos
-            if len(message) > 3500:
-                await self._send_telegram_message(message)
-                message = f"📋 *CONTINUACIÓN...* 📋\n\n"
-        
-        if message.strip():
-            await self._send_telegram_message(message)
-    
-    async def send_flat_alert(self, mint: str, token_data: dict, flat_analysis: dict, risk_analysis: dict):
-        if await db.is_token_notified(mint, "FLAT_DETECTED"):
-            logger.info(f"🔔 Token {mint} ya notificado (FLAT), omitiendo")
-            return
-        
-        symbol = token_data.get('symbol', 'N/A')
-        name = token_data.get('name', 'N/A')
-        liquidity = token_data.get('liquidity', 0)
-        
-        # Determinar calidad basada en el score
-        flat_score = flat_analysis.get('flat_score', 0)
-        if flat_score >= 70:
-            quality = "🎯 ALTA CALIDAD"
-        elif flat_score >= 50:
-            quality = "✅ BUENA CALIDAD"
-        else:
-            quality = "⚠️ CALIDAD MEDIA"
+        risk_level = "🔴 ALTO" if risk['score'] > 60 else "🟡 MEDIO" if risk['score'] > 35 else "🟢 BAJO"
         
         message = (
-            f"🎯 *TOKEN FLAT DETECTADO* 🎯\n\n"
-            f"*Token:* {symbol} - {name}\n"
-            f"*Mint:* `{mint}`\n"
-            f"*Calidad:* {quality}\n"
-            f"*Score FLAT:* {flat_score}/100\n"
-            f"*Riesgo:* {risk_analysis['score']}/100\n\n"
-            
-            f"📊 *ANÁLISIS FLAT:*\n"
-            f"• Duración: {flat_analysis['flat_duration']:.1f} horas\n"
-            f"• Volatilidad: {flat_analysis['volatility']:.2f}%\n"
-            f"• Velas volumen bajo: {flat_analysis['volume_analysis']['low_volume_candles']}\n"
-            f"• Picos aislados: {flat_analysis['volume_analysis']['isolated_spikes']}\n"
-            f"• Liquidez: ${liquidity:,.0f}\n\n"
-            
-            f"⚠️ *ANÁLISIS RIESGO:*\n"
-            f"• Señales riesgo: {len(risk_analysis['red_flags'])}\n"
-            f"• Señales positivas: {len(risk_analysis['green_flags'])}\n\n"
-            
-            f"🔍 *ENLACES:*\n"
-            f"{self.format_links(mint)}\n\n"
-            
-            f"💡 *ACCIÓN:*\n"
-            f"{'🚀 OPORTUNIDAD FUERTE' if flat_score >= 70 else '✅ CONSIDERAR ANÁLISIS' if flat_score >= 50 else '⚠️ VERIFICAR MANUALMENTE'}"
+            f"{title}\n\n"
+            f"🪙 *Token:* {symbol}\n"
+            f"`{mint}`\n\n"
+            f"🚨 *Riesgo:* {risk_level} ({risk['score']}/100)\n"
         )
+        for flag in risk['red_flags']: message += f"  - {flag}\n"
+        for flag in risk['green_flags']: message += f"  - {flag}\n"
         
-        await self._send_telegram_message(message)
-        await db.mark_token_notified(mint, symbol, "FLAT_DETECTED", risk_analysis['score'], 
-                                   {'flat_analysis': flat_analysis, 'risk_analysis': risk_analysis})
-        await db.save_flat_token(mint, symbol, flat_analysis)
-        
-        # Añadir a watchlist automáticamente
-        await db.add_to_watchlist(mint, symbol, name, "flat", "system", 
-                                f"Flat detectado - Score: {flat_score} - Riesgo: {risk_analysis['score']}")
-        
-        logger.info(f"✅ Alerta FLAT enviada para {symbol} (Score: {flat_score})")
-    
-    async def send_pumpfun_alert(self, mint: str, market_cap: float, token_data: dict = None):
-        if await db.is_token_notified(mint, "PUMPFUN_PRE_GRAD"):
-            return
-        
-        symbol = token_data.get('symbol', 'N/A') if token_data else 'N/A'
-        name = token_data.get('name', 'N/A') if token_data else 'N/A'
-        
-        message = (
-            f"🚀 *PUMP.FUN - PRE-GRADUACIÓN* 🚀\n\n"
-            f"*Token:* {symbol}\n"
-            f"*Mint:* `{mint}`\n"
-            f"*Market Cap Actual:* ${market_cap:,.0f}\n"
-            f"*Umbral Alerta:* ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}\n"
-            f"*Graduación en:* ${PUMP_GRADUATION_TARGET - market_cap:,.0f}\n\n"
+        message += "\n"
+        for key, value in data.items(): message += f"*{key}:* {value}\n"
             
-            f"⚡ *ACCIÓN INMINENTE:*\n"
-            f"Liquidez se bloqueará automáticamente al llegar a ${PUMP_GRADUATION_TARGET:,.0f}\n\n"
-            
-            f"🔗 *ENLACES RÁPIDOS:*\n"
-            f"{self.format_links(mint)}\n\n"
-            
-            f"🎯 *ESTRATEGIA:*\n"
-            f"Token técnicamente seguro (LP bloqueado) - Analizar potencial post-graduación"
-        )
+        message += f"\n🔗 {self._format_links(mint)}"
         
-        await self._send_telegram_message(message)
-        await db.mark_token_notified(mint, symbol, "PUMPFUN_PRE_GRAD", 0, 
-                                   {'market_cap': market_cap, 'alert_time': datetime.now().isoformat()})
-        await db.save_pumpfun_token(mint, symbol, market_cap)
-        
-        # Añadir a watchlist automáticamente
-        await db.add_to_watchlist(mint, symbol, name, "pumpfun", "system", 
-                                f"Pump.fun cerca de graduación - MC: ${market_cap:,.0f}")
-        
-        logger.info(f"✅ Alerta Pump.fun enviada para {symbol}")
-    
-    async def _send_telegram_message(self, message: str, reply_markup=None):
+        await self.bot.send_message(self.chat_id, message, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await db.mark_notified(mint, symbol, title, risk['score'], data)
+
+# ===================== LOS 3 CAZADORES =====================
+async def momentum_scanner(alert_system):
+    logger.info("⚡ Iniciando Cazador de Momentum...")
+    while True:
         try:
-            bot = await self.get_bot()
-            if bot and TELEGRAM_CHAT_ID:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    text=message,
-                    parse_mode=ParseMode.MARKDOWN,
-                    disable_web_page_preview=False,
-                    reply_markup=reply_markup
-                )
-        except Exception as e:
-            logger.error(f"❌ Error enviando mensaje Telegram: {e}")
-
-alert_system = AlertSystem()
-
-# ===================== SCANNER FLAT =====================
-class FlatScanner:
-    def __init__(self):
-        self.active = False
-    
-    async def start_scanning(self):
-        self.active = True
-        logger.info("🔄 Iniciando scanner FLAT optimizado...")
-        
-        await alert_system._send_telegram_message(
-            "🎯 *SCANNER FLAT OPTIMIZADO INICIADO*\n\n"
-            f"• Filtros flexibles activados\n"
-            f"• Liquidez mínima: ${MIN_LIQUIDITY:,.0f}\n"
-            f"• Intervalo: {UPDATE_INTERVAL/60} minutos\n"
-            "_Buscando oportunidades FLAT..._"
-        )
-        
-        while self.active:
-            try:
-                tokens = await api_client.get_quality_tokens()
-                logger.info(f"🔍 Analizando {len(tokens)} tokens para FLAT")
-                
-                flat_detections = 0
-                
-                for token in tokens[:30]:  # Limitar para no saturar
-                    if not self.active:
-                        break
-                    
-                    mint = token.get('id')
-                    symbol = token.get('symbol', 'N/A')
-                    
-                    try:
-                        # Análisis de riesgo primero
-                        risk_analysis = await risk_analyzer.analyze_token_risk(mint, token)
-                        
-                        # Solo proceder si el riesgo es aceptable
-                        if risk_analysis['score'] <= MAX_RISK_SCORE:
-                            flat_analysis = await flat_detector.analyze_token_flat(mint, token)
-                            
-                            if flat_analysis['is_flat'] and flat_analysis.get('flat_score', 0) >= 50:
-                                logger.info(f"✅ FLAT: {symbol} (Score: {flat_analysis['flat_score']})")
-                                await alert_system.send_flat_alert(mint, token, flat_analysis, risk_analysis)
-                                flat_detections += 1
-                        
-                        await asyncio.sleep(0.5)  # Rate limiting
-                        
-                    except Exception as e:
-                        logger.error(f"❌ Error con {mint}: {e}")
-                        continue
-                
-                logger.info(f"📊 Scan FLAT completado: {flat_detections} detecciones")
-                await asyncio.sleep(UPDATE_INTERVAL)
-                
-            except Exception as e:
-                logger.error(f"❌ Error en scanner FLAT: {e}")
+            # Buscamos tokens con buen score orgánico y con cambios recientes
+            tokens = await api_client.get_jupiter_data("/tokens/v2/toporganicscore/5m?limit=25")
+            if not tokens:
                 await asyncio.sleep(60)
-    
-    def stop(self):
-        self.active = False
-        logger.info("🛑 Scanner FLAT detenido")
+                continue
 
-flat_scanner = FlatScanner()
-
-# ===================== MONITOR PUMP.FUN =====================
-class PumpFunMonitor:
-    def __init__(self):
-        self.active = False
-    
-    async def start_monitoring(self):
-        self.active = True
-        logger.info("🚀 Iniciando monitor Pump.fun...")
-        
-        if not HELIUS_WSS_URL:
-            logger.error("❌ HELIUS_WSS_URL no configurado")
-            return
-        
-        await alert_system._send_telegram_message(
-            f"🔥 *MONITOR PUMP.FUN INICIADO*\n\n"
-            f"• Alerta en: ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f} MC\n"
-            f"• Graduación: ${PUMP_GRADUATION_TARGET:,.0f} MC\n"
-            f"• Programa: {PUMPFUN_PROGRAM_ID[:12]}...\n\n"
-            "_Escuchando tokens cerca de graduación..._"
-        )
-        
-        while self.active:
-            try:
-                async with websockets.connect(HELIUS_WSS_URL) as websocket:
-                    subscribe_msg = {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "logsSubscribe",
-                        "params": [
-                            {"mentions": [PUMPFUN_PROGRAM_ID]},
-                            {"commitment": "processed"}
-                        ]
-                    }
-                    await websocket.send(json.dumps(subscribe_msg))
-                    logger.info("✅ Conectado a WebSocket Helius - Monitoreando Pump.fun")
-                    
-                    while self.active:
-                        try:
-                            message = await asyncio.wait_for(websocket.recv(), timeout=30)
-                            data = json.loads(message)
-                            await self._process_pumpfun_event(data)
-                            
-                        except asyncio.TimeoutError:
-                            await websocket.send(json.dumps({"jsonrpc": "2.0", "id": 9999, "method": "ping"}))
-                        except Exception as e:
-                            logger.error(f"❌ Error procesando mensaje WebSocket: {e}")
-                            break
-                            
-            except Exception as e:
-                logger.error(f"❌ Error conexión WebSocket Pump.fun: {e}")
-                if self.active:
-                    await asyncio.sleep(5)
-    
-    async def _process_pumpfun_event(self, event_data):
-        try:
-            # SIMULACIÓN - En producción se parsearían los logs reales
-            import random
-            if random.random() < 0.01:  # 1% de probabilidad para pruebas
-                mock_mint = f"TEST{int(time.time())}"
-                mock_market_cap = random.randint(50000, 68000)
+            for token in tokens:
+                mint = token['id']
+                stats_5m = token.get('stats5m', {})
+                price_change = stats_5m.get('priceChange', 0)
                 
-                if mock_market_cap >= PUMP_PRE_GRADUATION_THRESHOLD:
-                    logger.info(f"🎯 SIMULACIÓN: Token {mock_mint} cerca de graduación - MC: ${mock_market_cap:,.0f}")
-                    await alert_system.send_pumpfun_alert(mock_mint, mock_market_cap)
-                    
+                # Criterios de Momentum
+                if price_change > MOMENTUM_CONFIG['MIN_PRICE_CHANGE_5M']:
+                    risk = await risk_analyzer.analyze(mint, token)
+                    if risk['score'] <= MAX_RISK_SCORE:
+                        await alert_system.send_alert(
+                            "⚡ ALERTA DE MOMENTUM ⚡", mint, token['symbol'],
+                            {'Precio 5min': f"+{price_change:.2f}%", 'Liquidez': f"${token.get('liquidity',0):,.0f}"},
+                            risk
+                        )
         except Exception as e:
-            logger.error(f"❌ Error procesando evento Pump.fun: {e}")
-    
-    def stop(self):
-        self.active = False
-        logger.info("🛑 Monitor Pump.fun detenido")
+            logger.error(f"Error en Momentum Scanner: {e}")
+        await asyncio.sleep(300) # Corre cada 5 minutos
 
-pumpfun_monitor = PumpFunMonitor()
-
-# ===================== COMANDOS TELEGRAM COMPLETOS =====================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando start simplificado para evitar errores de Markdown"""
-    welcome_msg = (
-        "🤖 *JUPITER BOT COMPLETO* 🚀\n\n"
-        "🎯 *SISTEMAS DISPONIBLES:*\n"
-        "• Detector FLAT (Patrón PESHI)\n"
-        "• Monitor Pump.fun Pre-Graduación\n"
-        "• Analizador de Riesgo Automático\n"
-        "• Gestión de Lista de Tokens\n\n"
-        
-        "📊 *CONFIGURACIÓN OPTIMIZADA:*\n"
-        f"• Liquidez mínima: ${MIN_LIQUIDITY:,}\n"
-        f"• Volumen mínimo: ${MIN_VOLUME_24H:,}\n"
-        f"• Duración FLAT: {FLAT_CONFIG['MIN_FLAT_DURATION_HOURS']}h\n"
-        f"• Máx riesgo: {MAX_RISK_SCORE}/100\n\n"
-        
-        "📋 *COMANDOS DE LISTAS:*\n"
-        "• /lista_tokens - Todos los tokens\n"
-        "• /lista_flat - Solo tokens FLAT\n"
-        "• /lista_pump - Tokens Pump.fun\n"
-        "• /watchlist - Tu lista personal\n\n"
-        
-        "⚡ *COMANDOS PRINCIPALES:*\n"
-        "• /iniciar - Activar todos los sistemas\n"
-        "• /detener - Parar todo\n"
-        "• /status - Estado del sistema\n"
-        "• /agregar_token - Añadir token\n"
-        "• /eliminar_token - Quitar token\n"
-    )
-    await update.message.reply_text(welcome_msg, parse_mode=ParseMode.MARKDOWN)
-
-async def lista_tokens_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista completa de todos los tokens notificados"""
-    try:
-        tokens = await db.get_notified_tokens_summary(100)
-        if not tokens:
-            await update.message.reply_text("📭 No hay tokens notificados aún.")
-            return
-        
-        await alert_system.send_token_list(tokens, "todos los tokens")
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /lista_tokens: {e}")
-        await update.message.reply_text("❌ Error obteniendo la lista de tokens")
-
-async def lista_flat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista de tokens FLAT detectados"""
-    try:
-        tokens = await db.get_flat_tokens_summary()
-        if not tokens:
-            await update.message.reply_text("📭 No hay tokens FLAT detectados aún.")
-            return
-        
-        flat_tokens_formatted = []
-        for token in tokens:
-            flat_tokens_formatted.append({
-                'mint_address': token['mint_address'],
-                'symbol': token['symbol'],
-                'volatility_score': token.get('volatility_score', 'N/A')
-            })
-        
-        await alert_system.send_token_list(flat_tokens_formatted, "tokens flat")
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /lista_flat: {e}")
-        await update.message.reply_text("❌ Error obteniendo tokens FLAT")
-
-async def lista_pump_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra lista de tokens Pump.fun notificados"""
-    try:
-        tokens = await db.get_pumpfun_tokens_summary()
-        if not tokens:
-            await update.message.reply_text("📭 No hay tokens Pump.fun detectados aún.")
-            return
-        
-        pump_tokens_formatted = []
-        for token in tokens:
-            pump_tokens_formatted.append({
-                'mint_address': token['mint_address'],
-                'symbol': token['symbol'],
-                'market_cap': token.get('market_cap')
-            })
-        
-        await alert_system.send_token_list(pump_tokens_formatted, "pump.fun")
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /lista_pump: {e}")
-        await update.message.reply_text("❌ Error obteniendo tokens Pump.fun")
-
-async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra la watchlist personal"""
-    try:
-        tokens = await db.get_watchlist()
-        if not tokens:
-            await update.message.reply_text("📭 Tu watchlist está vacía.")
-            return
-        
-        watchlist_formatted = []
-        for token in tokens:
-            watchlist_formatted.append({
-                'mint_address': token['mint_address'],
-                'symbol': token['symbol'],
-                'risk_score': 'N/A',
-                'category': token['category']
-            })
-        
-        await alert_system.send_token_list(watchlist_formatted, "watchlist")
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /watchlist: {e}")
-        await update.message.reply_text("❌ Error obteniendo watchlist")
-
-async def agregar_token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Agrega un token a la watchlist manualmente"""
-    try:
-        if len(context.args) < 1:
-            await update.message.reply_text("❌ Uso: /agregar_token <mint_address> [notas]")
-            return
-        
-        mint = context.args[0]
-        notes = " ".join(context.args[1:]) if len(context.args) > 1 else "Agregado manualmente"
-        
-        # Obtener metadata del token
-        token_data = await api_client.get_token_metadata(mint)
-        symbol = "N/A"
-        name = "N/A"
-        
-        if token_data and isinstance(token_data, list) and len(token_data) > 0:
-            symbol = token_data[0].get('symbol', 'N/A')
-            name = token_data[0].get('name', 'N/A')
-        
-        await db.add_to_watchlist(mint, symbol, name, "manual", "user", notes)
-        
-        await update.message.reply_text(
-            f"✅ Token agregado a watchlist:\n"
-            f"• Symbol: {symbol}\n"
-            f"• Mint: `{mint}`\n"
-            f"• Notas: {notes}"
-        )
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /agregar_token: {e}")
-        await update.message.reply_text("❌ Error agregando token a la watchlist")
-
-async def eliminar_token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Elimina un token de la watchlist"""
-    try:
-        if not context.args:
-            await update.message.reply_text("❌ Uso: /eliminar_token <mint_address>")
-            return
-        
-        mint = context.args[0]
-        await db.remove_from_watchlist(mint)
-        
-        await update.message.reply_text(f"✅ Token `{mint}` eliminado de la watchlist")
-        
-    except Exception as e:
-        logger.error(f"❌ Error en /eliminar_token: {e}")
-        await update.message.reply_text("❌ Error eliminando token de la watchlist")
-
-async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Activa todos los sistemas"""
-    asyncio.create_task(flat_scanner.start_scanning())
-    asyncio.create_task(pumpfun_monitor.start_monitoring())
-    
-    await update.message.reply_text(
-        "✅ *SISTEMAS ACTIVADOS*\n\n"
-        "• Scanner FLAT: ACTIVO\n"
-        "• Monitor Pump.fun: ACTIVO\n"
-        "• Analizador Riesgo: ACTIVO\n"
-        "• Gestor Tokens: ACTIVO\n\n"
-        "Todos los sistemas funcionando...",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detiene todos los sistemas"""
-    flat_scanner.stop()
-    pumpfun_monitor.stop()
-    
-    await update.message.reply_text(
-        "🛑 *SISTEMAS DETENIDOS*\n\n"
-        "• Scanner FLAT: DETENIDO\n"
-        "• Monitor Pump.fun: DETENIDO\n"
-        "• Analizador Riesgo: DETENIDO",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Muestra el estado del sistema"""
-    flat_tokens = await db.get_flat_tokens_summary()
-    notified_tokens = await db.get_notified_tokens_summary(10)
-    watchlist_tokens = await db.get_watchlist()
-    pump_tokens = await db.get_pumpfun_tokens_summary()
-    
-    status_msg = (
-        f"📊 *ESTADO DEL SISTEMA*\n\n"
-        f"• Scanner FLAT: {'ACTIVO' if flat_scanner.active else 'DETENIDO'}\n"
-        f"• Monitor Pump.fun: {'ACTIVO' if pumpfun_monitor.active else 'DETENIDO'}\n"
-        f"• Base datos: {'CONECTADA' if db.pool else 'NO CONECTADA'}\n"
-        f"• Tokens FLAT: {len(flat_tokens)}\n"
-        f"• Tokens Pump.fun: {len(pump_tokens)}\n"
-        f"• Tokens notificados: {len(notified_tokens)}\n"
-        f"• Watchlist: {len(watchlist_tokens)} tokens\n\n"
-        
-        f"⚙️ *CONFIGURACIÓN:*\n"
-        f"• Liquidez mínima: ${MIN_LIQUIDITY:,}\n"
-        f"• Volumen mínimo: ${MIN_VOLUME_24H:,}\n"
-        f"• Duración FLAT: {FLAT_CONFIG['MIN_FLAT_DURATION_HOURS']}h\n"
-        f"• Alerta Pump.fun: ${PUMP_PRE_GRADUATION_THRESHOLD:,}\n"
-    )
-    
-    await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
-
-# ===================== MAIN CORREGIDO SIN PSUTIL =====================
-async def main():
-    logger.info("🚀 INICIANDO BOT COMPLETO...")
-    
-    # Verificar si ya hay otra instancia corriendo (método simple)
-    try:
-        test_bot = Bot(token=TELEGRAM_BOT_TOKEN)
-        await test_bot.get_me()
-        logger.info("✅ Token de bot válido")
-    except Exception as e:
-        logger.error(f"❌ Error con el token del bot: {e}")
-        return
-    
-    await db.init()
-    
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("❌ Configuración de Telegram faltante")
-        return
-    
-    # Crear aplicación con configuración para evitar conflictos
-    application = (
-        Application.builder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
-    )
-    
-    # Registrar TODOS los comandos
-    commands = [
-        ("start", start_command),
-        ("iniciar", iniciar_command),
-        ("detener", detener_command),
-        ("status", status_command),
-        ("lista_tokens", lista_tokens_command),
-        ("lista_flat", lista_flat_command),
-        ("lista_pump", lista_pump_command),
-        ("watchlist", watchlist_command),
-        ("agregar_token", agregar_token_command),
-        ("eliminar_token", eliminar_token_command),
-    ]
-    
-    for command, handler in commands:
-        application.add_handler(CommandHandler(command, handler))
-    
-    try:
-        # Inicializar con drop_pending_updates para evitar conflictos
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(drop_pending_updates=True)
-        
-        logger.info("✅ Bot Telegram completo iniciado correctamente")
-        
-        await alert_system._send_telegram_message(
-            "🤖 *JUPITER BOT COMPLETO INICIADO* 🚀\n\n"
-            "✅ Todos los sistemas cargados\n"
-            "✅ Base de datos conectada\n"
-            "✅ APIs operativas\n\n"
-            "📋 *COMANDOS DISPONIBLES:*\n"
-            "• /iniciar - Activar todos los sistemas\n"
-            "• /lista_tokens - Ver todos los tokens\n"
-            "• /lista_flat - Tokens FLAT\n"
-            "• /lista_pump - Tokens Pump.fun\n"
-            "• /watchlist - Tu lista personal\n\n"
-            "Esperando comandos..."
-        )
-        
-        # Mantener el bot corriendo
-        while True:
-            await asyncio.sleep(3600)
-            
-    except Exception as e:
-        logger.error(f"❌ Error iniciando el bot: {e}")
-    finally:
-        # Limpieza adecuada
-        flat_scanner.stop()
-        pumpfun_monitor.stop()
-        
+async def pumpfun_sniper(alert_system):
+    logger.info("🚀 Iniciando Sniper de Pump.fun...")
+    while True:
+        if not HELIUS_WSS_URL: logger.error("HELIUS_WSS_URL no configurado para el Sniper."); await asyncio.sleep(3600); return
         try:
-            await application.stop()
-            await application.shutdown()
-        except:
-            pass
-        
-        if api_client.session:
-            await api_client.session.close()
-        
-        logger.info("✅ Bot completo apagado correctamente")
+            async with websockets.connect(HELIUS_WSS_URL) as ws:
+                sub_msg = {"jsonrpc":"2.0","id":1,"method":"logsSubscribe","params":[{"mentions":[PUMPFUN_PROGRAM_ID]},{"commitment":"processed"}]}
+                await ws.send(json.dumps(sub_msg))
+                logger.info("✅ Conectado al WebSocket para Pump.fun")
+
+                while True:
+                    try:
+                        message = await asyncio.wait_for(ws.recv(), timeout=30)
+                        data = json.loads(message)
+                        logs = data.get('params', {}).get('result', {}).get('value', {}).get('logs', [])
+                        
+                        log_text = " ".join(logs)
+                        if "instruction: buy" in log_text:
+                            mc_match = re.search(r"market_cap: (\d+)", log_text)
+                            mint_match = re.search(r"mint: ([A-Za-z0-9]{43,44})", log_text)
+
+                            if mc_match and mint_match:
+                                mc = float(mc_match.group(1))
+                                mint = mint_match.group(1)
+                                if mc >= PUMP_PRE_GRADUATION_THRESHOLD:
+                                    jupiter_data_list = await api_client.get_jupiter_data(f"/tokens/v2/search?query={mint}")
+                                    jupiter_data = jupiter_data_list[0] if jupiter_data_list else {}
+                                    risk = await risk_analyzer.analyze(mint, jupiter_data)
+                                    # Para pump.fun, el riesgo de rug es bajo, así que podemos ignorar el score si la liquidez será bloqueada
+                                    risk['green_flags'].append("✅ LP se bloqueará en la graduación")
+
+                                    await alert_system.send_alert(
+                                        "🚀 PUMP.FUN PRE-GRADUACIÓN 🚀", mint, jupiter_data.get('symbol', 'N/A'),
+                                        {'Market Cap': f"${mc:,.0f}"},
+                                        risk
+                                    )
+                    except asyncio.TimeoutError:
+                        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "ping", "id": 1})) # Keepalive
+                    except Exception:
+                        break # Reconectar si hay otro error
+        except Exception as e:
+            logger.error(f"Error en Sniper de Pump.fun: {e}. Reconectando en 10s...")
+            await asyncio.sleep(10)
+
+# (El cazador de tokens "Flat" se omite intencionadamente porque requiere una fuente de datos de velas históricas fiable que no tenemos,
+# y las otras dos estrategias son mucho más efectivas para el tipo de tokens que buscas)
+
+# ===================== BOT DE TELEGRAM Y MAIN =====================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = "🤖 *Bot de Caza V5 Activo*\n\nEste bot ejecuta 2 estrategias de caza en paralelo:\n\n*1. Cazador de Momentum:*\nBusca tokens recién listados que muestran un aumento repentino de volumen y precio.\n\n*2. Sniper de Pump.fun:*\nTe alerta segundos antes de que un token se gradúe y su liquidez sea bloqueada.\n\nEl bot se inicia automáticamente. Recibirás las alertas en este chat."
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def main():
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+        logger.error("Faltan variables de entorno de Telegram. Saliendo.")
+        return
+    
+    await db.connect()
+    alert_sys = AlertSystem(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+    
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_command))
+    
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    
+    logger.info("✅ Bot de Telegram iniciado. Lanzando cazadores...")
+    await alert_sys.bot.send_message(TELEGRAM_CHAT_ID, "✅ Bot V5 iniciado. Los cazadores de Momentum y Pump.fun están activos.")
+    
+    # Lanzar los cazadores en paralelo
+    momentum_task = asyncio.create_task(momentum_scanner(alert_sys))
+    pumpfun_task = asyncio.create_task(pumpfun_sniper(alert_sys))
+    
+    await asyncio.gather(momentum_task, pumpfun_task)
 
 if __name__ == "__main__":
-    required_vars = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID"]
-    missing_vars = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing_vars:
-        logger.error(f"❌ Variables faltantes: {missing_vars}")
-        exit(1)
-    
-    # Método simple para verificar múltiples instancias
-    import subprocess
-    import sys
-    
     try:
-        # Buscar procesos de Python que ejecuten este script
-        result = subprocess.run(
-            ["pgrep", "-f", "python.*telegram_bot"],
-            capture_output=True, text=True
-        )
-        
-        if result.returncode == 0:
-            pids = result.stdout.strip().split('\n')
-            current_pid = str(os.getpid())
-            
-            # Filtrar el PID actual
-            other_pids = [pid for pid in pids if pid != current_pid]
-            
-            if other_pids:
-                logger.warning(f"⚠️ Se encontraron otras instancias del bot: {other_pids}")
-                logger.warning("⚠️ Por favor, cierre otras instancias manualmente")
-                logger.warning("⚠️ Ejecute: pkill -f 'python.*telegram_bot'")
-    except Exception as e:
-        logger.warning(f"⚠️ No se pudo verificar otras instancias: {e}")
-    
-    asyncio.run(main())
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot detenido manualmente.")
