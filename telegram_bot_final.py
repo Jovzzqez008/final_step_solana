@@ -1,13 +1,6 @@
-# bot_jupiter_v3_cazador.py
-# Requisitos: ver requirements.txt
-"""
-Bot Jupiter V3 - Cazador
-- Detecta tokens 'flat' (patrón PESHI / volumen fantasma + picos aislados + anti-manipulación)
-- Monitorea Pump.fun (pre-graduación ~60k MC)
-- Usa Helius Raydium proxy por defecto para RPC/WSS
-- Persistencia en Postgres (DATABASE_URL) para evitar spam
-- Comandos Telegram para tuning en caliente
-"""
+# bot_jupiter_v3_cazador_FIXED.py
+# Requisitos: aiohttp, asyncpg, python-telegram-bot==20.3, websockets
+# Manual mode: use /cazar to start workers, /parar to stop them.
 
 import os
 import asyncio
@@ -61,7 +54,7 @@ DB_TABLE_NOTIFIED = "notified_mints"
 
 # Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("jupiter_v3_cazador")
+logger = logging.getLogger("jupiter_v3_cazador_fixed")
 
 # ---------------- GLOBAL STATE ----------------
 http_session = None
@@ -73,10 +66,15 @@ price_histories = defaultdict(lambda: deque(maxlen=500))
 flat_tokens = {}
 monitored_tokens = set()
 
+# Worker tasks and stop event (manual)
+worker_stop_evt = asyncio.Event()
+monitor_task = None
+pump_task = None
+
 # ---------------- HTTP / TELEGRAM HELPERS ----------------
 async def get_http_session():
     global http_session
-    if http_session is None:
+    if http_session is None or http_session.closed:
         http_session = aiohttp.ClientSession()
     return http_session
 
@@ -165,7 +163,6 @@ class JupiterClient:
         return await self.request(f"/tokens/v2/search?query={mint}", cache_key=f"t_{mint}", ttl=60)
 
     async def compute_universe_avg_volume(self, sample_limit: int = 50):
-        # average per-candle volume (approx) over a sample of tokens
         tokens = await self.get_multiple_token_sources()
         vols = []
         for t in tokens[:sample_limit]:
@@ -368,7 +365,6 @@ async def flat_scanner_worker(stop_event: asyncio.Event):
                     is_flat, details = await evaluate_token_flat(mint)
                     if is_flat:
                         details['detected_at'] = datetime.utcnow().isoformat()
-                        # enrich token_meta
                         token_meta = {
                             'symbol': meta.get('symbol'), 'name': meta.get('name'),
                             'liquidity': meta.get('liquidity'),
@@ -407,18 +403,16 @@ async def pumpfun_wss_worker(stop_event: asyncio.Event):
                         logs = value.get('logs') if value else []
                         text = "\n".join([str(l) for l in logs])
                         # detect market_cap mentions
-                        for m in re.finditer(r"market_cap\\W*[:=]\\W*(\\d+[.,]?\\d*)", text, re.IGNORECASE):
+                        for m in re.finditer(r"market_cap\W*[:=]\W*(\d+[.,]?\d*)", text, re.IGNORECASE):
                             mc = float(m.group(1).replace(',',''))
-                            # handle pre-alert margin
                             if mc >= (PUMP_PRE_GRADUATION_THRESHOLD - PUMP_PRE_ALERT_MARGIN):
-                                mm = re.search(r"mint\\W*[:=]\\W*([A-Za-z0-9]{32,44})", text)
+                                mm = re.search(r"mint\W*[:=]\W*([A-Za-z0-9]{32,44})", text)
                                 mint = mm.group(1) if mm else None
                                 if mint and not await is_notified(mint):
                                     meta = await jupiter.get_token_by_id(mint)
                                     token_meta = meta[0] if isinstance(meta,list) and meta else (meta if isinstance(meta,dict) else {})
                                     await alert_pumpfun_pre_graduation(mint, mc, token_meta)
                     except asyncio.TimeoutError:
-                        # send lightweight keepalive
                         try:
                             await ws.send(json.dumps({"jsonrpc":"2.0","id":9999,"method":"ping"}))
                         except Exception:
@@ -427,23 +421,44 @@ async def pumpfun_wss_worker(stop_event: asyncio.Event):
             logger.error(f"WSS connection error: {e}")
             await asyncio.sleep(5)
 
-# ---------------- TELEGRAM COMMANDS (tuning) ----------------
+# ---------------- TELEGRAM COMMANDS (tuning/manual) ----------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot V3 Cazador listo. Usa /cazar para iniciar.")
+    await update.message.reply_text("Bot V3 Cazador listo. Usa /cazar para iniciar, /parar para detener.")
 
 async def cmd_cazar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global monitor_task, pump_task, stop_evt
-    if not stop_evt.is_set():
-        await update.message.reply_text("Monitoreo ya activo")
+    global monitor_task, pump_task, worker_stop_evt
+    if monitor_task and not monitor_task.done():
+        await update.message.reply_text("Monitoreo ya activo.")
         return
-    stop_evt.clear()
-    monitor_task = asyncio.create_task(flat_scanner_worker(stop_evt))
-    pump_task = asyncio.create_task(pumpfun_wss_worker(stop_evt))
-    await update.message.reply_text("Monitoreo iniciado")
+    # clear stop event and start workers
+    worker_stop_evt.clear()
+    monitor_task = asyncio.create_task(flat_scanner_worker(worker_stop_evt))
+    pump_task = asyncio.create_task(pumpfun_wss_worker(worker_stop_evt))
+    await update.message.reply_text("Monitoreo iniciado (flat scanner + pumpfun watcher).")
 
 async def cmd_parar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    stop_evt.set()
-    await update.message.reply_text("Monitoreo detenido")
+    global monitor_task, pump_task, worker_stop_evt
+    if not (monitor_task or pump_task):
+        await update.message.reply_text("No hay monitoreo en ejecución.")
+        return
+    worker_stop_evt.set()
+    # wait a short moment for tasks to finish cleanly
+    await asyncio.sleep(1.0)
+    if monitor_task:
+        try:
+            await asyncio.wait_for(monitor_task, timeout=5)
+        except Exception:
+            pass
+    if pump_task:
+        try:
+            await asyncio.wait_for(pump_task, timeout=5)
+        except Exception:
+            pass
+    monitor_task = None
+    pump_task = None
+    # reset stop evt for future use
+    worker_stop_evt = asyncio.Event()
+    await update.message.reply_text("Monitoreo detenido.")
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flat_count = len(flat_tokens)
@@ -469,13 +484,11 @@ async def cmd_ajustar_vol(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- MAIN ----------------
 async def main():
-    global stop_evt, monitor_task, pump_task, app_bot
-    logger.info("Starting Bot Jupiter V3 - Cazador")
+    global app_bot, monitor_task, pump_task, worker_stop_evt
+    logger.info("Starting Bot Jupiter V3 - Cazador (FIXED manual mode)")
     await init_db()
-    stop_evt.clear()
-    monitor_task = asyncio.create_task(flat_scanner_worker(stop_evt))
-    pump_task = asyncio.create_task(pumpfun_wss_worker(stop_evt))
 
+    # Build Telegram application but DO NOT start workers automatically
     if TELEGRAM_BOT_TOKEN:
         app_bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         app_bot.add_handler(CommandHandler('start', cmd_start))
@@ -484,25 +497,61 @@ async def main():
         app_bot.add_handler(CommandHandler('status', cmd_status))
         app_bot.add_handler(CommandHandler('ajustar_std', cmd_ajustar_std))
         app_bot.add_handler(CommandHandler('ajustar_vol', cmd_ajustar_vol))
-        asyncio.create_task(app_bot.run_polling())
 
+        # initialize and start polling in the same event loop safely
+        await app_bot.initialize()
+        await app_bot.start()
+        await app_bot.updater.start_polling()
+        logger.info("Telegram polling started (manual control mode).")
+    else:
+        logger.warning("TELEGRAM_BOT_TOKEN not set — bot will run without telegram commands.")
+
+    # Keep application alive until interrupted; workers are started by /cazar
     try:
-        await asyncio.gather(monitor_task, pump_task)
+        while True:
+            await asyncio.sleep(3600)
     except asyncio.CancelledError:
-        logger.info("Cancelled")
+        logger.info("Main cancelled, shutting down...")
     finally:
-        stop_evt.set()
-        if http_session:
-            await http_session.close()
-        if pg_pool:
-            await pg_pool.close()
+        # stop workers if running
+        worker_stop_evt.set()
+        if monitor_task and not monitor_task.done():
+            try:
+                await monitor_task
+            except Exception:
+                pass
+        if pump_task and not pump_task.done():
+            try:
+                await pump_task
+            except Exception:
+                pass
+        # shutdown telegram app cleanly if it was started
         if app_bot:
-            await app_bot.shutdown()
+            try:
+                await app_bot.updater.stop_polling()
+            except Exception:
+                pass
+            try:
+                await app_bot.stop()
+                await app_bot.shutdown()
+            except Exception:
+                pass
+        # close http and db
+        if http_session:
+            try:
+                await http_session.close()
+            except Exception:
+                pass
+        if pg_pool:
+            try:
+                await pg_pool.close()
+            except Exception:
+                pass
+        logger.info("Shutdown complete.")
 
 if __name__ == '__main__':
-    stop_evt = asyncio.Event()
-    stop_evt.set()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Interrupted")
+        # graceful exit on Ctrl-C
+        logger.info("Interrupted by user - exiting")
