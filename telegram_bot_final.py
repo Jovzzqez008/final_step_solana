@@ -57,7 +57,7 @@ JUPITER_BASE = os.getenv("JUPITER_LITE_URL", "https://lite-api.jup.ag")
 JUPITER_TOKENS_V2 = f"{JUPITER_BASE}/tokens/v2"
 
 # Pump.fun specifics
-PUMPFUN_PROGRAM_ID = os.getenv("PUMPFUN_PROGRAM_ID", "PUMPFUN_PROGRAM_ID_PLACEHOLDER")
+PUMPFUN_PROGRAM_ID = os.getenv("PUMPFUN_PROGRAM_ID", "pumpfun1Mt11111111111111111111111111111111")
 PUMP_PRE_GRADUATION_THRESHOLD = float(os.getenv("PUMP_PRE_THRESHOLD", "60000"))  # 60k
 
 # Monitoring params (editable)
