@@ -46,7 +46,6 @@ class TokenManager:
     def __init__(self):
         self.pool = None
         self.recent_tokens = deque(maxlen=20)
-        self.pump_tokens_being_monitored = {}
     
     async def init(self):
         if DATABASE_URL:
@@ -149,6 +148,7 @@ class FastAPIClient:
             return []
     
     async def get_dexscreener_candles(self, mint: str, limit: int = 24):
+        """Obtener velas de DexScreener con mejor manejo de errores"""
         try:
             if not self.session:
                 self.session = aiohttp.ClientSession()
@@ -163,6 +163,7 @@ class FastAPIClient:
                 if not pairs:
                     return []
                 
+                # Buscar par de Solana
                 pair = None
                 for p in pairs:
                     if p.get('chainId') == 'solana':
@@ -172,7 +173,11 @@ class FastAPIClient:
                 if not pair:
                     return []
                 
+                # Obtener datos del par específico
                 pair_address = pair.get('pairAddress')
+                if not pair_address:
+                    return []
+                
                 pair_url = f"{DEXSCREENER_API}/pairs/solana/{pair_address}"
                 
                 async with self.session.get(pair_url, timeout=8) as pair_response:
@@ -180,21 +185,34 @@ class FastAPIClient:
                         return []
                     
                     pair_data = await pair_response.json()
-                    candles = pair_data.get('pairs', [{}])[0].get('candles')
-                    if not candles:
+                    
+                    # Manejar mejor la estructura de respuesta
+                    if isinstance(pair_data, list) and len(pair_data) > 0:
+                        pair_info = pair_data[0]
+                    elif isinstance(pair_data, dict):
+                        pair_info = pair_data
+                    else:
+                        return []
+                    
+                    # Obtener candles de manera segura
+                    candles = pair_info.get('candles')
+                    if not candles or not isinstance(candles, list):
                         return []
                     
                     normalized = []
                     for candle in candles[-limit:]:
                         if isinstance(candle, dict):
-                            normalized.append({
-                                'time': candle.get('timestamp', 0),
-                                'open': float(candle.get('open', 0)),
-                                'high': float(candle.get('high', 0)),
-                                'low': float(candle.get('low', 0)),
-                                'close': float(candle.get('close', 0)),
-                                'volume': float(candle.get('volume', 0))
-                            })
+                            try:
+                                normalized.append({
+                                    'time': candle.get('timestamp', 0),
+                                    'open': float(candle.get('open', 0)),
+                                    'high': float(candle.get('high', 0)),
+                                    'low': float(candle.get('low', 0)),
+                                    'close': float(candle.get('close', 0)),
+                                    'volume': float(candle.get('volume', 0))
+                                })
+                            except (ValueError, TypeError):
+                                continue
                     
                     return normalized
                     
@@ -302,11 +320,22 @@ class AlertSystem:
         if await token_manager.is_duplicate(mint, "PUMPFUN"):
             return
         
+        # Verificar que sea un mint válido (no programas del sistema)
+        invalid_mints = [
+            "ComputeBudget111111111111111111111111111111",
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+            "11111111111111111111111111111111"
+        ]
+        
+        if mint in invalid_mints:
+            logger.info(f"⏭️  Mint del sistema detectado, omitiendo: {mint}")
+            return
+        
         message = (
             f"🚀 *PUMP.FUN - PRE-GRADUACIÓN* 🚀\n\n"
             f"*Mint:* `{mint}`\n"
             f"*Market Cap Actual:* ${market_cap:,.0f}\n"
-            f"*Graduación en:* ${PUMP_GRADUATION_TARGET - market_cap:,.0f}\n\n"
+            f"*Graduación en:* ${max(0, PUMP_GRADUATION_TARGET - market_cap):,.0f}\n\n"
             f"{self.format_token_links(mint)}\n"
             f"⚡ *Acción Inminente:* Liquidez se bloqueará automáticamente en ~${PUMP_GRADUATION_TARGET:,.0f}"
         )
@@ -366,7 +395,7 @@ class AlertSystem:
 
 alert_system = AlertSystem()
 
-# ===================== MONITOR PUMP.FUN CON HELIUS REAL =====================
+# ===================== MONITOR PUMP.FUN MEJORADO =====================
 class PumpFunMonitor:
     def __init__(self):
         self.active = False
@@ -383,9 +412,9 @@ class PumpFunMonitor:
         await alert_system._send_message(
             f"🔥 *MONITOR PUMP.FUN INICIADO*\n\n"
             f"• Conectado a Helius WebSocket\n"
-            f"• Programa: {PUMPFUN_PROGRAM_ID[:12]}...\n"
+            f"• Filtrado mejorado activado\n"
             f"• Alerta en: ${PUMP_PRE_GRADUATION_THRESHOLD:,.0f}+ MC\n\n"
-            "_Escuchando tokens cerca de graduación..._"
+            "_Buscando tokens reales de Pump.fun..._"
         )
         
         while self.active:
@@ -427,51 +456,73 @@ class PumpFunMonitor:
     
     async def _process_pumpfun_event(self, event_data):
         try:
-            # Buscar market cap en los logs
-            if 'params' in event_data:
-                result = event_data['params'].get('result', {})
-                logs = result.get('value', {}).get('logs', [])
+            # Filtro mejorado para detectar solo tokens reales de Pump.fun
+            if 'params' not in event_data:
+                return
                 
-                log_text = " ".join(logs)
-                
-                # Buscar patrones de market cap en los logs
-                import re
-                
-                # Patrón para market cap
-                mc_patterns = [
-                    r"market cap.*?(\d{4,})",
-                    r"market_cap.*?(\d{4,})", 
-                    r"mc.*?(\d{4,})",
-                    r"graduat.*?(\d{4,})"
-                ]
-                
-                for pattern in mc_patterns:
-                    matches = re.findall(pattern, log_text, re.IGNORECASE)
-                    for match in matches:
-                        market_cap = float(match)
-                        if market_cap >= PUMP_PRE_GRADUATION_THRESHOLD:
-                            # Intentar extraer mint address
-                            mint_match = re.search(r"([1-9A-HJ-NP-Za-km-z]{32,44})", log_text)
-                            if mint_match:
-                                mint = mint_match.group(1)
-                                logger.info(f"🎯 Token cerca de graduación: {mint} - MC: ${market_cap:,.0f}")
-                                await alert_system.send_pumpfun_alert(mint, market_cap)
-                                return
-                
-                # También buscar en transacciones específicas
-                if 'transaction' in str(event_data):
-                    # Analizar transaction data para encontrar mints
-                    tx_data = str(event_data)
-                    mint_matches = re.findall(r"([1-9A-HJ-NP-Za-km-z]{32,44})", tx_data)
-                    for mint in mint_matches:
-                        if mint != PUMPFUN_PROGRAM_ID:
-                            # Verificar si es un token de Pump.fun
-                            logger.info(f"🔍 Token detectado: {mint}")
-                            # Aquí podrías agregar más verificación
+            result = event_data['params'].get('result', {})
+            logs = result.get('value', {}).get('logs', [])
+            
+            if not logs:
+                return
+            
+            log_text = " ".join(logs)
+            
+            # Filtrar programas del sistema conocidos
+            system_programs = [
+                "ComputeBudget111111111111111111111111111111",
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", 
+                "11111111111111111111111111111111",
+                "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
+                "SystemProgram1111111111111111111111111111111"
+            ]
+            
+            # Buscar mint addresses válidos (excluyendo programas del sistema)
+            import re
+            mint_pattern = r"([1-9A-HJ-NP-Za-km-z]{32,44})"
+            all_mints = re.findall(mint_pattern, log_text)
+            
+            valid_mints = []
+            for mint in all_mints:
+                if mint not in system_programs and mint != PUMPFUN_PROGRAM_ID:
+                    valid_mints.append(mint)
+            
+            if not valid_mints:
+                return
+            
+            # Buscar market cap realista
+            mc_patterns = [
+                r"market cap.*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+                r"market_cap.*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+                r"mc.*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+                r"graduat.*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)",
+                r"price.*?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)"
+            ]
+            
+            for pattern in mc_patterns:
+                matches = re.findall(pattern, log_text, re.IGNORECASE)
+                for match in matches:
+                    try:
+                        # Limpiar el número (remover comas)
+                        clean_match = match.replace(',', '')
+                        market_cap = float(clean_match)
+                        
+                        # Solo alertar si el market cap es realista para Pump.fun
+                        if (PUMP_PRE_GRADUATION_THRESHOLD <= market_cap <= 1000000 and 
+                            market_cap > 0):
                             
+                            # Usar el primer mint válido encontrado
+                            mint = valid_mints[0]
+                            logger.info(f"🎯 Token Pump.fun detectado: {mint} - MC: ${market_cap:,.0f}")
+                            await alert_system.send_pumpfun_alert(mint, market_cap)
+                            return
+                            
+                    except (ValueError, TypeError):
+                        continue
+                        
         except Exception as e:
             logger.error(f"❌ Error procesando evento Pump.fun: {e}")
-    
+
     def stop(self):
         self.active = False
         logger.info("🛑 Monitor Pump.fun detenido")
@@ -507,15 +558,26 @@ class FlatScanner:
                         break
                     
                     mint = token.get('id')
+                    symbol = token.get('symbol', 'N/A')
+                    
                     if not mint:
                         continue
                     
-                    flat_analysis = await flat_detector.analyze_flat_pattern(mint)
+                    # Saltar tokens con símbolos muy genéricos
+                    generic_symbols = ['SOL', 'USDC', 'USDT', 'BONK', 'JUP', 'RAY', 'ORCA']
+                    if symbol in generic_symbols:
+                        continue
                     
-                    if flat_analysis['is_flat']:
-                        logger.info(f"✅ FLAT detectado: {token.get('symbol')} - {flat_analysis['duration_hours']:.1f}h")
-                        await alert_system.send_flat_alert(mint, token, flat_analysis)
-                        flat_detections += 1
+                    try:
+                        flat_analysis = await flat_detector.analyze_flat_pattern(mint)
+                        
+                        if flat_analysis['is_flat']:
+                            logger.info(f"✅ FLAT detectado: {symbol} - {flat_analysis['duration_hours']:.1f}h")
+                            await alert_system.send_flat_alert(mint, token, flat_analysis)
+                            flat_detections += 1
+                    except Exception as e:
+                        logger.error(f"❌ Error analizando {mint}: {e}")
+                        continue
                     
                     await asyncio.sleep(1)  # Rate limiting
                 
@@ -638,7 +700,7 @@ async def main():
         "✅ Sistema listo para comandos\n"
         "✅ Base de datos conectada\n" 
         "✅ Helius configurado\n"
-        "✅ APIs operativas\n\n"
+        "✅ Filtros mejorados activos\n\n"
         "📋 *Comandos disponibles:*\n"
         "• `iniciar` - Activar scanners\n"
         "• `detener` - Parar scanners\n"  
