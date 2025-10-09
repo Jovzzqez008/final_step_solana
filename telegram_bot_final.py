@@ -1,4 +1,4 @@
-# bot_jupiter_complete_fixed.py - VERSIÓN CORREGIDA
+# bot_jupiter_complete_fixed.py - VERSIÓN SIN PSUTIL
 import asyncio
 import json
 import os
@@ -1012,11 +1012,11 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await update.message.reply_text(status_msg, parse_mode=ParseMode.MARKDOWN)
 
-# ===================== MAIN CORREGIDO =====================
+# ===================== MAIN CORREGIDO SIN PSUTIL =====================
 async def main():
     logger.info("🚀 INICIANDO BOT COMPLETO...")
     
-    # Verificar si ya hay otra instancia corriendo
+    # Verificar si ya hay otra instancia corriendo (método simple)
     try:
         test_bot = Bot(token=TELEGRAM_BOT_TOKEN)
         await test_bot.get_me()
@@ -1107,34 +1107,29 @@ if __name__ == "__main__":
         logger.error(f"❌ Variables faltantes: {missing_vars}")
         exit(1)
     
-    # Verificar que no hay otra instancia corriendo
-    import psutil
-    current_pid = os.getpid()
-    bot_processes = []
+    # Método simple para verificar múltiples instancias
+    import subprocess
+    import sys
     
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            if (proc.info['pid'] != current_pid and 
-                proc.info['cmdline'] and 
-                any('python' in cmd for cmd in proc.info['cmdline']) and
-                any('bot_jupiter' in cmd for cmd in proc.info['cmdline'])):
-                bot_processes.append(proc.info['pid'])
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            pass
-    
-    if bot_processes:
-        logger.warning(f"⚠️ Se encontraron otras instancias del bot: {bot_processes}")
-        logger.warning("⚠️ Cerrando otras instancias...")
-        for pid in bot_processes:
-            try:
-                p = psutil.Process(pid)
-                p.terminate()
-                p.wait(timeout=5)
-            except:
-                try:
-                    p.kill()
-                except:
-                    pass
-        logger.info("✅ Otras instancias cerradas")
+    try:
+        # Buscar procesos de Python que ejecuten este script
+        result = subprocess.run(
+            ["pgrep", "-f", "python.*telegram_bot"],
+            capture_output=True, text=True
+        )
+        
+        if result.returncode == 0:
+            pids = result.stdout.strip().split('\n')
+            current_pid = str(os.getpid())
+            
+            # Filtrar el PID actual
+            other_pids = [pid for pid in pids if pid != current_pid]
+            
+            if other_pids:
+                logger.warning(f"⚠️ Se encontraron otras instancias del bot: {other_pids}")
+                logger.warning("⚠️ Por favor, cierre otras instancias manualmente")
+                logger.warning("⚠️ Ejecute: pkill -f 'python.*telegram_bot'")
+    except Exception as e:
+        logger.warning(f"⚠️ No se pudo verificar otras instancias: {e}")
     
     asyncio.run(main())
