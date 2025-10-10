@@ -537,8 +537,43 @@ async def init_bot():
 
 @app.on_event("startup")
 async def on_startup():
-    # inicializa bot y módulos (módulos se arrancan solo con /iniciar)
-    await init_bot()
+    # Debug info
+    port = os.getenv("PORT", "NO SET")
+    print(f"🚀 Starting bot on port: {port}")
+    print(f"🤖 Bot token configured: {'YES' if TELEGRAM_BOT_TOKEN else 'NO'}")
+    print(f"💬 Chat ID: {TELEGRAM_CHAT_ID}")
+    
+    try:
+        # inicializa bot y módulos
+        await init_bot()
+        
+        # ✅ CRÍTICO: Inicializa la aplicación de Telegram
+        await telegram_app.initialize()
+        await telegram_app.start()
+        
+        print("✅ Telegram bot initialized successfully")
+        
+    except Exception as e:
+        print(f"❌ Error during startup: {e}")
+        raise
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    print("🛑 Shutting down bot...")
+    # Detener monitores
+    await pump_monitor.stop()
+    await flat_scanner.stop()
+    # Cerrar la aplicación de Telegram
+    if telegram_app:
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+    # Cerrar sesión HTTP
+    if http_session:
+        await http_session.close()
+    # Cerrar pool de DB
+    if db:
+        await db.close()
+    print("✅ Bot shut down successfully")
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, req: Request):
@@ -650,7 +685,8 @@ async def cmd_ajustar_flat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 def run_uvicorn():
     import uvicorn
-    uvicorn.run("telegram_bot_final:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    port = int(os.getenv("PORT", "8000"))  # ✅ Usa el puerto de Railway o 8000 por defecto
+    uvicorn.run("telegram_bot_final:app", host="0.0.0.0", port=port)
 
 # This allows both: "python telegram_bot_final.py" (dev) or gunicorn
 if __name__ == "__main__":
