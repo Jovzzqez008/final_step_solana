@@ -93,7 +93,23 @@ class DB:
             raise RuntimeError("DATABASE_URL no configurada")
         self.pool = await asyncpg.create_pool(self.database_url, min_size=1, max_size=6)
         async with self.pool.acquire() as conn:
+            # Verificar si la tabla existe y tiene las columnas correctas
+            table_exists = await conn.fetchval(
+                "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'notified_tokens')"
+            )
+            
+            if table_exists:
+                # Verificar si la columna notified_at existe
+                column_exists = await conn.fetchval(
+                    "SELECT EXISTS (SELECT FROM information_schema.columns WHERE table_name = 'notified_tokens' AND column_name = 'notified_at')"
+                )
+                if not column_exists:
+                    # La tabla existe pero no tiene la columna notified_at, recrearla
+                    await conn.execute("DROP TABLE notified_tokens")
+                    print("🗑️ Tabla antigua eliminada, creando nueva...")
+            
             await conn.execute(DB_SCHEMA_SQL)
+            print("✅ Esquema de base de datos verificado/creado")
 
     async def close(self):
         if self.pool:
@@ -122,8 +138,12 @@ class DB:
     async def count_alerts_last_24h(self) -> int:
         q = "SELECT COUNT(*) FROM notified_tokens WHERE notified_at >= $1"
         async with self.pool.acquire() as conn:
-            r = await conn.fetchval(q, now_ts() - timedelta(hours=24))
-            return int(r or 0)
+            try:
+                r = await conn.fetchval(q, now_ts() - timedelta(hours=24))
+                return int(r or 0)
+            except Exception as e:
+                print(f"❌ Error contando alertas: {e}")
+                return 0
 
 # ---------------------------
 # HTTP client wrapper (aiohttp)
@@ -520,6 +540,7 @@ async def init_bot():
     telegram_app.add_handler(CommandHandler("detener", cmd_detener))
     telegram_app.add_handler(CommandHandler("status", cmd_status))
     telegram_app.add_handler(CommandHandler("ajustar_flat", cmd_ajustar_flat))
+    telegram_app.add_handler(CommandHandler("help", cmd_start))
 
     # DB
     db = DB(DATABASE_URL)
