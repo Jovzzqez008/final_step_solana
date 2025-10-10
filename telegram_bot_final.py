@@ -650,7 +650,7 @@ async def cmd_ajustar_flat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ---------------------------
 def run_uvicorn():
     import uvicorn
-    uvicorn.run("telegram_bot_final:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run("telegram_bot_final:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 # This allows both: "python telegram_bot_final.py" (dev) or gunicorn
 if __name__ == "__main__":
