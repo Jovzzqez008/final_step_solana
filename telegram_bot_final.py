@@ -313,12 +313,18 @@ class DexScreenerClient:
         except Exception:
             return []
 
+# ---------------------------
+# Birdeye client (parcheado)
+# ---------------------------
 class BirdeyeClient:
     def __init__(self, http: HttpClient, base: str):
         self.http = http
         self.base = base.rstrip("/")
 
     async def get_candles(self, mint: str, interval: str = "5m", limit: int = 72) -> List[Dict[str, Any]]:
+        # Evitar SOL nativo (no soportado en Birdeye)
+        if mint == "So11111111111111111111111111111111111111112":
+            return []
         url = f"{self.base}/public/market/candles"
         params = {"address": mint, "interval": interval, "limit": limit}
         headers = {"accept": "application/json"}
@@ -330,21 +336,31 @@ class BirdeyeClient:
             return []
 
 # ---------------------------
-# Raydium client
+# ---------------------------
+# Raydium client (parcheado)
 # ---------------------------
 class RaydiumClient:
     def __init__(self, http: HttpClient):
         self.http = http
 
     async def get_new_pools(self, limit: int = 50) -> List[Dict[str, Any]]:
-        url = f"{RAYDIUM_API}/pools"
+        """Obtiene pools recién creados en Raydium con fallback"""
         try:
-            params = {'sortField': 'createdAt', 'sortType': 'desc', 'limit': limit}
+            # Endpoint estable
+            url = f"{RAYDIUM_API}/pool/list"
+            params = {"pageSize": limit, "page": 1, "sortField": "createdAt", "sortType": "desc"}
             data = await self.http.get_json(url, params=params)
-            return data.get('data', [])
+            return data.get("data", [])
         except Exception as e:
             json_log("raydium_pools_error", error=str(e))
-            return []
+            # Fallback a AMM v3
+            try:
+                url = f"{RAYDIUM_API}/ammV3/pools"
+                data = await self.http.get_json(url, params={"limit": limit})
+                return data.get("data", [])
+            except Exception as e2:
+                json_log("raydium_pools_fallback_error", error=str(e2))
+                return []
 
 # ---------------------------
 # RugCheck: LP lock & security
