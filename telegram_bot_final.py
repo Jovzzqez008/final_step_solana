@@ -520,6 +520,7 @@ async def init_bot():
     telegram_app.add_handler(CommandHandler("detener", cmd_detener))
     telegram_app.add_handler(CommandHandler("status", cmd_status))
     telegram_app.add_handler(CommandHandler("ajustar_flat", cmd_ajustar_flat))
+    telegram_app.add_handler(CommandHandler("help", cmd_start))
 
     # DB
     db = DB(DATABASE_URL)
@@ -553,6 +554,11 @@ async def on_startup():
         
         print("✅ Telegram bot initialized successfully")
         
+        # ✅ INICIAR MONITORES AUTOMÁTICAMENTE
+        await pump_monitor.start()
+        await flat_scanner.start()
+        print("✅ Monitors started automatically")
+        
     except Exception as e:
         print(f"❌ Error during startup: {e}")
         raise
@@ -575,36 +581,47 @@ async def on_shutdown():
         await db.close()
     print("✅ Bot shut down successfully")
 
+# Agrega estas rutas para testing
+@app.get("/test")
+async def test_endpoint():
+    return {
+        "status": "ok", 
+        "bot_running": telegram_app is not None,
+        "chat_id": TELEGRAM_CHAT_ID
+    }
+
+@app.get("/")
+async def root():
+    return {"status": "Bot is running", "webhook": "active"}
+
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, req: Request):
     """
     Endpoint webhook donde Telegram enviará updates.
-    - No autoregistra el webhook. Tú lo harás con curl.
-    - Validamos que el token en URL coincida con la env var.
-    - En modo privado, validamos que el chat que envía comandos sea el TELEGRAM_CHAT_ID.
     """
-    if token != TELEGRAM_BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
-
-    body = await req.json()
-    # Convertimos body a Update y lo encolamos en la aplicación telegram interna
-    update = Update.de_json(body, telegram_app.bot)
-    # Si el update tiene mensaje y proviene de otro usuario que no es TELEGRAM_CHAT_ID -> ignorar (modo privado)
     try:
-        from_user = None
-        if update.effective_user:
-            from_user = update.effective_user.id
-        # Si hay from_user y no coincide -> ignorar y devolver OK
-        if from_user and int(from_user) != int(TELEGRAM_CHAT_ID):
-            # No respondemos a usuarios no autorizados
-            return JSONResponse({"ok": True, "note": "ignored - private bot"})
-    except Exception:
-        # si no hay user info, aceptamos (algún tipo de update)
-        pass
+        if token != TELEGRAM_BOT_TOKEN:
+            raise HTTPException(status_code=403, detail="Invalid token")
 
-    # poner update en queue para que los handlers lo procesen
-    await telegram_app.update_queue.put(update)
-    return JSONResponse({"ok": True})
+        body = await req.json()
+        print(f"📨 Webhook recibido: {body}")  # Debug
+        
+        # Convertimos body a Update
+        update = Update.de_json(body, telegram_app.bot)
+        
+        # Verificación de usuario (modo privado)
+        if update.effective_user:
+            if update.effective_user.id != TELEGRAM_CHAT_ID:
+                print(f"🚫 Usuario no autorizado: {update.effective_user.id}")
+                return JSONResponse({"ok": True, "note": "ignored - private bot"})
+        
+        # Procesar el update
+        await telegram_app.process_update(update)
+        return JSONResponse({"ok": True})
+        
+    except Exception as e:
+        print(f"❌ Error en webhook: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # ---------------------------
 # Telegram command handlers
