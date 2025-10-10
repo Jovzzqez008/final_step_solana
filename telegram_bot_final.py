@@ -1,10 +1,11 @@
-# telegram_bot_final_v5_pro.py
-# Solana Monitor Bot v5_pro - Raydium graduation, Pump.fun integration, Flat watchlist,
-# Smart-wallet tracking, db persistence and commands (/mints_list, /watchlist, /rank)
+# telegram_bot_final.py
+# Solana Monitor Bot v5_pro - FIXED
+# Raydium graduation, Pump.fun integration (optional), Flat watchlist,
+# Smart-wallet tracking, DB persistence and commands (/mints_list, /watchlist, /rank)
 #
-# Notes:
-# - Remove/replace API endpoints if you have private keys or alternative endpoints.
-# - Deploy in Railway/Heroku/GCP and provide env vars described in the README above.
+# Variables de entorno requeridas:
+# TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DATABASE_URL
+# Opcionales: DEXSCREENER_API, RAYDIUM_API, PUMPFUN_API, SOLSCAN_API, COINGECKO_API, HELIUS_WSS_URL
 
 import os
 import asyncio
@@ -78,7 +79,6 @@ def format_number(num: float) -> str:
         return f"{num:.2f}"
 
 def safe_html(s: str) -> str:
-    # minimal sanitizer: escape &, <, >
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def json_log(event: str, **kw):
@@ -179,7 +179,7 @@ class HttpClient:
                         continue
                     text = await resp.text()
                     raise RuntimeError(f"HTTP {resp.status}: {text}")
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            except (aiohttp.ClientError, asyncio.TimeoutError):
                 await asyncio.sleep(backoff_delay(attempt))
                 attempt += 1
                 if attempt >= MAX_RETRIES:
@@ -223,7 +223,6 @@ class PumpFunClient:
         self.base = base.rstrip("/") if base else ""
 
     async def token_details(self, mint: str) -> Dict[str,Any]:
-        # if no base provided, return {}
         if not self.base:
             return {}
         try:
@@ -254,7 +253,6 @@ class CoinGeckoClient:
         self.base = base.rstrip("/")
 
     async def find_listing(self, symbol_or_name: str) -> Dict[str,Any]:
-        # simple search endpoint, not guaranteed
         try:
             url = f"{self.base}/search"
             data = await self.http.get_json(url, params={"query": symbol_or_name})
@@ -366,7 +364,7 @@ class FlatDetector:
     def analyze_flat(self, candles: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
         if not candles or len(candles) < 12:
             return None
-        recent = candles[-(12*int(max(1, (60//5)))):]  # at least ~1h of 5m candles
+        recent = candles[-12:]  # last ~1h of 5m candles
         highs = [c["high"] for c in recent]
         lows = [c["low"] for c in recent]
         vols = [c["volume_usd"] for c in recent]
@@ -375,7 +373,6 @@ class FlatDetector:
         volatility_pct = ((max(highs) - min(lows)) / min(lows)) * 100
         avg_vol = sum(vols)/len(vols)
         low_vol_ratio = sum(1 for v in vols if v < avg_vol*0.7) / len(vols)
-        # heuristic: low vol, low volatility -> flat
         if volatility_pct < 12.0 and low_vol_ratio >= 0.6:
             flat_low = min(lows)
             flat_high = max(highs)
@@ -406,7 +403,6 @@ class FlatDetector:
         self.running = True
         while self.running:
             try:
-                # scan watchlist and re-evaluate if breakout occurred
                 rows = await self.get_watchlist(limit=200)
                 for r in rows:
                     mint = r["mint"]
@@ -414,7 +410,6 @@ class FlatDetector:
                     avg_vol = float(r["avg_volume"] or 0)
                     flat_low = float(r["flat_low"] or 0)
                     flat_high = float(r["flat_high"] or 0)
-                    # fetch current candles
                     dexs = await self.core.dexs.token_info(mint)
                     candles = self.candles_parse_dexs(dexs)
                     if not candles:
@@ -423,18 +418,14 @@ class FlatDetector:
                     recent_vols = [c["volume_usd"] for c in candles[-PRE_BREAKOUT_CANDLES_COUNT:]] if PRE_BREAKOUT_CANDLES_COUNT <= len(candles) else [c["volume_usd"] for c in candles[-3:]]
                     recent_avg = sum(recent_vols)/len(recent_vols)
                     price = latest["close"]
-                    # breakout condition: price > flat_high AND recent volume > avg_vol * multiplier
                     if price > flat_high and recent_avg > float(avg_vol) * PRE_BREAKOUT_VOLUME_MULTIPLIER:
-                        # check additional signals: smart wallets buying recently
                         smart_signal = False
-                        # very simple: check last buys by smart wallets for this mint
                         async with self.core.db_pool.acquire() as conn:
                             buys = await conn.fetch("SELECT wallet,amount,price,ts FROM wallet_buys WHERE mint=$1 ORDER BY ts DESC LIMIT 10", mint)
                             for b in buys:
                                 if await self.core.is_smart_wallet(b["wallet"]):
                                     smart_signal = True
                                     break
-                        # prepare text
                         pre = "⚡ <b>EXPLOSIÓN POST-FLAT</b> ⚡" if smart_signal else "⚡ <b>BREAKOUT POST-FLAT</b>"
                         text = (
                             f"{pre}\n\n"
@@ -453,11 +444,9 @@ class FlatDetector:
                             ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
                         ]
                         await notifier.send(text, buttons)
-                        # mark in notified tokens and remove from watchlist
                         async with self.core.db_pool.acquire() as conn:
                             await conn.execute("INSERT INTO notified_tokens(mint,kind,symbol,notified_at,meta) VALUES($1,$2,$3,$4,$5) ON CONFLICT (mint) DO UPDATE SET notified_at=EXCLUDED.notified_at, kind=EXCLUDED.kind", mint, "post_flat_breakout", symbol, now_ts(), json.dumps({"recent_avg": recent_avg}))
                         await self.remove_from_watchlist(mint)
-                # sleep
                 await asyncio.sleep(max(10, CHECK_INTERVAL_MINUTES*60//2))
             except Exception as e:
                 json_log("flat_watch_loop_error", error=str(e))
@@ -493,7 +482,6 @@ class RaydiumGraduationMonitor:
         now_ts_s = now_ts().timestamp()
         for pool in pools:
             created = None
-            # attempt to parse createdAt field
             ca = pool.get("createdAt") or pool.get("createTime") or pool.get("created_at")
             try:
                 if isinstance(ca, (int, float)):
@@ -512,7 +500,6 @@ class RaydiumGraduationMonitor:
                 continue
             if (now_ts_s - created) > RAYDIUM_GRAD_WINDOW_SECONDS:
                 continue
-            # pick a token mint from pool
             mint = None
             try:
                 tokenA = pool.get("tokenA") or pool.get("mintA") or {}
@@ -527,7 +514,6 @@ class RaydiumGraduationMonitor:
                 continue
             if not mint:
                 continue
-            # avoid repeats
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow("SELECT 1 FROM notified_tokens WHERE mint=$1 AND kind=$2", mint, "raydium_grad")
                 if row:
@@ -538,12 +524,12 @@ class RaydiumGraduationMonitor:
             if not (PUMP_PRE_GRADUATION_MIN <= mc <= PUMP_PRE_GRADUATION_MAX):
                 continue
             token_info = await self.core.dexs.token_info(mint)
-            holders = (token_info.get("token",{}).get("holders") or token_info.get("token",{}).get("holderCount")) if token_info else None
-            holders = int(holders or 0)
+            token_obj = token_info.get("token") or {}
+            holders = int(token_obj.get("holderCount") or token_obj.get("holders") or 0)
             if holders < PUMP_MIN_HOLDERS:
                 continue
-            symbol = token_info.get("token",{}).get("symbol") or "UNK"
-            name = token_info.get("token",{}).get("name") or ""
+            symbol = token_obj.get("symbol") or "UNK"
+            name = token_obj.get("name") or ""
             text = (
                 f"🔥 <b>RAYDIUM - RECIÉN GRADUADO</b>\n\n"
                 f"<b>{safe_html(symbol)}</b> {safe_html(name)}\n"
@@ -560,7 +546,7 @@ class RaydiumGraduationMonitor:
             await self.notifier.send(text, buttons)
             async with self.db_pool.acquire() as conn:
                 await conn.execute("INSERT INTO notified_tokens(mint,kind,symbol,notified_at,meta) VALUES($1,$2,$3,$4,$5) ON CONFLICT(mint) DO UPDATE SET notified_at=EXCLUDED.notified_at, kind=EXCLUDED.kind", mint, "raydium_grad", symbol, now_ts(), json.dumps({"mc": mc}))
-            await asyncio.sleep(0.1)  # gentle pacing
+            await asyncio.sleep(0.1)
 
     async def loop(self):
         self.running = True
@@ -603,7 +589,6 @@ class HeliusPumpMonitor:
         mint = msg.get("mint") or msg.get("token")
         if mint and 32 <= len(mint) <= 44:
             return mint
-        # try logs
         logs = []
         if isinstance(msg.get("params"), dict):
             logs = msg["params"].get("result", {}).get("value", {}).get("logs", []) or []
@@ -647,7 +632,6 @@ class HeliusPumpMonitor:
                             mint = self.extract_mint_from_msg(msg)
                             if not mint:
                                 continue
-                            # process
                             if self.core.cache.recently_seen(mint):
                                 continue
                             self.core.cache.mark_seen(mint)
@@ -656,8 +640,9 @@ class HeliusPumpMonitor:
                                 continue
                             if PUMP_PRE_GRADUATION_MIN <= mc <= PUMP_PRE_GRADUATION_MAX:
                                 token_info = await self.core.dexs.token_info(mint)
-                                symbol = token_info.get("token",{}).get("symbol") or "UNK"
-                                holders = int(token_info.get("token",{}).get("holderCount") or 0) if token_info else 0
+                                token_obj = token_info.get("token") or {}
+                                symbol = token_obj.get("symbol") or "UNK"
+                                holders = int(token_obj.get("holderCount") or token_obj.get("holders") or 0)
                                 if holders < PUMP_MIN_HOLDERS:
                                     continue
                                 text = (
@@ -712,9 +697,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_iniciar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    # start monitors
-    if hel i us_monitor and hasattr(helius_monitor, "start"):
-        await hel i us_monitor.start()  # noqa: intentionally guarded (if configured)
+    if helius_monitor:
+        await helius_monitor.start()
     if raydium_grad:
         await raydium_grad.start()
     if flat_detector:
@@ -724,8 +708,8 @@ async def cmd_iniciar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_detener(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    if hel i us_monitor and hasattr(helius_monitor, "stop"):
-        await hel i us_monitor.stop()  # noqa
+    if helius_monitor:
+        await helius_monitor.stop()
     if raydium_grad:
         await raydium_grad.stop()
     if flat_detector:
@@ -737,9 +721,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     running = (raydium_grad.running if raydium_grad else False)
     cnt = 0
-    async with db_pool.acquire() as conn:
-        v = await conn.fetchval("SELECT COUNT(*) FROM notified_tokens WHERE notified_at >= $1", now_ts() - timedelta(hours=24))
-        cnt = int(v or 0)
+    if db_pool:
+        async with db_pool.acquire() as conn:
+            v = await conn.fetchval("SELECT COUNT(*) FROM notified_tokens WHERE notified_at >= $1", now_ts() - timedelta(hours=24))
+            cnt = int(v or 0)
     text = (
         f"<b>📊 ESTADO v5_pro</b>\n\n"
         f"• Raydium grad monitor: {'🟢' if running else '🔴'}\n"
@@ -750,6 +735,9 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_mints_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
+        return
+    if not db_pool:
+        await update.message.reply_text("DB not ready", parse_mode="HTML")
         return
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT mint, kind, symbol, notified_at FROM notified_tokens ORDER BY notified_at DESC LIMIT 20")
@@ -782,10 +770,10 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     for r in rows:
         mint = r["mint"]
         sym = r["symbol"] or "UNK"
-        text += f"• <b>{safe_html(sym)}</b> <code>{mint[:8]}...{mint[-8:]}</code> detected {r['detected_at'].strftime('%Y-%m-%d %H:%M')}\n"
+        det = r["detected_at"]
+        text += f"• <b>{safe_html(sym)}</b> <code>{mint[:8]}...{mint[-8:]}</code> detected {det.strftime('%Y-%m-%d %H:%M')}\n"
         keyboard.append([
             InlineKeyboardButton("Dex", url=f"https://dexscreener.com/solana/{mint}"),
-            InlineKeyboardButton("Remove", url=f"https://example-remove/{mint}")  # placeholder if you add a remove action via web
         ])
     reply_markup = InlineKeyboardMarkup(keyboard)
     await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", reply_markup=reply_markup)
@@ -793,7 +781,9 @@ async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_rank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    # simple ranking: highest recent_avg / avg_vol ratio stored in meta if available
+    if not db_pool:
+        await update.message.reply_text("DB not ready", parse_mode="HTML")
+        return
     async with db_pool.acquire() as conn:
         rows = await conn.fetch("SELECT mint, symbol, meta FROM flat_watchlist")
     scored = []
@@ -844,7 +834,7 @@ async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # Initialization & startup/shutdown
 # ---------------------------
 async def init_app():
-    global telegram_app, db_pool, http_session, http_client, cache, notifier, core, flat_detector, raydium_grad, hel i us_monitor, scheduler
+    global telegram_app, db_pool, http_session, http_client, cache, notifier, core, flat_detector, raydium_grad, helius_monitor, scheduler
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN no configurado")
@@ -853,7 +843,6 @@ async def init_app():
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("TELEGRAM_CHAT_ID no configurado")
 
-    # Telegram app
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("iniciar", cmd_iniciar))
@@ -864,12 +853,10 @@ async def init_app():
     telegram_app.add_handler(CommandHandler("rank", cmd_rank))
     telegram_app.add_handler(CommandHandler("buscar", cmd_buscar))
 
-    # DB pool
     db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8)
     async with db_pool.acquire() as conn:
         await conn.execute(DB_SCHEMA)
 
-    # HTTP
     http_session = aiohttp.ClientSession()
     http_client = HttpClient(http_session)
 
@@ -879,9 +866,8 @@ async def init_app():
 
     flat_detector = FlatDetector(core, db_pool)
     raydium_grad = RaydiumGraduationMonitor(core, db_pool, notifier)
-    hel i us_monitor = HeliusPumpMonitor(HELIUS_WSS_URL, core, db_pool, notifier) if HELIUS_WSS_URL else None
+    helius_monitor = HeliusPumpMonitor(HELIUS_WSS_URL, core, db_pool, notifier) if HELIUS_WSS_URL else None
 
-    # Scheduler summary
     scheduler = AsyncIOScheduler()
     async def send_summary():
         async with db_pool.acquire() as conn:
@@ -897,18 +883,19 @@ async def on_startup():
     await init_app()
     await telegram_app.initialize()
     await telegram_app.start()
-    # auto-start monitors
-    if hel i us_monitor:
-        await hel i us_monitor.start()
-    await raydium_grad.start()
-    await flat_detector.start(notifier)
+    if helius_monitor:
+        await helius_monitor.start()
+    if raydium_grad:
+        await raydium_grad.start()
+    if flat_detector:
+        await flat_detector.start(notifier)
     json_log("monitors_started_v5_pro")
 
 @app.on_event("shutdown")
 async def on_shutdown():
     json_log("shutdown_start")
-    if hel i us_monitor:
-        await hel i us_monitor.stop()
+    if helius_monitor:
+        await helius_monitor.stop()
     if raydium_grad:
         await raydium_grad.stop()
     if flat_detector:
@@ -945,7 +932,7 @@ async def telegram_webhook(token: str, req: Request):
 
 def run_uvicorn():
     import uvicorn
-    uvicorn.run("telegram_bot_final_v5_pro:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    uvicorn.run("telegram_bot_final:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 if __name__ == "__main__":
     asyncio.run(init_app())
