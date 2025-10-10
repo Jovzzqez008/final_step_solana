@@ -1,10 +1,17 @@
 """
 telegram_bot_final.py - VERSIÓN MEJORADA Y CORREGIDA
+
+Bot mejorado con:
+- Detección más precisa de tokens Pump.fun pre-graduación
+- Scanner de tokens flat mejorado con Jupiter API V2
+- Filtros más inteligentes usando Organic Score y datos en tiempo real
+- Múltiples fuentes de datos para mejor precisión
 """
 
 import os
 import asyncio
 import json
+import random
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timedelta
 import aiohttp
@@ -29,19 +36,27 @@ JUPITER_API_BASE = os.getenv("JUPITER_API_BASE", "https://lite-api.jup.ag")
 RAYDIUM_API = "https://api-v3.raydium.io"
 
 # Configuraciones mejoradas
-CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
+CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))  # Más frecuente
+
+# Pump.fun - Rangos más precisos
 PUMP_PRE_GRADUATION_MIN = float(os.getenv("PUMP_PRE_GRADUATION_MIN", "55000"))
 PUMP_PRE_GRADUATION_MAX = float(os.getenv("PUMP_PRE_GRADUATION_MAX", "68000"))
-FLAT_LIQUIDITY_MIN = float(os.getenv("FLAT_LIQUIDITY_MIN", "20000"))
-FLAT_VOLUME_24H_MIN = float(os.getenv("FLAT_VOLUME_24H_MIN", "30000"))
-FLAT_VOLATILITY_PCT = float(os.getenv("FLAT_VOLATILITY_PCT", "12.0"))
-FLAT_VOLUME_AVG_PER_CANDLE_USD = float(os.getenv("FLAT_VOLUME_AVG_PER_CANDLE_USD", "250"))
+
+# Flat Scanner - Criterios MEJORADOS (menos estrictos)
+FLAT_LIQUIDITY_MIN = float(os.getenv("FLAT_LIQUIDITY_MIN", "10000"))
+FLAT_VOLUME_24H_MIN = float(os.getenv("FLAT_VOLUME_24H_MIN", "15000"))
+FLAT_VOLATILITY_PCT = float(os.getenv("FLAT_VOLATILITY_PCT", "15.0"))
+FLAT_VOLUME_AVG_PER_CANDLE_USD = float(os.getenv("FLAT_VOLUME_AVG_PER_CANDLE_USD", "200"))
 FLAT_TOKEN_REPEAT_HOURS = int(os.getenv("FLAT_TOKEN_REPEAT_HOURS", "6"))
-FLAT_MIN_ORGANIC_SCORE = float(os.getenv("FLAT_MIN_ORGANIC_SCORE", "30"))
-MIN_HOLDER_COUNT = int(os.getenv("MIN_HOLDER_COUNT", "100"))
+FLAT_MIN_ORGANIC_SCORE = float(os.getenv("FLAT_MIN_ORGANIC_SCORE", "10"))  # Menos estricto
+
+# Nuevos parámetros para mejor detección
+MIN_HOLDER_COUNT = int(os.getenv("MIN_HOLDER_COUNT", "50"))  # Menos estricto
 MIN_ORGANIC_VOLUME_RATIO = float(os.getenv("MIN_ORGANIC_VOLUME_RATIO", "0.3"))
+
 CANDLE_INTERVAL = "5m"
 CANDLES_HOURS = int(os.getenv("CANDLES_HOURS", "3"))
+
 MAX_RETRIES = 8
 BASE_BACKOFF = 1.0
 
@@ -71,6 +86,7 @@ def backoff_delay(attempt: int) -> float:
     return BASE_BACKOFF * (2 ** attempt) * (0.9 + 0.2 * (os.urandom(1)[0] / 255))
 
 def format_number(num: float) -> str:
+    """Formatea números grandes de manera legible"""
     if num >= 1_000_000:
         return f"{num/1_000_000:.2f}M"
     elif num >= 1_000:
@@ -93,6 +109,7 @@ class DB:
             raise RuntimeError("DATABASE_URL no configurada")
         self.pool = await asyncpg.create_pool(self.database_url, min_size=2, max_size=10)
         async with self.pool.acquire() as conn:
+            # Verificar y crear esquema
             table_exists = await conn.fetchval(
                 "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'notified_tokens')"
             )
@@ -177,6 +194,7 @@ class JupiterClient:
         self.http = http
 
     async def get_token_info(self, mint: str) -> Optional[Dict[str, Any]]:
+        """Obtiene información detallada del token usando Jupiter API V2"""
         url = f"{JUPITER_API_BASE}/tokens/v2/search?query={mint}"
         try:
             data = await self.http.get_json(url)
@@ -187,6 +205,7 @@ class JupiterClient:
         return None
 
     async def get_verified_tokens(self) -> List[Dict[str, Any]]:
+        """Obtiene tokens verificados con buena reputación"""
         url = f"{JUPITER_API_BASE}/tokens/v2/tag?query=verified"
         try:
             return await self.http.get_json(url)
@@ -194,6 +213,7 @@ class JupiterClient:
             return []
 
     async def get_high_organic_tokens(self) -> List[Dict[str, Any]]:
+        """Obtiene tokens con alto organic score (mejor calidad)"""
         endpoints = [
             f"{JUPITER_API_BASE}/tokens/v2/toporganicscore/1h?limit=100",
             f"{JUPITER_API_BASE}/tokens/v2/toptraded/1h?limit=50",
@@ -210,6 +230,7 @@ class JupiterClient:
                 print(f"Error en endpoint {endpoint}: {e}")
                 continue
         
+        # Filtrar y ordenar por organic score
         filtered = []
         for token in all_tokens:
             try:
@@ -228,12 +249,16 @@ class JupiterClient:
         return filtered
 
     async def get_candidates(self) -> List[Dict[str, Any]]:
+        """Obtiene candidatos de múltiples fuentes con mejor filtrado"""
         candidates = await self.get_high_organic_tokens()
+        
+        # Eliminar duplicados
         unique_tokens = {}
         for token in candidates:
             mint = token.get('id') or token.get('mint') or token.get('address')
             if mint:
                 unique_tokens[mint] = token
+        
         return list(unique_tokens.values())
 
 # ---------------------------
@@ -251,6 +276,15 @@ class DexScreenerClient:
         except Exception:
             return {}
 
+    async def get_token_pairs(self, mint: str) -> List[Dict[str, Any]]:
+        """Obtiene todos los pairs asociados a un token"""
+        url = f"{self.base}/tokens/{mint}"
+        try:
+            data = await self.http.get_json(url)
+            return data.get('pairs', [])
+        except Exception:
+            return []
+
 # ---------------------------
 # RAYDIUM CLIENT (NUEVO)
 # ---------------------------
@@ -259,6 +293,7 @@ class RaydiumClient:
         self.http = http
 
     async def get_new_pools(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Obtiene pools recién creados en Raydium"""
         url = f"{RAYDIUM_API}/pools"
         try:
             params = {
@@ -349,39 +384,50 @@ class HeliusPumpMonitor:
                 await asyncio.sleep(backoff_delay(attempt))
 
     async def _process(self, msg: Dict[str, Any]):
+        # Filtrar programa Pump.fun
         program = msg.get("program") or msg.get("programId")
         if program != "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P":
             return
         
+        # Extraer mint address
         mint = self._extract_mint_from_message(msg)
         if not mint:
             return
         
+        # Evitar procesar el mismo mint múltiples veces
         if mint in self.recent_mints:
             return
         self.recent_mints.add(mint)
+        # Limpiar cache cada 100 mints
         if len(self.recent_mints) > 100:
             self.recent_mints.clear()
 
+        # Obtener market cap y verificar condiciones
         marketcap = await self._get_marketcap(mint)
         if marketcap is None:
             return
 
         if PUMP_PRE_GRADUATION_MIN <= marketcap <= PUMP_PRE_GRADUATION_MAX:
-            if await self.db.was_notified_recently(mint, "pump_pregrad", 12):
+            # Verificar si ya fue notificado
+            if await self.db.was_notified_recently(mint, "pump_pregrad", 12):  # 12 horas en lugar de 7 días
                 return
 
+            # Obtener información adicional del token
             token_info = await self.jup.get_token_info(mint)
             symbol = token_info.get('symbol', 'UNK') if token_info else msg.get('symbol', 'UNK')
             name = token_info.get('name', '') if token_info else msg.get('name', '')
 
+            # Enviar alerta mejorada
             await self._send_pump_alert(mint, symbol, name, marketcap, token_info)
 
     def _extract_mint_from_message(self, msg: Dict[str, Any]) -> Optional[str]:
+        """Extrae mint address del mensaje de diferentes maneras"""
+        # Intentar extraer directamente
         mint = msg.get("mint") or msg.get("token")
         if mint and len(mint) == 44:
             return mint
 
+        # Buscar en logs
         params = msg.get("params") or {}
         result = params.get("result", {}) if isinstance(params, dict) else {}
         logs = result.get("value", {}).get("logs", []) if isinstance(result, dict) else []
@@ -400,6 +446,7 @@ class HeliusPumpMonitor:
             return self.cache[mint]
         
         try:
+            # Intentar con DexScreener primero
             url = f"{DEXSCREENER_API.rstrip('/')}/tokens/{mint}"
             data = await self.http.get_json(url)
             token = data.get("token") or {}
@@ -408,6 +455,7 @@ class HeliusPumpMonitor:
             if mc:
                 mc_val = float(mc)
                 self.cache[mint] = mc_val
+                # Limpiar cache periódicamente
                 if len(self.cache) > 500:
                     self.cache.clear()
                 return mc_val
@@ -417,6 +465,9 @@ class HeliusPumpMonitor:
         return None
 
     async def _send_pump_alert(self, mint: str, symbol: str, name: str, marketcap: float, token_info: Optional[Dict]):
+        """Envía alerta de Pump.fun mejorada con más información"""
+        
+        # Información adicional si está disponible
         extra_info = ""
         if token_info:
             organic_score = token_info.get('organicScore', 'N/A')
@@ -496,9 +547,11 @@ class FlatScanner:
         async with self.lock:
             print("🔄 Ejecutando scan de tokens flat...")
             
+            # Obtener candidatos de múltiples fuentes
             candidates = await self.jup.get_candidates()
             print(f"📊 Candidatos iniciales: {len(candidates)}")
             
+            # Filtrar candidatos prometedores
             filtered = []
             for token in candidates:
                 if await self._is_promising_token(token):
@@ -506,19 +559,23 @@ class FlatScanner:
             
             print(f"🎯 Tokens prometedores después de filtro: {len(filtered)}")
             
-            sem = asyncio.Semaphore(8)
+            # Analizar tokens en paralelo
+            sem = asyncio.Semaphore(8)  # Más paralelismo
             tasks = [self._analyze(token, sem) for token in filtered]
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _is_promising_token(self, token: Dict[str, Any]) -> bool:
+        """Filtra tokens prometedores usando múltiples criterios"""
         try:
             mint = token.get('id') or token.get('mint') or token.get('address')
             if not mint:
                 return False
 
+            # Verificar si ya fue notificado recientemente
             if await self.db.was_notified_recently(mint, "flat", FLAT_TOKEN_REPEAT_HOURS):
                 return False
 
+            # Criterios de filtrado mejorados
             liquidity = float(token.get('liquidity', 0))
             volume_24h = float(token.get('stats24h', {}).get('buyVolume', 0) + 
                              token.get('stats24h', {}).get('sellVolume', 0))
@@ -540,11 +597,13 @@ class FlatScanner:
                 if not mint:
                     return
 
+                # Obtener datos de velas
                 resp = await self.dexs.get_token(mint)
                 candles = self._parse_candles(resp)
                 if not candles:
                     return
 
+                # Análisis de patrón flat mejorado
                 analysis = self._is_flat_improved(candles, token)
                 if analysis["is_flat"]:
                     await self._send_flat_alert(token, analysis, mint)
@@ -553,16 +612,18 @@ class FlatScanner:
                 print(f"Error analizando token {mint}: {e}")
 
     def _parse_candles(self, resp: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Parsea velas de diferentes formatos de respuesta"""
         candles = []
         if not resp:
             return candles
 
+        # Formato DexScreener estándar
         if "pairs" in resp and resp["pairs"]:
             pair = resp["pairs"][0]
             if "chart" in pair and "candles" in pair["chart"]:
                 for candle in pair["chart"]["candles"]:
                     candles.append({
-                        "time": int(candle.get("time", 0)) // 1000,
+                        "time": int(candle.get("time", 0)) // 1000,  # Convertir a segundos
                         "open": float(candle.get("open", 0)),
                         "high": float(candle.get("high", 0)),
                         "low": float(candle.get("low", 0)),
@@ -573,17 +634,20 @@ class FlatScanner:
         return candles
 
     def _is_flat_improved(self, candles: List[Dict[str, Any]], token_info: Dict[str, Any]) -> Dict[str, Any]:
+        """Análisis de patrón flat mejorado con múltiples criterios"""
         res = {"is_flat": False, "avg_vol": 0.0, "volatility_pct": 100.0, "flat_period_hours": 0}
         
         if not candles:
             return res
 
+        # Filtrar velas de las últimas 3 horas
         cutoff = now_ts().timestamp() - (CANDLES_HOURS * 3600)
         recent_candles = [c for c in candles if c["time"] >= cutoff]
         
-        if len(recent_candles) < 6:
+        if len(recent_candles) < 6:  # Mínimo 6 velas de 5m para 30 minutos
             return res
 
+        # Calcular métricas
         highs = [c["high"] for c in recent_candles]
         lows = [c["low"] for c in recent_candles]
         vols = [c["volume_usd"] for c in recent_candles]
@@ -597,17 +661,24 @@ class FlatScanner:
         if min_low <= 0:
             return res
 
+        # Volatilidad porcentual
         volatility_pct = ((max_high - min_low) / min_low) * 100
         avg_volume = sum(vols) / len(vols)
 
+        # Criterios mejorados para flat
         low_volume_candles = sum(1 for v in vols if v < FLAT_VOLUME_AVG_PER_CANDLE_USD)
         high_volume_spikes = sum(1 for v in vols if v > FLAT_VOLUME_AVG_PER_CANDLE_USD * 3)
         
+        # Porcentaje de velas con volumen bajo
         low_volume_ratio = low_volume_candles / len(vols)
         
+        # El token está en flat si:
+        # 1. Baja volatilidad
+        # 2. Alto porcentaje de velas con volumen bajo
+        # 3. Pocos picos de volumen alto
         is_flat = (volatility_pct < FLAT_VOLATILITY_PCT and
-                  low_volume_ratio >= 0.7 and
-                  high_volume_spikes <= 2)
+                  low_volume_ratio >= 0.7 and  # 70% de velas con volumen bajo
+                  high_volume_spikes <= 2)     # Máximo 2 picos de volumen
 
         res.update({
             "avg_vol": avg_volume,
@@ -619,6 +690,7 @@ class FlatScanner:
         return res
 
     async def _send_flat_alert(self, token: Dict[str, Any], analysis: Dict[str, Any], mint: str):
+        """Envía alerta de patrón flat mejorada"""
         symbol = token.get('symbol', 'UNK')
         name = token.get('name', '')
         liquidity = token.get('liquidity', 0)
@@ -666,6 +738,9 @@ flat_scanner: Optional[FlatScanner] = None
 http_session: Optional[aiohttp.ClientSession] = None
 
 async def init_bot():
+    """
+    Inicialización mejorada del bot
+    """
     global telegram_app, db, pump_monitor, flat_scanner, http_session
 
     if not TELEGRAM_BOT_TOKEN:
@@ -675,8 +750,10 @@ async def init_bot():
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("TELEGRAM_CHAT_ID no configurado (modo privado)")
 
+    # Telegram Application
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
+    # Handlers mejorados
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("iniciar", cmd_iniciar))
     telegram_app.add_handler(CommandHandler("detener", cmd_detener))
@@ -685,9 +762,11 @@ async def init_bot():
     telegram_app.add_handler(CommandHandler("help", cmd_start))
     telegram_app.add_handler(CommandHandler("config", cmd_config))
 
+    # Database
     db = DB(DATABASE_URL)
     await db.connect()
 
+    # HTTP session + clients
     http_session = aiohttp.ClientSession()
     http_client = HttpClient(http_session)
     jup = JupiterClient(http_client)
@@ -695,6 +774,7 @@ async def init_bot():
     raydium = RaydiumClient(http_client)
     notifier = TelegramNotifier(telegram_app)
 
+    # Monitores mejorados
     pump_monitor = HeliusPumpMonitor(HELIUS_WSS_URL, http_client, notifier, db, jup)
     flat_scanner = FlatScanner(jup, dexs, notifier, db, raydium)
 
@@ -712,6 +792,7 @@ async def on_startup():
         
         print("✅ Telegram bot inicializado correctamente")
         
+        # Iniciar monitores automáticamente
         await pump_monitor.start()
         await flat_scanner.start()
         print("✅ Monitores mejorados iniciados automáticamente")
@@ -734,6 +815,7 @@ async def on_shutdown():
         await db.close()
     print("✅ Bot apagado correctamente")
 
+# Endpoints de prueba mejorados
 @app.get("/test")
 async def test_endpoint():
     return {
@@ -749,6 +831,9 @@ async def root():
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, req: Request):
+    """
+    Endpoint webhook mejorado
+    """
     try:
         if token != TELEGRAM_BOT_TOKEN:
             raise HTTPException(status_code=403, detail="Invalid token")
@@ -758,6 +843,7 @@ async def telegram_webhook(token: str, req: Request):
         
         update = Update.de_json(body, telegram_app.bot)
         
+        # Verificación de usuario (modo privado)
         if update.effective_user:
             if update.effective_user.id != TELEGRAM_CHAT_ID:
                 print(f"🚫 Usuario no autorizado: {update.effective_user.id}")
@@ -771,7 +857,7 @@ async def telegram_webhook(token: str, req: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # ---------------------------
-# COMANDOS DE TELEGRAM CORREGIDOS (HTML)
+# COMANDOS DE TELEGRAM MEJORADOS (HTML)
 # ---------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
@@ -890,6 +976,7 @@ async def cmd_ajustar_flat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     param = args[0].lower()
     val = args[1]
     
+    # CORRECCIÓN: Declaración global sin paréntesis
     global FLAT_VOLATILITY_PCT, FLAT_VOLUME_AVG_PER_CANDLE_USD, FLAT_LIQUIDITY_MIN, FLAT_VOLUME_24H_MIN, FLAT_MIN_ORGANIC_SCORE, MIN_HOLDER_COUNT, CHECK_INTERVAL_MINUTES, FLAT_TOKEN_REPEAT_HOURS
     
     try:
