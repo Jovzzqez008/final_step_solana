@@ -1,11 +1,5 @@
 """
 telegram_bot_final.py - VERSIÓN MEJORADA Y CORREGIDA
-
-Bot mejorado con:
-- Detección más precisa de tokens Pump.fun pre-graduación
-- Scanner de tokens flat mejorado con Jupiter API V2
-- Filtros más inteligentes usando Organic Score y datos en tiempo real
-- Múltiples fuentes de datos para mejor precisión
 """
 
 import os
@@ -36,26 +30,18 @@ RAYDIUM_API = "https://api-v3.raydium.io"
 
 # Configuraciones mejoradas
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "10"))
-
-# Pump.fun - Rangos más precisos
 PUMP_PRE_GRADUATION_MIN = float(os.getenv("PUMP_PRE_GRADUATION_MIN", "55000"))
 PUMP_PRE_GRADUATION_MAX = float(os.getenv("PUMP_PRE_GRADUATION_MAX", "68000"))
-
-# Flat Scanner - Criterios mejorados
 FLAT_LIQUIDITY_MIN = float(os.getenv("FLAT_LIQUIDITY_MIN", "20000"))
 FLAT_VOLUME_24H_MIN = float(os.getenv("FLAT_VOLUME_24H_MIN", "30000"))
 FLAT_VOLATILITY_PCT = float(os.getenv("FLAT_VOLATILITY_PCT", "12.0"))
 FLAT_VOLUME_AVG_PER_CANDLE_USD = float(os.getenv("FLAT_VOLUME_AVG_PER_CANDLE_USD", "250"))
 FLAT_TOKEN_REPEAT_HOURS = int(os.getenv("FLAT_TOKEN_REPEAT_HOURS", "6"))
 FLAT_MIN_ORGANIC_SCORE = float(os.getenv("FLAT_MIN_ORGANIC_SCORE", "30"))
-
-# Nuevos parámetros para mejor detección
 MIN_HOLDER_COUNT = int(os.getenv("MIN_HOLDER_COUNT", "100"))
 MIN_ORGANIC_VOLUME_RATIO = float(os.getenv("MIN_ORGANIC_VOLUME_RATIO", "0.3"))
-
 CANDLE_INTERVAL = "5m"
 CANDLES_HOURS = int(os.getenv("CANDLES_HOURS", "3"))
-
 MAX_RETRIES = 8
 BASE_BACKOFF = 1.0
 
@@ -85,7 +71,6 @@ def backoff_delay(attempt: int) -> float:
     return BASE_BACKOFF * (2 ** attempt) * (0.9 + 0.2 * (os.urandom(1)[0] / 255))
 
 def format_number(num: float) -> str:
-    """Formatea números grandes de manera legible"""
     if num >= 1_000_000:
         return f"{num/1_000_000:.2f}M"
     elif num >= 1_000:
@@ -192,7 +177,6 @@ class JupiterClient:
         self.http = http
 
     async def get_token_info(self, mint: str) -> Optional[Dict[str, Any]]:
-        """Obtiene información detallada del token usando Jupiter API V2"""
         url = f"{JUPITER_API_BASE}/tokens/v2/search?query={mint}"
         try:
             data = await self.http.get_json(url)
@@ -203,7 +187,6 @@ class JupiterClient:
         return None
 
     async def get_verified_tokens(self) -> List[Dict[str, Any]]:
-        """Obtiene tokens verificados con buena reputación"""
         url = f"{JUPITER_API_BASE}/tokens/v2/tag?query=verified"
         try:
             return await self.http.get_json(url)
@@ -211,7 +194,6 @@ class JupiterClient:
             return []
 
     async def get_high_organic_tokens(self) -> List[Dict[str, Any]]:
-        """Obtiene tokens con alto organic score (mejor calidad)"""
         endpoints = [
             f"{JUPITER_API_BASE}/tokens/v2/toporganicscore/1h?limit=100",
             f"{JUPITER_API_BASE}/tokens/v2/toptraded/1h?limit=50",
@@ -246,15 +228,12 @@ class JupiterClient:
         return filtered
 
     async def get_candidates(self) -> List[Dict[str, Any]]:
-        """Obtiene candidatos de múltiples fuentes con mejor filtrado"""
         candidates = await self.get_high_organic_tokens()
-        
         unique_tokens = {}
         for token in candidates:
             mint = token.get('id') or token.get('mint') or token.get('address')
             if mint:
                 unique_tokens[mint] = token
-        
         return list(unique_tokens.values())
 
 # ---------------------------
@@ -272,15 +251,6 @@ class DexScreenerClient:
         except Exception:
             return {}
 
-    async def get_token_pairs(self, mint: str) -> List[Dict[str, Any]]:
-        """Obtiene todos los pairs asociados a un token"""
-        url = f"{self.base}/tokens/{mint}"
-        try:
-            data = await self.http.get_json(url)
-            return data.get('pairs', [])
-        except Exception:
-            return []
-
 # ---------------------------
 # RAYDIUM CLIENT (NUEVO)
 # ---------------------------
@@ -289,7 +259,6 @@ class RaydiumClient:
         self.http = http
 
     async def get_new_pools(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Obtiene pools recién creados en Raydium"""
         url = f"{RAYDIUM_API}/pools"
         try:
             params = {
@@ -310,7 +279,7 @@ class TelegramNotifier:
     def __init__(self, app: Application):
         self.app = app
 
-    async def send_markdown(self, text: str):
+    async def send_message(self, text: str, parse_mode: str = "HTML"):
         if not TELEGRAM_CHAT_ID:
             print("TELEGRAM_CHAT_ID no configurado; no se envía mensaje")
             return
@@ -318,7 +287,7 @@ class TelegramNotifier:
             await self.app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID, 
                 text=text, 
-                parse_mode="Markdown", 
+                parse_mode=parse_mode,
                 disable_web_page_preview=False
             )
         except Exception as e:
@@ -463,26 +432,26 @@ class HeliusPumpMonitor:
             )
 
         text = (
-            "🚀 *ALERTA PUMP.FUN - PRE-GRADUACIÓN INMINENTE* 🚀\n\n"
-            f"*Token:* {symbol} - {name}\n"
-            f"*Market Cap:* ${marketcap:,.0f} / ${PUMP_PRE_GRADUATION_MAX:,.0f}\n\n"
-            f"*📊 Métricas Clave:*\n"
+            "🚀 <b>ALERTA PUMP.FUN - PRE-GRADUACIÓN INMINENTE</b> 🚀\n\n"
+            f"<b>Token:</b> {symbol} - {name}\n"
+            f"<b>Market Cap:</b> ${marketcap:,.0f} / ${PUMP_PRE_GRADUATION_MAX:,.0f}\n\n"
+            f"<b>📊 Métricas Clave:</b>\n"
             f"{extra_info}\n"
-            f"*📝 Mint Address:*\n"
-            f"`{mint}`\n\n"
-            "*🔗 Enlaces Rápidos:*\n"
-            f"• [DexScreener](https://dexscreener.com/solana/{mint})\n"
-            f"• [RugCheck](https://rugcheck.xyz/tokens/{mint})\n"
-            f"• [Birdeye](https://birdeye.so/token/{mint})\n"
-            f"• [Jupiter](https://jup.ag/swap/{mint}-SOL)\n\n"
-            "*💡 Análisis Rápido:*\n"
+            f"<b>📝 Mint Address:</b>\n"
+            f"<code>{mint}</code>\n\n"
+            "<b>🔗 Enlaces Rápidos:</b>\n"
+            f"• <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a>\n"
+            f"• <a href='https://rugcheck.xyz/tokens/{mint}'>RugCheck</a>\n"
+            f"• <a href='https://birdeye.so/token/{mint}'>Birdeye</a>\n"
+            f"• <a href='https://jup.ag/swap/{mint}-SOL'>Jupiter</a>\n\n"
+            "<b>💡 Análisis Rápido:</b>\n"
             "• Verifica gráfico en DexScreener\n"
             "• Revisa RugCheck para seguridad\n"
             "• Analiza volumen y liquidez\n"
             "• Considera tu estrategia de entrada/salida"
         )
         
-        await self.notifier.send_markdown(text)
+        await self.notifier.send_message(text)
         await self.db.mark_notified(mint, "pump_pregrad", symbol)
 
 # ---------------------------
@@ -658,32 +627,32 @@ class FlatScanner:
         holder_count = token.get('holderCount', 'N/A')
 
         text = (
-            "🎯 *ALERTA - PATRÓN FLAT DETECTADO* 🎯\n\n"
-            f"*Token:* {symbol} - {name}\n"
-            f"*Duración del flat:* ~{analysis['flat_period_hours']} horas\n\n"
-            "*📊 Métricas del Flat:*\n"
+            "🎯 <b>ALERTA - PATRÓN FLAT DETECTADO</b> 🎯\n\n"
+            f"<b>Token:</b> {symbol} - {name}\n"
+            f"<b>Duración del flat:</b> ~{analysis['flat_period_hours']} horas\n\n"
+            "<b>📊 Métricas del Flat:</b>\n"
             f"• Volatilidad: {analysis['volatility_pct']:.2f}%\n"
             f"• Volumen Promedio: ${analysis['avg_vol']:.2f}\n"
             f"• Liquidez: ${format_number(liquidity)}\n"
             f"• Market Cap: ${format_number(market_cap)}\n\n"
-            "*📈 Calidad del Token:*\n"
+            "<b>📈 Calidad del Token:</b>\n"
             f"• Organic Score: {organic_score}\n"
             f"• Holders: {holder_count}\n\n"
-            f"*📝 Mint Address:*\n"
-            f"`{mint}`\n\n"
-            "*🔗 Enlaces de Análisis:*\n"
-            f"• [DexScreener](https://dexscreener.com/solana/{mint})\n"
-            f"• [RugCheck](https://rugcheck.xyz/tokens/{mint})\n"
-            f"• [Birdeye](https://birdeye.so/token/{mint})\n"
-            f"• [Jupiter](https://jup.ag/swap/{mint}-SOL)\n\n"
-            "*💡 Estrategia Sugerida:*\n"
+            f"<b>📝 Mint Address:</b>\n"
+            f"<code>{mint}</code>\n\n"
+            "<b>🔗 Enlaces de Análisis:</b>\n"
+            f"• <a href='https://dexscreener.com/solana/{mint}'>DexScreener</a>\n"
+            f"• <a href='https://rugcheck.xyz/tokens/{mint}'>RugCheck</a>\n"
+            f"• <a href='https://birdeye.so/token/{mint}'>Birdeye</a>\n"
+            f"• <a href='https://jup.ag/swap/{mint}-SOL'>Jupiter</a>\n\n"
+            "<b>💡 Estrategia Sugerida:</b>\n"
             "• Token en consolidación, posible breakout\n"
             "• Verificar volumen de entrada/salida\n"
             "• Establecer stops adecuados\n"
             "• Considerar posición pequeña inicial"
         )
 
-        await self.notifier.send_markdown(text)
+        await self.notifier.send_message(text)
         await self.db.mark_notified(mint, "flat", symbol)
 
 # ---------------------------
@@ -802,45 +771,53 @@ async def telegram_webhook(token: str, req: Request):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 # ---------------------------
-# COMANDOS DE TELEGRAM MEJORADOS
+# COMANDOS DE TELEGRAM CORREGIDOS (HTML)
 # ---------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
+    
     text = (
-        "🤖 *Solana Monitor Bot - VERSIÓN MEJORADA* 🤖\n\n"
-        "*Funciones Mejoradas:*\n"
+        "🤖 <b>Solana Monitor Bot - VERSIÓN MEJORADA</b> 🤖\n\n"
+        "<b>Funciones Mejoradas:</b>\n"
         "• 🚀 Detección INTELIGENTE de tokens Pump.fun pre-graduación\n"
         "• 🎯 Scanner de tokens FLAT con filtros de calidad\n"
         "• 📊 Análisis con Jupiter API V2 y Organic Score\n"
         "• ⚡ Monitoreo en tiempo real mejorado\n\n"
-        "*Comandos Disponibles:*\n"
+        "<b>Comandos Disponibles:</b>\n"
         "/iniciar - Inicia todos los monitores\n"
         "/detener - Detiene todos los monitores\n"
         "/status - Estado y estadísticas\n"
         "/config - Ver configuración actual\n"
-        "/ajustar_flat <param> <valor> - Ajustar parámetros\n\n"
-        "*✨ Características Nuevas:*\n"
+        "/ajustar_flat &lt;param&gt; &lt;valor&gt; - Ajustar parámetros\n\n"
+        "<b>✨ Características Nuevas:</b>\n"
         "• Filtrado por Organic Score\n"
         "• Análisis de calidad de token\n"
         "• Alertas más informativas\n"
         "• Métricas mejoradas"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_iniciar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
     await pump_monitor.start()
     await flat_scanner.start()
-    await update.message.reply_text("✅ *Monitores mejorados iniciados*\n\nAhora con:\n• Filtros de calidad mejorados\n• Análisis en tiempo real\n• Métricas avanzadas", parse_mode="Markdown")
+    text = (
+        "✅ <b>Monitores mejorados iniciados</b>\n\n"
+        "Ahora con:\n"
+        "• Filtros de calidad mejorados\n"
+        "• Análisis en tiempo real\n"
+        "• Métricas avanzadas"
+    )
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_detener(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
     await pump_monitor.stop()
     await flat_scanner.stop()
-    await update.message.reply_text("⛔ *Monitores detenidos*", parse_mode="Markdown")
+    await update.message.reply_text("⛔ <b>Monitores detenidos</b>", parse_mode="HTML")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
@@ -849,71 +826,70 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cnt = await db.count_alerts_last_24h()
     
     text = (
-        f"*📊 ESTADO DEL BOT MEJORADO* 📊\n\n"
-        f"*Estado:* {'🟢 ACTIVOS' if running else '🔴 DETENIDOS'}\n"
-        f"*Alertas (24h):* {cnt}\n\n"
-        f"*🚀 PUMP.FUN MONITOR:*\n"
+        f"<b>📊 ESTADO DEL BOT MEJORADO</b> 📊\n\n"
+        f"<b>Estado:</b> {'🟢 ACTIVOS' if running else '🔴 DETENIDOS'}\n"
+        f"<b>Alertas (24h):</b> {cnt}\n\n"
+        f"<b>🚀 PUMP.FUN MONITOR:</b>\n"
         f"• Umbral: ${PUMP_PRE_GRADUATION_MIN:,.0f}–${PUMP_PRE_GRADUATION_MAX:,.0f}\n"
         f"• Estado: {'🟢 Activo' if pump_monitor and pump_monitor.running else '🔴 Inactivo'}\n\n"
-        f"*🎯 FLAT SCANNER:*\n"
+        f"<b>🎯 FLAT SCANNER:</b>\n"
         f"• Liquidez mínima: ${FLAT_LIQUIDITY_MIN:,.0f}\n"
         f"• Volumen 24h: ${FLAT_VOLUME_24H_MIN:,.0f}\n"
         f"• Volatilidad máxima: {FLAT_VOLATILITY_PCT}%\n"
         f"• Organic Score mínimo: {FLAT_MIN_ORGANIC_SCORE}\n"
         f"• Estado: {'🟢 Activo' if flat_scanner and flat_scanner.running else '🔴 Inactivo'}\n\n"
-        f"*⚡ CONFIGURACIÓN:*\n"
+        f"<b>⚡ CONFIGURACIÓN:</b>\n"
         f"• Intervalo de escaneo: {CHECK_INTERVAL_MINUTES} min\n"
         f"• Horas sin repetir: {FLAT_TOKEN_REPEAT_HOURS}h"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
     
     text = (
-        "*⚙️ CONFIGURACIÓN ACTUAL* ⚙️\n\n"
-        f"*Pump.fun Monitor:*\n"
+        "<b>⚙️ CONFIGURACIÓN ACTUAL</b> ⚙️\n\n"
+        "<b>Pump.fun Monitor:</b>\n"
         f"• Mínimo: ${PUMP_PRE_GRADUATION_MIN:,.0f}\n"
         f"• Máximo: ${PUMP_PRE_GRADUATION_MAX:,.0f}\n\n"
-        f"*Flat Scanner:*\n"
+        "<b>Flat Scanner:</b>\n"
         f"• Liquidez: ${FLAT_LIQUIDITY_MIN:,.0f}\n"
         f"• Volumen 24h: ${FLAT_VOLUME_24H_MIN:,.0f}\n"
         f"• Volatilidad: {FLAT_VOLATILITY_PCT}%\n"
         f"• Vol/vela: ${FLAT_VOLUME_AVG_PER_CANDLE_USD}\n"
         f"• Organic Score: {FLAT_MIN_ORGANIC_SCORE}\n"
         f"• Holders mín: {MIN_HOLDER_COUNT}\n\n"
-        f"*General:*\n"
+        "<b>General:</b>\n"
         f"• Intervalo: {CHECK_INTERVAL_MINUTES} min\n"
         f"• Sin repetir: {FLAT_TOKEN_REPEAT_HOURS}h\n"
         f"• Velas: {CANDLES_HOURS}h ({CANDLE_INTERVAL})"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_ajustar_flat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
     args = ctx.args or []
     if len(args) < 2:
-        await update.message.reply_text(
-            "📝 *Uso:* /ajustar_flat <parametro> <valor>\n\n"
-            "*Parámetros disponibles:*\n"
-            "• `liquidez` - Liquidez mínima\n"
-            "• `vol24h` - Volumen 24h mínimo\n" 
-            "• `volatilidad` - % máxima de volatilidad\n"
-            "• `volumen_promedio` - Volumen promedio por vela\n"
-            "• `organic_score` - Puntuación orgánica mínima\n"
-            "• `holders` - Mínimo de holders\n"
-            "• `intervalo` - Minutos entre escaneos\n"
-            "• `horas_sin_repetir` - Horas sin repetir alertas",
-            parse_mode="Markdown"
+        text = (
+            "<b>📝 Uso:</b> /ajustar_flat &lt;parametro&gt; &lt;valor&gt;\n\n"
+            "<b>Parámetros disponibles:</b>\n"
+            "• <code>liquidez</code> - Liquidez mínima\n"
+            "• <code>vol24h</code> - Volumen 24h mínimo\n" 
+            "• <code>volatilidad</code> - % máxima de volatilidad\n"
+            "• <code>volumen_promedio</code> - Volumen promedio por vela\n"
+            "• <code>organic_score</code> - Puntuación orgánica mínima\n"
+            "• <code>holders</code> - Mínimo de holders\n"
+            "• <code>intervalo</code> - Minutos entre escaneos\n"
+            "• <code>horas_sin_repetir</code> - Horas sin repetir alertas"
         )
+        await update.message.reply_text(text, parse_mode="HTML")
         return
     
     param = args[0].lower()
     val = args[1]
     
-    # CORRECCIÓN: Declaración global sin paréntesis
     global FLAT_VOLATILITY_PCT, FLAT_VOLUME_AVG_PER_CANDLE_USD, FLAT_LIQUIDITY_MIN, FLAT_VOLUME_24H_MIN, FLAT_MIN_ORGANIC_SCORE, MIN_HOLDER_COUNT, CHECK_INTERVAL_MINUTES, FLAT_TOKEN_REPEAT_HOURS
     
     try:
@@ -937,7 +913,7 @@ async def cmd_ajustar_flat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Parámetro no reconocido.")
             return
         
-        await update.message.reply_text(f"✅ `{param}` actualizado a `{val}`")
+        await update.message.reply_text(f"✅ <code>{param}</code> actualizado a <code>{val}</code>", parse_mode="HTML")
         
     except Exception:
         await update.message.reply_text("❌ Valor inválido.")
