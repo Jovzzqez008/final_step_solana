@@ -1,20 +1,15 @@
-# telegram_bot_final.py
-# Solana Monitor Bot v4.1 – Railway-ready
-# - Pump.fun pre-grad detection (Helius WSS)
-# - Flat scanner with stricter filters, Raydium + Jupiter candidates
-# - Fallback candles via Birdeye
-# - Security via RugCheck (LP lock, top holders)
-# - SQLite cache for resilience + asyncio Queue for load control
-# - Telegram UX: inline buttons, commands: start/iniciar/detener/status/config/ajustar_flat/ultimos/buscar
-# - APScheduler: resumen automático cada 8h
+# telegram_bot_final_v5_pro.py
+# Solana Monitor Bot v5_pro - Raydium graduation, Pump.fun integration, Flat watchlist,
+# Smart-wallet tracking, db persistence and commands (/mints_list, /watchlist, /rank)
 #
-# Start: python telegram_bot_final.py
-# Webhook: POST https://DOMAIN/webhook/TELEGRAM_BOT_TOKEN
+# Notes:
+# - Remove/replace API endpoints if you have private keys or alternative endpoints.
+# - Deploy in Railway/Heroku/GCP and provide env vars described in the README above.
 
 import os
 import asyncio
 import json
-import random
+import re
 import sqlite3
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta
@@ -30,59 +25,51 @@ from telegram.ext import Application, ContextTypes, CommandHandler
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ---------------------------
-# CONFIG
+# CONFIG / ENV
 # ---------------------------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL")
 DEXSCREENER_API = os.getenv("DEXSCREENER_API", "https://api.dexscreener.com/latest/dex")
-JUPITER_API_BASE = os.getenv("JUPITER_API_BASE", "https://lite-api.jup.ag")
-RAYDIUM_API = "https://api-v3.raydium.io"
-BIRDEYE_API_BASE = os.getenv("BIRDEYE_API_BASE", "https://public-api.birdeye.so")
-RUGCHECK_API_BASE = os.getenv("RUGCHECK_API_BASE", "https://api.rugcheck.xyz")
-
-DOMAIN = os.getenv("DOMAIN", "")
-PORT = int(os.getenv("PORT", "8080"))
+RAYDIUM_API = os.getenv("RAYDIUM_API", "https://api-v3.raydium.io")
+PUMPFUN_API = os.getenv("PUMPFUN_API", "")       # optional key or base url
+SOLSCAN_API = os.getenv("SOLSCAN_API", "")       # optional
+COINGECKO_API = os.getenv("COINGECKO_API", "")   # optional
+HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL", "")
 
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "5"))
+RAYDIUM_GRAD_WINDOW_SECONDS = int(os.getenv("RAYDIUM_GRAD_WINDOW_SECONDS", "120"))
 
-# Pump.fun thresholds
 PUMP_PRE_GRADUATION_MIN = float(os.getenv("PUMP_PRE_GRADUATION_MIN", "55000"))
 PUMP_PRE_GRADUATION_MAX = float(os.getenv("PUMP_PRE_GRADUATION_MAX", "68000"))
+PUMP_MIN_HOLDERS = int(os.getenv("PUMP_MIN_HOLDERS", "40"))
 
-# Flat scanner thresholds
-FLAT_LIQUIDITY_MIN = float(os.getenv("FLAT_LIQUIDITY_MIN", "15000"))
-FLAT_VOLUME_24H_MIN = float(os.getenv("FLAT_VOLUME_24H_MIN", "20000"))
-FLAT_VOLATILITY_PCT = float(os.getenv("FLAT_VOLATILITY_PCT", "15.0"))
-FLAT_VOLUME_AVG_PER_CANDLE_USD = float(os.getenv("FLAT_VOLUME_AVG_PER_CANDLE_USD", "200"))
-FLAT_TOKEN_REPEAT_HOURS = int(os.getenv("FLAT_TOKEN_REPEAT_HOURS", "4"))
-FLAT_MIN_ORGANIC_SCORE = float(os.getenv("FLAT_MIN_ORGANIC_SCORE", "15"))
-MIN_HOLDER_COUNT = int(os.getenv("MIN_HOLDER_COUNT", "75"))
-MIN_ORGANIC_VOLUME_RATIO = float(os.getenv("MIN_ORGANIC_VOLUME_RATIO", "0.2"))
-
-# Pre-breakout
 PRE_BREAKOUT_VOLUME_MULTIPLIER = float(os.getenv("PRE_BREAKOUT_VOLUME_MULTIPLIER", "2.5"))
 PRE_BREAKOUT_CANDLES_COUNT = int(os.getenv("PRE_BREAKOUT_CANDLES_COUNT", "3"))
 
-CANDLE_INTERVAL = "5m"
-CANDLES_HOURS = int(os.getenv("CANDLES_HOURS", "3"))
+CACHE_DB_PATH = os.getenv("CACHE_DB_PATH", "/data/cache_v5.db")
 
-MAX_RETRIES = 8
+MAX_RETRIES = 6
 BASE_BACKOFF = 1.0
 
 # ---------------------------
-# UTILS
+# UTILITIES
 # ---------------------------
 def now_ts() -> datetime:
     return datetime.utcnow()
+
+def iso_ts(ts: float) -> str:
+    return datetime.utcfromtimestamp(ts).isoformat() + "Z"
 
 def backoff_delay(attempt: int) -> float:
     return BASE_BACKOFF * (2 ** attempt) * (0.9 + 0.2 * (os.urandom(1)[0] / 255))
 
 def format_number(num: float) -> str:
+    try:
+        num = float(num)
+    except Exception:
+        return "N/A"
     if num >= 1_000_000:
         return f"{num/1_000_000:.2f}M"
     elif num >= 1_000:
@@ -90,121 +77,87 @@ def format_number(num: float) -> str:
     else:
         return f"{num:.2f}"
 
+def safe_html(s: str) -> str:
+    # minimal sanitizer: escape &, <, >
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def json_log(event: str, **kw):
     log = {"ts": now_ts().isoformat(), "event": event, **kw}
     print(json.dumps(log, ensure_ascii=False))
 
 # ---------------------------
-# DB: Postgres for alerts
+# POSTGRES SCHEMA
 # ---------------------------
-DB_SCHEMA_SQL = """
+DB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS notified_tokens (
     mint TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
-    notified_at TIMESTAMP WITH TIME ZONE NOT NULL,
     symbol TEXT,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    notified_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    meta JSONB
 );
-CREATE INDEX IF NOT EXISTS idx_notified_tokens_kind ON notified_tokens(kind);
-CREATE INDEX IF NOT EXISTS idx_notified_tokens_notified_at ON notified_tokens(notified_at);
+CREATE INDEX IF NOT EXISTS idx_notified_kind ON notified_tokens(kind);
+CREATE INDEX IF NOT EXISTS idx_notified_time ON notified_tokens(notified_at);
+
+CREATE TABLE IF NOT EXISTS flat_watchlist (
+    mint TEXT PRIMARY KEY,
+    symbol TEXT,
+    detected_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    flat_low REAL,
+    flat_high REAL,
+    avg_volume REAL,
+    notes TEXT,
+    meta JSONB
+);
+CREATE INDEX IF NOT EXISTS idx_flat_detected_at ON flat_watchlist(detected_at);
+
+CREATE TABLE IF NOT EXISTS smart_wallets (
+    wallet TEXT PRIMARY KEY,
+    first_seen TIMESTAMP WITH TIME ZONE NOT NULL,
+    score REAL DEFAULT 0,
+    meta JSONB
+);
+
+CREATE TABLE IF NOT EXISTS wallet_buys (
+    id BIGSERIAL PRIMARY KEY,
+    wallet TEXT,
+    mint TEXT,
+    amount REAL,
+    price REAL,
+    ts TIMESTAMP WITH TIME ZONE
+);
+CREATE INDEX IF NOT EXISTS idx_wallet_buys_wallet ON wallet_buys(wallet);
+CREATE INDEX IF NOT EXISTS idx_wallet_buys_mint ON wallet_buys(mint);
 """
 
-class DB:
-    def __init__(self, database_url: str):
-        self.database_url = database_url
-        self.pool: Optional[asyncpg.Pool] = None
-
-    async def connect(self):
-        if self.pool:
-            return
-        if not self.database_url:
-            raise RuntimeError("DATABASE_URL no configurada")
-        self.pool = await asyncpg.create_pool(self.database_url, min_size=2, max_size=10)
-        async with self.pool.acquire() as conn:
-            await conn.execute(DB_SCHEMA_SQL)
-            json_log("db_schema_ready")
-
-    async def close(self):
-        if self.pool:
-            await self.pool.close()
-            self.pool = None
-
-    async def was_notified_recently(self, mint: str, kind: str, hours: int) -> bool:
-        q = "SELECT notified_at FROM notified_tokens WHERE mint=$1 AND kind=$2"
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow(q, mint, kind)
-            if not row:
-                return False
-            return (now_ts() - row["notified_at"]) < timedelta(hours=hours)
-
-    async def mark_notified(self, mint: str, kind: str, symbol: str = None):
-        q = """
-        INSERT INTO notified_tokens(mint, kind, notified_at, symbol)
-        VALUES ($1, $2, $3, $4)
-        ON CONFLICT (mint) DO UPDATE
-          SET notified_at = EXCLUDED.notified_at, kind = EXCLUDED.kind, symbol = EXCLUDED.symbol;
-        """
-        async with self.pool.acquire() as conn:
-            await conn.execute(q, mint, kind, now_ts(), symbol)
-
-    async def count_alerts_last_24h(self) -> int:
-        q = "SELECT COUNT(*) FROM notified_tokens WHERE notified_at >= $1"
-        async with self.pool.acquire() as conn:
-            try:
-                r = await conn.fetchval(q, now_ts() - timedelta(hours=24))
-                return int(r or 0)
-            except Exception as e:
-                json_log("db_count_error", error=str(e))
-                return 0
-
-    async def last_notifications(self, limit: int = 5) -> List[asyncpg.Record]:
-        q = """SELECT mint, kind, symbol, notified_at
-               FROM notified_tokens
-               ORDER BY notified_at DESC
-               LIMIT $1"""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(q, limit)
-        return rows
-
 # ---------------------------
-# SQLite cache for resilience
+# CACHE (sqlite) for small fast storage
 # ---------------------------
 class Cache:
-    def __init__(self, path: str = "/data/cache.db"):
+    def __init__(self, path: str = CACHE_DB_PATH):
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
-        self._conn.execute("""
-        CREATE TABLE IF NOT EXISTS marketcap_cache (
-            mint TEXT PRIMARY KEY,
-            marketcap REAL,
-            updated_at TEXT
-        )""")
-        self._conn.execute("""
-        CREATE TABLE IF NOT EXISTS recent_mints (
-            mint TEXT PRIMARY KEY,
-            added_at TEXT
-        )""")
-        self._conn.commit()
+        self.conn = sqlite3.connect(self.path, check_same_thread=False)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS marketcap(mint TEXT PRIMARY KEY, mc REAL, ts TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS recent_mints(mint TEXT PRIMARY KEY, ts TEXT)")
+        self.conn.commit()
 
     def get_marketcap(self, mint: str) -> Optional[float]:
-        cur = self._conn.execute("SELECT marketcap FROM marketcap_cache WHERE mint=?", (mint,))
-        row = cur.fetchone()
-        return row[0] if row else None
+        cur = self.conn.execute("SELECT mc FROM marketcap WHERE mint=?", (mint,))
+        r = cur.fetchone()
+        return r[0] if r else None
 
     def set_marketcap(self, mint: str, mc: float):
-        self._conn.execute("REPLACE INTO marketcap_cache(mint, marketcap, updated_at) VALUES(?,?,?)",
-                           (mint, mc, now_ts().isoformat()))
-        self._conn.commit()
+        self.conn.execute("REPLACE INTO marketcap(mint,mc,ts) VALUES(?,?,?)", (mint, mc, now_ts().isoformat()))
+        self.conn.commit()
 
     def recently_seen(self, mint: str) -> bool:
-        cur = self._conn.execute("SELECT added_at FROM recent_mints WHERE mint=?", (mint,))
+        cur = self.conn.execute("SELECT 1 FROM recent_mints WHERE mint=?", (mint,))
         return cur.fetchone() is not None
 
     def mark_seen(self, mint: str):
-        self._conn.execute("REPLACE INTO recent_mints(mint, added_at) VALUES(?,?)",
-                           (mint, now_ts().isoformat()))
-        self._conn.commit()
+        self.conn.execute("REPLACE INTO recent_mints(mint,ts) VALUES(?,?)", (mint, now_ts().isoformat()))
+        self.conn.commit()
 
 # ---------------------------
 # HTTP client with retries
@@ -213,20 +166,20 @@ class HttpClient:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
 
-    async def get_json(self, url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Any:
+    async def get_json(self, url: str, params: Dict[str, Any] = None, headers: Dict[str,str] = None) -> Any:
         attempt = 0
         while attempt < MAX_RETRIES:
             try:
                 async with self.session.get(url, params=params, headers=headers, timeout=15) as resp:
                     if resp.status == 200:
                         return await resp.json()
-                    if resp.status in (429, 503, 502):
+                    if resp.status in (429, 502, 503):
                         await asyncio.sleep(backoff_delay(attempt))
                         attempt += 1
                         continue
                     text = await resp.text()
                     raise RuntimeError(f"HTTP {resp.status}: {text}")
-            except (aiohttp.ClientError, asyncio.TimeoutError):
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 await asyncio.sleep(backoff_delay(attempt))
                 attempt += 1
                 if attempt >= MAX_RETRIES:
@@ -234,70 +187,14 @@ class HttpClient:
         raise RuntimeError("Max retries exceeded")
 
 # ---------------------------
-# Jupiter client
-# ---------------------------
-class JupiterClient:
-    def __init__(self, http: HttpClient):
-        self.http = http
-
-    async def get_token_info(self, mint: str) -> Optional[Dict[str, Any]]:
-        url = f"{JUPITER_API_BASE}/tokens/v2/search?query={mint}"
-        try:
-            data = await self.http.get_json(url)
-            if isinstance(data, list) and len(data) > 0:
-                return data[0]
-        except Exception as e:
-            json_log("jup_token_error", mint=mint, error=str(e))
-        return None
-
-    async def get_high_organic_tokens(self) -> List[Dict[str, Any]]:
-        endpoints = [
-            f"{JUPITER_API_BASE}/tokens/v2/toporganicscore/1h?limit=100",
-            f"{JUPITER_API_BASE}/tokens/v2/toptraded/1h?limit=50",
-            f"{JUPITER_API_BASE}/tokens/v2/recent?limit=30"
-        ]
-        all_tokens = []
-        for endpoint in endpoints:
-            try:
-                tokens = await self.http.get_json(endpoint)
-                if isinstance(tokens, list):
-                    all_tokens.extend(tokens)
-            except Exception as e:
-                json_log("jup_endpoint_error", endpoint=endpoint, error=str(e))
-                continue
-        filtered = []
-        for token in all_tokens:
-            try:
-                organic_score = token.get('organicScore', 0)
-                liquidity = float(token.get('liquidity', 0))
-                volume_24h = float(token.get('stats24h', {}).get('buyVolume', 0) +
-                                   token.get('stats24h', {}).get('sellVolume', 0))
-                if (organic_score >= FLAT_MIN_ORGANIC_SCORE and
-                    liquidity >= FLAT_LIQUIDITY_MIN and
-                    volume_24h >= FLAT_VOLUME_24H_MIN):
-                    filtered.append(token)
-            except (ValueError, TypeError):
-                continue
-        return filtered
-
-    async def get_candidates(self) -> List[Dict[str, Any]]:
-        candidates = await self.get_high_organic_tokens()
-        unique_tokens = {}
-        for token in candidates:
-            mint = token.get('id') or token.get('mint') or token.get('address')
-            if mint:
-                unique_tokens[mint] = token
-        return list(unique_tokens.values())
-
-# ---------------------------
-# DexScreener + Birdeye fallback
+# API Clients (Dexscreener, Raydium, Pump.fun, Solscan, CoinGecko)
 # ---------------------------
 class DexScreenerClient:
-    def __init__(self, http: HttpClient, base: str):
+    def __init__(self, http: HttpClient, base: str = DEXSCREENER_API):
         self.http = http
         self.base = base.rstrip("/")
 
-    async def get_token(self, mint: str) -> Dict[str, Any]:
+    async def token_info(self, mint: str) -> Dict[str,Any]:
         url = f"{self.base}/tokens/{mint}"
         try:
             return await self.http.get_json(url)
@@ -305,88 +202,75 @@ class DexScreenerClient:
             json_log("dexs_token_error", mint=mint, error=str(e))
             return {}
 
-    async def get_token_pairs(self, mint: str) -> List[Dict[str, Any]]:
-        url = f"{self.base}/tokens/{mint}"
-        try:
-            data = await self.http.get_json(url)
-            return data.get('pairs', [])
-        except Exception:
-            return []
-
-# ---------------------------
-# Birdeye client (parcheado)
-# ---------------------------
-class BirdeyeClient:
-    def __init__(self, http: HttpClient, base: str):
+class RaydiumClient:
+    def __init__(self, http: HttpClient, base: str = RAYDIUM_API):
         self.http = http
         self.base = base.rstrip("/")
 
-    async def get_candles(self, mint: str, interval: str = "5m", limit: int = 72) -> List[Dict[str, Any]]:
-        # Evitar SOL nativo (no soportado en Birdeye)
-        if mint == "So11111111111111111111111111111111111111112":
-            return []
-        url = f"{self.base}/public/market/candles"
-        params = {"address": mint, "interval": interval, "limit": limit}
-        headers = {"accept": "application/json"}
+    async def get_new_pools(self, limit: int = 200) -> List[Dict[str,Any]]:
         try:
-            data = await self.http.get_json(url, params=params, headers=headers)
+            url = f"{self.base}/pool/list"
+            params = {"pageSize": limit, "page": 1, "sortField":"createdAt","sortType":"desc"}
+            data = await self.http.get_json(url, params=params)
             return data.get("data", []) if isinstance(data, dict) else []
         except Exception as e:
-            json_log("birdeye_candles_error", mint=mint, error=str(e))
+            json_log("raydium_pools_error", error=str(e))
             return []
 
-# ---------------------------
-# ---------------------------
-# Raydium client (parcheado)
-# ---------------------------
-class RaydiumClient:
-    def __init__(self, http: HttpClient):
+class PumpFunClient:
+    def __init__(self, http: HttpClient, base: str = PUMPFUN_API):
         self.http = http
+        self.base = base.rstrip("/") if base else ""
 
-    async def get_new_pools(self, limit: int = 50) -> List[Dict[str, Any]]:
-        """Obtiene pools recién creados en Raydium con fallback"""
+    async def token_details(self, mint: str) -> Dict[str,Any]:
+        # if no base provided, return {}
+        if not self.base:
+            return {}
         try:
-            # Endpoint estable
-            url = f"{RAYDIUM_API}/pool/list"
-            params = {"pageSize": limit, "page": 1, "sortField": "createdAt", "sortType": "desc"}
-            data = await self.http.get_json(url, params=params)
-            return data.get("data", [])
+            url = f"{self.base}/token/{mint}"
+            return await self.http.get_json(url)
         except Exception as e:
-            json_log("raydium_pools_error", error=str(e))
-            # Fallback a AMM v3
-            try:
-                url = f"{RAYDIUM_API}/ammV3/pools"
-                data = await self.http.get_json(url, params={"limit": limit})
-                return data.get("data", [])
-            except Exception as e2:
-                json_log("raydium_pools_fallback_error", error=str(e2))
-                return []
+            json_log("pump_token_error", mint=mint, error=str(e))
+            return {}
 
-# ---------------------------
-# RugCheck: LP lock & security
-# ---------------------------
-class RugCheckClient:
-    def __init__(self, http: HttpClient, base: str):
+class SolscanClient:
+    def __init__(self, http: HttpClient, base: str = SOLSCAN_API):
+        self.http = http
+        self.base = base.rstrip("/") if base else ""
+
+    async def get_token(self, mint: str) -> Dict[str,Any]:
+        if not self.base:
+            return {}
+        try:
+            url = f"{self.base}/token/meta?tokenAddress={mint}"
+            return await self.http.get_json(url)
+        except Exception as e:
+            json_log("solscan_token_error", mint=mint, error=str(e))
+            return {}
+
+class CoinGeckoClient:
+    def __init__(self, http: HttpClient, base: str = "https://api.coingecko.com/api/v3"):
         self.http = http
         self.base = base.rstrip("/")
 
-    async def get_security(self, mint: str) -> Dict[str, Any]:
-        url = f"{self.base}/tokens/{mint}"
+    async def find_listing(self, symbol_or_name: str) -> Dict[str,Any]:
+        # simple search endpoint, not guaranteed
         try:
-            data = await self.http.get_json(url)
-            return data if isinstance(data, dict) else {}
+            url = f"{self.base}/search"
+            data = await self.http.get_json(url, params={"query": symbol_or_name})
+            return data
         except Exception as e:
-            json_log("rugcheck_error", mint=mint, error=str(e))
+            json_log("cg_search_error", q=symbol_or_name, error=str(e))
             return {}
 
 # ---------------------------
-# Notifier (Telegram)
+# Notifier (Telegram) — HTML safe
 # ---------------------------
 class TelegramNotifier:
-    def __init__(self, app: Application):
+    def __init__(self, app):
         self.app = app
 
-    async def send_message(self, text: str, buttons: Optional[List[Tuple[str,str]]] = None):
+    async def send(self, text: str, buttons: Optional[List[Tuple[str,str]]] = None):
         if not TELEGRAM_CHAT_ID:
             json_log("tg_no_chat_id")
             return
@@ -395,54 +279,302 @@ class TelegramNotifier:
             if buttons:
                 keyboard = [[InlineKeyboardButton(lbl, url=url)] for (lbl, url) in buttons]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-            await self.app.bot.send_message(
-                chat_id=TELEGRAM_CHAT_ID,
-                text=text,
-                parse_mode="HTML",
-                disable_web_page_preview=False,
-                reply_markup=reply_markup
-            )
+            await self.app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", disable_web_page_preview=False, reply_markup=reply_markup)
         except Exception as e:
             json_log("tg_send_error", error=str(e))
 
 # ---------------------------
-# Queue for analysis
+# Core monitors
 # ---------------------------
-class AnalysisQueue:
-    def __init__(self, maxsize: int = 300):
-        self.queue = asyncio.Queue(maxsize=maxsize)
-
-    async def push(self, item: Dict[str, Any]):
-        try:
-            await self.queue.put(item)
-        except asyncio.QueueFull:
-            json_log("queue_full")
-
-    async def pop(self) -> Dict[str, Any]:
-        item = await self.queue.get()
-        self.queue.task_done()
-        return item
-
-# ---------------------------
-# Pump.fun monitor
-# ---------------------------
-class HeliusPumpMonitor:
-    def __init__(self, wss_url: str, http: HttpClient, notifier: TelegramNotifier, db: DB, jup: JupiterClient, cache: Cache):
-        self.wss_url = wss_url
+class MonitorCore:
+    def __init__(self, http: HttpClient, db_pool, cache: Cache, notifier: TelegramNotifier):
         self.http = http
-        self.notifier = notifier
-        self.db = db
-        self.jup = jup
+        self.db_pool = db_pool
         self.cache = cache
+        self.notifier = notifier
+        self.dexs = DexScreenerClient(http)
+        self.raydium = RaydiumClient(http)
+        self.pumpfun = PumpFunClient(http)
+        self.solscan = SolscanClient(http)
+        self.cg = CoinGeckoClient(http)
+
+    async def get_marketcap(self, mint: str) -> Optional[float]:
+        mc = self.cache.get_marketcap(mint)
+        if mc is not None:
+            return mc
+        try:
+            data = await self.dexs.token_info(mint)
+            token = data.get("token") or {}
+            mc = token.get("marketCapUsd") or token.get("marketCap")
+            if mc:
+                mc = float(mc)
+                self.cache.set_marketcap(mint, mc)
+                return mc
+        except Exception:
+            pass
+        return None
+
+    async def record_wallet_buy(self, wallet: str, mint: str, amount: float, price: float):
+        q = "INSERT INTO wallet_buys(wallet,mint,amount,price,ts) VALUES($1,$2,$3,$4,$5)"
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(q, wallet, mint, amount, price, now_ts())
+
+    async def mark_smart_wallet(self, wallet: str, score: float = 1.0, meta: Dict = None):
+        q = "INSERT INTO smart_wallets(wallet,first_seen,score,meta) VALUES($1,$2,$3,$4) ON CONFLICT (wallet) DO UPDATE SET score=smart_wallets.score + EXCLUDED.score"
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(q, wallet, now_ts(), score, json.dumps(meta or {}))
+
+    async def is_smart_wallet(self, wallet: str) -> bool:
+        q = "SELECT score FROM smart_wallets WHERE wallet=$1"
+        async with self.db_pool.acquire() as conn:
+            r = await conn.fetchrow(q, wallet)
+            return bool(r and r.get("score", 0) >= 1.0)
+
+# ---------------------------
+# Flat detector + Watchlist
+# ---------------------------
+class FlatDetector:
+    def __init__(self, core: MonitorCore, db_pool):
+        self.core = core
+        self.db_pool = db_pool
+        self.watch_check_task: Optional[asyncio.Task] = None
+        self.running = False
+
+    def candles_parse_dexs(self, dexs_resp: Dict[str,Any]) -> List[Dict[str,Any]]:
+        candles = []
+        if not dexs_resp:
+            return candles
+        pairs = dexs_resp.get("pairs", [])
+        if not pairs:
+            return candles
+        chart = pairs[0].get("chart", {})
+        for c in chart.get("candles", []):
+            try:
+                t = int(c.get("time", 0))//1000
+                candles.append({
+                    "time": t,
+                    "open": float(c.get("open",0)),
+                    "high": float(c.get("high",0)),
+                    "low": float(c.get("low",0)),
+                    "close": float(c.get("close",0)),
+                    "volume_usd": float(c.get("volumeUsd",0) or c.get("volumeUsd",0))
+                })
+            except Exception:
+                continue
+        return candles
+
+    def analyze_flat(self, candles: List[Dict[str,Any]]) -> Optional[Dict[str,Any]]:
+        if not candles or len(candles) < 12:
+            return None
+        recent = candles[-(12*int(max(1, (60//5)))):]  # at least ~1h of 5m candles
+        highs = [c["high"] for c in recent]
+        lows = [c["low"] for c in recent]
+        vols = [c["volume_usd"] for c in recent]
+        if not highs or not lows or min(lows) <= 0:
+            return None
+        volatility_pct = ((max(highs) - min(lows)) / min(lows)) * 100
+        avg_vol = sum(vols)/len(vols)
+        low_vol_ratio = sum(1 for v in vols if v < avg_vol*0.7) / len(vols)
+        # heuristic: low vol, low volatility -> flat
+        if volatility_pct < 12.0 and low_vol_ratio >= 0.6:
+            flat_low = min(lows)
+            flat_high = max(highs)
+            return {"is_flat": True, "flat_low": flat_low, "flat_high": flat_high, "avg_vol": avg_vol, "volatility_pct": volatility_pct}
+        return None
+
+    async def add_to_watchlist(self, mint: str, symbol: str, flat: Dict[str,Any], meta: Dict = None):
+        q = """
+        INSERT INTO flat_watchlist(mint,symbol,detected_at,flat_low,flat_high,avg_volume,notes,meta)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8)
+        ON CONFLICT (mint) DO UPDATE SET detected_at=EXCLUDED.detected_at, flat_low=EXCLUDED.flat_low, flat_high=EXCLUDED.flat_high, avg_volume=EXCLUDED.avg_volume, meta=EXCLUDED.meta
+        """
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(q, mint, symbol, now_ts(), flat["flat_low"], flat["flat_high"], flat["avg_vol"], json.dumps(meta or {}), json.dumps(meta or {}))
+
+    async def remove_from_watchlist(self, mint: str):
+        q = "DELETE FROM flat_watchlist WHERE mint=$1"
+        async with self.db_pool.acquire() as conn:
+            await conn.execute(q, mint)
+
+    async def get_watchlist(self, limit:int=50) -> List[asyncpg.Record]:
+        q = "SELECT * FROM flat_watchlist ORDER BY detected_at DESC LIMIT $1"
+        async with self.db_pool.acquire() as conn:
+            rows = await conn.fetch(q, limit)
+            return rows
+
+    async def watch_loop(self, notifier: TelegramNotifier):
+        self.running = True
+        while self.running:
+            try:
+                # scan watchlist and re-evaluate if breakout occurred
+                rows = await self.get_watchlist(limit=200)
+                for r in rows:
+                    mint = r["mint"]
+                    symbol = r["symbol"] or "UNK"
+                    avg_vol = float(r["avg_volume"] or 0)
+                    flat_low = float(r["flat_low"] or 0)
+                    flat_high = float(r["flat_high"] or 0)
+                    # fetch current candles
+                    dexs = await self.core.dexs.token_info(mint)
+                    candles = self.candles_parse_dexs(dexs)
+                    if not candles:
+                        continue
+                    latest = candles[-1]
+                    recent_vols = [c["volume_usd"] for c in candles[-PRE_BREAKOUT_CANDLES_COUNT:]] if PRE_BREAKOUT_CANDLES_COUNT <= len(candles) else [c["volume_usd"] for c in candles[-3:]]
+                    recent_avg = sum(recent_vols)/len(recent_vols)
+                    price = latest["close"]
+                    # breakout condition: price > flat_high AND recent volume > avg_vol * multiplier
+                    if price > flat_high and recent_avg > float(avg_vol) * PRE_BREAKOUT_VOLUME_MULTIPLIER:
+                        # check additional signals: smart wallets buying recently
+                        smart_signal = False
+                        # very simple: check last buys by smart wallets for this mint
+                        async with self.core.db_pool.acquire() as conn:
+                            buys = await conn.fetch("SELECT wallet,amount,price,ts FROM wallet_buys WHERE mint=$1 ORDER BY ts DESC LIMIT 10", mint)
+                            for b in buys:
+                                if await self.core.is_smart_wallet(b["wallet"]):
+                                    smart_signal = True
+                                    break
+                        # prepare text
+                        pre = "⚡ <b>EXPLOSIÓN POST-FLAT</b> ⚡" if smart_signal else "⚡ <b>BREAKOUT POST-FLAT</b>"
+                        text = (
+                            f"{pre}\n\n"
+                            f"<b>{safe_html(symbol)}</b>\n"
+                            f"• Price: {price}\n"
+                            f"• Flat range: {flat_low:.6f} - {flat_high:.6f}\n"
+                            f"• Avg vol (flat): ${format_number(avg_vol)}\n"
+                            f"• Vol recientes: ${format_number(recent_avg)}\n"
+                            f"\n<b>Mint:</b>\n<code>{mint}</code>\n"
+                        )
+                        if smart_signal:
+                            text += "\n<b>Smart money detected</b> — wallets with good history have bought.\n"
+                        buttons = [
+                            ("DexScreener", f"https://dexscreener.com/solana/{mint}"),
+                            ("RugCheck", f"https://rugcheck.xyz/tokens/{mint}"),
+                            ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
+                        ]
+                        await notifier.send(text, buttons)
+                        # mark in notified tokens and remove from watchlist
+                        async with self.core.db_pool.acquire() as conn:
+                            await conn.execute("INSERT INTO notified_tokens(mint,kind,symbol,notified_at,meta) VALUES($1,$2,$3,$4,$5) ON CONFLICT (mint) DO UPDATE SET notified_at=EXCLUDED.notified_at, kind=EXCLUDED.kind", mint, "post_flat_breakout", symbol, now_ts(), json.dumps({"recent_avg": recent_avg}))
+                        await self.remove_from_watchlist(mint)
+                # sleep
+                await asyncio.sleep(max(10, CHECK_INTERVAL_MINUTES*60//2))
+            except Exception as e:
+                json_log("flat_watch_loop_error", error=str(e))
+                await asyncio.sleep(5)
+
+    async def start(self, notifier: TelegramNotifier):
+        if self.watch_check_task and not self.watch_check_task.done():
+            return
+        self.watch_check_task = asyncio.create_task(self.watch_loop(notifier))
+
+    async def stop(self):
+        self.running = False
+        if self.watch_check_task:
+            self.watch_check_task.cancel()
+            try:
+                await self.watch_check_task
+            except Exception:
+                pass
+
+# ---------------------------
+# Raydium graduation monitor (first X seconds)
+# ---------------------------
+class RaydiumGraduationMonitor:
+    def __init__(self, core: MonitorCore, db_pool, notifier: TelegramNotifier):
+        self.core = core
+        self.db_pool = db_pool
+        self.notifier = notifier
         self.running = False
         self.task: Optional[asyncio.Task] = None
 
-    async def start(self):
-        if self.running or not self.wss_url:
-            return
+    async def check_once(self):
+        pools = await self.core.raydium.get_new_pools(limit=200)
+        now_ts_s = now_ts().timestamp()
+        for pool in pools:
+            created = None
+            # attempt to parse createdAt field
+            ca = pool.get("createdAt") or pool.get("createTime") or pool.get("created_at")
+            try:
+                if isinstance(ca, (int, float)):
+                    created = float(ca)
+                elif isinstance(ca, str) and ca.isdigit():
+                    created = float(ca)
+                elif isinstance(ca, str):
+                    try:
+                        dt = datetime.fromisoformat(ca.replace("Z","+00:00"))
+                        created = dt.timestamp()
+                    except Exception:
+                        created = None
+            except Exception:
+                created = None
+            if not created:
+                continue
+            if (now_ts_s - created) > RAYDIUM_GRAD_WINDOW_SECONDS:
+                continue
+            # pick a token mint from pool
+            mint = None
+            try:
+                tokenA = pool.get("tokenA") or pool.get("mintA") or {}
+                tokenB = pool.get("tokenB") or pool.get("mintB") or {}
+                for t in (tokenA, tokenB):
+                    if isinstance(t, dict):
+                        cand = t.get("address") or t.get("mint")
+                        if cand and len(cand) >= 32:
+                            mint = cand
+                            break
+            except Exception:
+                continue
+            if not mint:
+                continue
+            # avoid repeats
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow("SELECT 1 FROM notified_tokens WHERE mint=$1 AND kind=$2", mint, "raydium_grad")
+                if row:
+                    continue
+            mc = await self.core.get_marketcap(mint)
+            if mc is None:
+                continue
+            if not (PUMP_PRE_GRADUATION_MIN <= mc <= PUMP_PRE_GRADUATION_MAX):
+                continue
+            token_info = await self.core.dexs.token_info(mint)
+            holders = (token_info.get("token",{}).get("holders") or token_info.get("token",{}).get("holderCount")) if token_info else None
+            holders = int(holders or 0)
+            if holders < PUMP_MIN_HOLDERS:
+                continue
+            symbol = token_info.get("token",{}).get("symbol") or "UNK"
+            name = token_info.get("token",{}).get("name") or ""
+            text = (
+                f"🔥 <b>RAYDIUM - RECIÉN GRADUADO</b>\n\n"
+                f"<b>{safe_html(symbol)}</b> {safe_html(name)}\n"
+                f"<b>MC:</b> ${mc:,.0f}\n"
+                f"• Holders: {holders}\n\n"
+                f"<b>Mint:</b>\n<code>{mint}</code>\n"
+                f"• Graduado en Raydium (ventana {RAYDIUM_GRAD_WINDOW_SECONDS}s)"
+            )
+            buttons = [
+                ("DexScreener", f"https://dexscreener.com/solana/{mint}"),
+                ("RugCheck", f"https://rugcheck.xyz/tokens/{mint}"),
+                ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
+            ]
+            await self.notifier.send(text, buttons)
+            async with self.db_pool.acquire() as conn:
+                await conn.execute("INSERT INTO notified_tokens(mint,kind,symbol,notified_at,meta) VALUES($1,$2,$3,$4,$5) ON CONFLICT(mint) DO UPDATE SET notified_at=EXCLUDED.notified_at, kind=EXCLUDED.kind", mint, "raydium_grad", symbol, now_ts(), json.dumps({"mc": mc}))
+            await asyncio.sleep(0.1)  # gentle pacing
+
+    async def loop(self):
         self.running = True
-        self.task = asyncio.create_task(self._loop())
-        json_log("pump_monitor_started")
+        while self.running:
+            try:
+                await self.check_once()
+            except Exception as e:
+                json_log("raydium_grad_loop_error", error=str(e))
+            await asyncio.sleep(max(5, CHECK_INTERVAL_MINUTES*60//3))
+
+    async def start(self):
+        if self.task and not self.task.done():
+            return
+        self.task = asyncio.create_task(self.loop())
 
     async def stop(self):
         self.running = False
@@ -450,66 +582,32 @@ class HeliusPumpMonitor:
             self.task.cancel()
             try:
                 await self.task
-            except asyncio.CancelledError:
+            except Exception:
                 pass
-        json_log("pump_monitor_stopped")
 
-    async def _loop(self):
-        attempt = 0
-        while self.running:
-            try:
-                async with websockets.connect(self.wss_url, ping_interval=30, ping_timeout=10) as ws:
-                    attempt = 0
-                    json_log("wss_connected")
-                    async for raw in ws:
-                        if not self.running:
-                            break
-                        try:
-                            msg = json.loads(raw)
-                            await self._process(msg)
-                        except Exception as e:
-                            json_log("wss_msg_error", error=str(e))
-                            continue
-            except Exception as e:
-                attempt += 1
-                json_log("wss_connect_error", attempt=attempt, error=str(e))
-                await asyncio.sleep(backoff_delay(attempt))
+# ---------------------------
+# Helius pump monitor (optional) — listens to WSS for mints
+# ---------------------------
+class HeliusPumpMonitor:
+    def __init__(self, wss_url: str, core: MonitorCore, db_pool, notifier: TelegramNotifier):
+        self.wss_url = wss_url
+        self.core = core
+        self.db_pool = db_pool
+        self.notifier = notifier
+        self.running = False
+        self.task: Optional[asyncio.Task] = None
 
-    async def _process(self, msg: Dict[str, Any]):
-        program = msg.get("program") or msg.get("programId")
-        if program != "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P":
-            return
-        mint = self._extract_mint_from_message(msg)
-        if not mint:
-            return
-        if self.cache.recently_seen(mint):
-            return
-        self.cache.mark_seen(mint)
-
-        marketcap = await self._get_marketcap(mint)
-        if marketcap is None:
-            return
-
-        if PUMP_PRE_GRADUATION_MIN <= marketcap <= PUMP_PRE_GRADUATION_MAX:
-            if await self.db.was_notified_recently(mint, "pump_pregrad", 8):
-                return
-            token_info = await self.jup.get_token_info(mint)
-            symbol = token_info.get('symbol', 'UNK') if token_info else msg.get('symbol', 'UNK')
-            name = token_info.get('name', '') if token_info else msg.get('name', '')
-            if await self._is_fake_token(mint, token_info):
-                json_log("pump_fake_filtered", mint=mint, symbol=symbol)
-                return
-            await self._send_pump_alert(mint, symbol, name, marketcap, token_info)
-
-    def _extract_mint_from_message(self, msg: Dict[str, Any]) -> Optional[str]:
+    def extract_mint_from_msg(self, msg: Dict[str,Any]) -> Optional[str]:
+        if not msg:
+            return None
         mint = msg.get("mint") or msg.get("token")
         if mint and 32 <= len(mint) <= 44:
             return mint
-        params = msg.get("params") or {}
-        result = params.get("result", {}) if isinstance(params, dict) else {}
-        logs = result.get("value", {}).get("logs", []) if isinstance(result, dict) else []
+        # try logs
+        logs = []
+        if isinstance(msg.get("params"), dict):
+            logs = msg["params"].get("result", {}).get("value", {}).get("logs", []) or []
         if logs:
-            import re
             combined = " ".join(logs)
             matches = re.findall(r'[1-9A-HJ-NP-Za-km-z]{32,44}', combined)
             for m in matches:
@@ -517,550 +615,236 @@ class HeliusPumpMonitor:
                     return m
         return None
 
-    async def _get_marketcap(self, mint: str) -> Optional[float]:
-        cached = self.cache.get_marketcap(mint)
-        if cached is not None:
-            return cached
-        try:
-            url = f"{DEXSCREENER_API.rstrip('/')}/tokens/{mint}"
-            data = await self.http.get_json(url)
-            token = data.get("token") or {}
-            mc = token.get("marketCapUsd")
-            if mc:
-                mc_val = float(mc)
-                self.cache.set_marketcap(mint, mc_val)
-                return mc_val
-        except Exception:
-            pass
-        return None
-
-    async def _is_fake_token(self, mint: str, token_info: Optional[Dict]) -> bool:
-        if not token_info:
-            return False
-        audit = token_info.get('audit', {})
-        mint_disabled = audit.get('mintAuthorityDisabled', False)
-        freeze_disabled = audit.get('freezeAuthorityDisabled', False)
-        holder_count = token_info.get('holderCount', 0)
-        liquidity = token_info.get('liquidity', 0)
-        if not mint_disabled:
-            return True
-        if holder_count < 50:
-            return True
-        if liquidity < 5000:
-            return True
-        return False
-
-    async def _send_pump_alert(self, mint: str, symbol: str, name: str, marketcap: float, token_info: Optional[Dict]):
-        organic_score = token_info.get('organicScore', 'N/A') if token_info else 'N/A'
-        holder_count = token_info.get('holderCount', 'N/A') if token_info else 'N/A'
-        liquidity = token_info.get('liquidity', 0) if token_info else 0
-        volume_24h = 0
-        if token_info and token_info.get('stats24h'):
-            volume_24h = token_info['stats24h'].get('buyVolume', 0) + token_info['stats24h'].get('sellVolume', 0)
-        audit = token_info.get('audit', {}) if token_info else {}
-        mint_disabled = audit.get('mintAuthorityDisabled', False)
-        freeze_disabled = audit.get('freezeAuthorityDisabled', False)
-        top_holders_pct = audit.get('topHoldersPercentage', 'N/A')
-
-        text = (
-            f"🚀 <b>PUMP.FUN - PRE-GRAD</b>\n\n"
-            f"<b>{symbol}</b> {name}\n"
-            f"<b>MC:</b> ${marketcap:,.0f} / ${PUMP_PRE_GRADUATION_MAX:,.0f}\n\n"
-            f"<b>📊 Métricas:</b>\n"
-            f"• Organic: {organic_score}\n"
-            f"• Holders: {holder_count}\n"
-            f"• Liq: ${format_number(liquidity)}\n"
-            f"• Vol 24h: ${format_number(volume_24h)}\n\n"
-            f"<b>🛡️ Seguridad:</b>\n"
-            f"• Mint Revocada: {'✅' if mint_disabled else '❌'}\n"
-            f"• Freeze Revocado: {'✅' if freeze_disabled else '❌'}\n"
-            f"• Top Holders: {top_holders_pct}%\n\n"
-            f"<b>Mint:</b>\n<code>{mint}</code>"
-        )
-        buttons = [
-            ("DexScreener", f"https://dexscreener.com/solana/{mint}"),
-            ("RugCheck", f"https://rugcheck.xyz/tokens/{mint}"),
-            ("Birdeye", f"https://birdeye.so/token/{mint}"),
-            ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
-        ]
-        await self.notifier.send_message(text, buttons)
-        await self.db.mark_notified(mint, "pump_pregrad", symbol)
-
-# ---------------------------
-# Flat scanner with queue + filters + RugCheck + Birdeye fallback
-# ---------------------------
-class FlatScanner:
-    def __init__(self, jup: JupiterClient, dexs: DexScreenerClient, notifier: TelegramNotifier, db: DB,
-                 raydium: RaydiumClient, birdeye: BirdeyeClient, rugcheck: RugCheckClient, analysis_queue: AnalysisQueue):
-        self.jup = jup
-        self.dexs = dexs
-        self.notifier = notifier
-        self.db = db
-        self.raydium = raydium
-        self.birdeye = birdeye
-        self.rugcheck = rugcheck
-        self.q = analysis_queue
-        self.running = False
-        self.task: Optional[asyncio.Task] = None
-        self.worker_task: Optional[asyncio.Task] = None
-
     async def start(self):
-        if self.running:
+        if not self.wss_url:
+            return
+        if self.task and not self.task.done():
             return
         self.running = True
-        self.task = asyncio.create_task(self._producer_loop())
-        self.worker_task = asyncio.create_task(self._worker_loop())
-        json_log("flat_scanner_started")
+        self.task = asyncio.create_task(self._loop())
 
     async def stop(self):
         self.running = False
         if self.task:
             self.task.cancel()
-        if self.worker_task:
-            self.worker_task.cancel()
-        try:
-            if self.task:
+            try:
                 await self.task
-            if self.worker_task:
-                await self.worker_task
-        except asyncio.CancelledError:
-            pass
-        json_log("flat_scanner_stopped")
+            except Exception:
+                pass
 
-    async def _producer_loop(self):
+    async def _loop(self):
+        attempt = 0
         while self.running:
             try:
-                await self.scan_once()
+                async with websockets.connect(self.wss_url, ping_interval=30, ping_timeout=10) as ws:
+                    attempt = 0
+                    json_log("helius_wss_connected")
+                    async for raw in ws:
+                        if not self.running:
+                            break
+                        try:
+                            msg = json.loads(raw)
+                            mint = self.extract_mint_from_msg(msg)
+                            if not mint:
+                                continue
+                            # process
+                            if self.core.cache.recently_seen(mint):
+                                continue
+                            self.core.cache.mark_seen(mint)
+                            mc = await self.core.get_marketcap(mint)
+                            if mc is None:
+                                continue
+                            if PUMP_PRE_GRADUATION_MIN <= mc <= PUMP_PRE_GRADUATION_MAX:
+                                token_info = await self.core.dexs.token_info(mint)
+                                symbol = token_info.get("token",{}).get("symbol") or "UNK"
+                                holders = int(token_info.get("token",{}).get("holderCount") or 0) if token_info else 0
+                                if holders < PUMP_MIN_HOLDERS:
+                                    continue
+                                text = (
+                                    f"🚀 <b>PUMP.FUN - PRE-GRAD</b>\n\n"
+                                    f"<b>{safe_html(symbol)}</b>\n"
+                                    f"<b>MC:</b> ${mc:,.0f}\n"
+                                    f"• Holders: {holders}\n\n"
+                                    f"<b>Mint:</b>\n<code>{mint}</code>"
+                                )
+                                buttons = [
+                                    ("DexScreener", f"https://dexscreener.com/solana/{mint}"),
+                                    ("RugCheck", f"https://rugcheck.xyz/tokens/{mint}"),
+                                    ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
+                                ]
+                                await self.notifier.send(text, buttons)
+                                async with self.db_pool.acquire() as conn:
+                                    await conn.execute("INSERT INTO notified_tokens(mint,kind,symbol,notified_at,meta) VALUES($1,$2,$3,$4,$5) ON CONFLICT (mint) DO UPDATE SET notified_at=EXCLUDED.notified_at, kind=EXCLUDED.kind", mint, "pump_pregrad", symbol, now_ts(), json.dumps({"mc": mc}))
+                        except Exception as e:
+                            json_log("helius_msg_error", error=str(e))
+                            continue
             except Exception as e:
-                json_log("flat_scan_error", error=str(e))
-            await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
-
-    async def _worker_loop(self):
-        sem = asyncio.Semaphore(8)
-        while self.running:
-            item = await self.q.pop()
-            async with sem:
-                try:
-                    await self._analyze(item)
-                except Exception as e:
-                    json_log("flat_analyze_error", error=str(e))
-
-    async def scan_once(self):
-        json_log("scan_start")
-        jup_candidates = await self.jup.get_candidates()
-        raydium_pools = await self.raydium.get_new_pools()
-        raydium_candidates = []
-        for pool in raydium_pools:
-            mint = pool.get('mintA', {}).get('address')
-            if mint:
-                token_info = await self.jup.get_token_info(mint)
-                if token_info:
-                    raydium_candidates.append(token_info)
-        all_candidates = {}
-        for token in jup_candidates + raydium_candidates:
-            token_mint = token.get('id') or token.get('mint') or token.get('address')
-            if token_mint:
-                all_candidates[token_mint] = token
-        candidates = list(all_candidates.values())
-
-        filtered = []
-        for token in candidates:
-            if await self._is_promising_token(token):
-                filtered.append(token)
-        json_log("scan_filtered", count=len(filtered))
-        for token in filtered:
-            await self.q.push(token)
-
-    async def _is_promising_token(self, token: Dict[str, Any]) -> bool:
-        """Filtros mejorados para tokens flat"""
-        try:
-            mint = token.get('id') or token.get('mint') or token.get('address')
-            if not mint:
-                return False
-
-            if await self.db.was_notified_recently(mint, "flat", FLAT_TOKEN_REPEAT_HOURS):
-                return False
-
-            liquidity = float(token.get('liquidity', 0))
-            volume_24h = float(token.get('stats24h', {}).get('buyVolume', 0) +
-                               token.get('stats24h', {}).get('sellVolume', 0))
-            organic_score = token.get('organicScore', 0)
-            holder_count = token.get('holderCount', 0)
-
-            # Ratio buys/sells
-            buys = token.get('stats24h', {}).get('buys', 0)
-            sells = token.get('stats24h', {}).get('sells', 0)
-            total_trades = buys + sells
-            if total_trades > 0:
-                buy_ratio = buys / total_trades
-                if buy_ratio < 0.35 or buy_ratio > 0.65:
-                    return False
-
-            # Seguridad
-            audit = token.get('audit', {})
-            mint_disabled = audit.get('mintAuthorityDisabled', False)
-            top_holders_pct = audit.get('topHoldersPercentage', 100)
-
-            return (
-                liquidity >= FLAT_LIQUIDITY_MIN and
-                volume_24h >= FLAT_VOLUME_24H_MIN and
-                organic_score >= FLAT_MIN_ORGANIC_SCORE and
-                holder_count >= MIN_HOLDER_COUNT and
-                mint_disabled and
-                top_holders_pct < 25
-            )
-        except (ValueError, TypeError):
-            return False
-
-    def _parse_candles_dexs(self, resp: Dict[str, Any]) -> List[Dict[str, Any]]:
-        candles = []
-        if not resp:
-            return candles
-        if "pairs" in resp and resp["pairs"]:
-            pair = resp["pairs"][0]
-            chart = pair.get("chart", {})
-            for candle in chart.get("candles", []):
-                candles.append({
-                    "time": int(candle.get("time", 0)) // 1000,
-                    "open": float(candle.get("open", 0)),
-                    "high": float(candle.get("high", 0)),
-                    "low": float(candle.get("low", 0)),
-                    "close": float(candle.get("close", 0)),
-                    "volume_usd": float(candle.get("volumeUsd", 0)),
-                })
-        return candles
-
-    def _is_flat_improved(self, candles: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Flat con duración mínima y pre‑ruptura"""
-        res = {"is_flat": False, "avg_vol": 0.0, "volatility_pct": 100.0,
-               "flat_period_hours": CANDLES_HOURS, "pre_breakout": False, "recent_volume_avg": 0.0}
-        if not candles:
-            return res
-
-        cutoff = now_ts().timestamp() - (CANDLES_HOURS * 3600)
-        recent_candles = [c for c in candles if c["time"] >= cutoff]
-        if len(recent_candles) < 12:  # al menos 1h de velas de 5m
-            return res
-
-        highs = [c["high"] for c in recent_candles]
-        lows = [c["low"] for c in recent_candles]
-        vols = [c["volume_usd"] for c in recent_candles]
-        if not highs or not lows or min(lows) <= 0:
-            return res
-
-        volatility_pct = ((max(highs) - min(lows)) / min(lows)) * 100
-        avg_volume = sum(vols) / len(vols)
-        low_volume_candles = sum(1 for v in vols if v < FLAT_VOLUME_AVG_PER_CANDLE_USD)
-        low_volume_ratio = low_volume_candles / len(vols)
-        high_volume_spikes = sum(1 for v in vols if v > FLAT_VOLUME_AVG_PER_CANDLE_USD * 3)
-
-        recent = vols[-min(PRE_BREAKOUT_CANDLES_COUNT, len(vols)):]
-        recent_volume_avg = sum(recent) / len(recent) if recent else 0
-
-        is_flat = (volatility_pct < FLAT_VOLATILITY_PCT and
-                   low_volume_ratio >= 0.7 and
-                   high_volume_spikes <= 2)
-
-        pre_breakout = (is_flat and
-                        recent_volume_avg > avg_volume * PRE_BREAKOUT_VOLUME_MULTIPLIER and
-                        recent_volume_avg > FLAT_VOLUME_AVG_PER_CANDLE_USD * 2)
-
-        res.update({"avg_vol": avg_volume, "volatility_pct": volatility_pct,
-                    "is_flat": is_flat, "pre_breakout": pre_breakout,
-                    "recent_volume_avg": recent_volume_avg})
-        return res
-
-    async def _analyze(self, token: Dict[str, Any]):
-        mint = token.get('id') or token.get('mint') or token.get('address')
-        if not mint:
-            return
-        # DexScreener candles
-        resp = await self.dexs.get_token(mint)
-        candles = self._parse_candles_dexs(resp)
-        # Fallback Birdeye if no candles
-        if not candles:
-            be_c = await self.birdeye.get_candles(mint, interval="5m", limit=72)
-            candles = [{
-                "time": int(c["unixTime"]),
-                "open": float(c.get("open", 0)), "high": float(c.get("high", 0)),
-                "low": float(c.get("low", 0)), "close": float(c.get("close", 0)),
-                "volume_usd": float(c.get("volume", 0))
-            } for c in be_c] if be_c else []
-        if not candles:
-            return
-
-        # Security: RugCheck LP lock & holder concentration (if provided)
-        rc = await self.rugcheck.get_security(mint)
-        lp_locked = rc.get("lpLocked", None)  # boolean or %
-        lock_info = rc.get("lockInfo", "")
-        top_holders_pct = rc.get("topHoldersPercentage", None)
-
-        analysis = self._is_flat_improved(candles)
-        if analysis["is_flat"]:
-            await self._send_flat_alert(token, analysis, mint, lp_locked, lock_info, top_holders_pct)
-
-    async def _send_flat_alert(self, token: Dict[str, Any], analysis: Dict[str, Any],
-                               mint: str, lp_locked: Optional[Any], lock_info: str, top_holders_pct: Optional[float]):
-        symbol = token.get('symbol', 'UNK')
-        name = token.get('name', '')
-        liquidity = token.get('liquidity', 0)
-        market_cap = token.get('marketCap', token.get('fdv', 0))
-        organic_score = token.get('organicScore', 'N/A')
-        holder_count = token.get('holderCount', 'N/A')
-        audit = token.get('audit', {})
-        mint_disabled = audit.get('mintAuthorityDisabled', False)
-        freeze_disabled = audit.get('freezeAuthorityDisabled', False)
-        rc_lp = f"{lp_locked} (lock: {lock_info})" if lp_locked is not None else "N/A"
-        rc_top = f"{top_holders_pct}%" if top_holders_pct is not None else audit.get('topHoldersPercentage', 'N/A')
-
-        pre_breakout_emoji = "⚡" if analysis.get('pre_breakout', False) else ""
-        text = (
-            f"🎯 {pre_breakout_emoji} <b>FLAT DETECTADO</b> {pre_breakout_emoji}\n\n"
-            f"<b>{symbol}</b> {name}\n"
-            f"• Duración: ~{analysis['flat_period_hours']}h\n"
-            f"• Volatilidad: {analysis['volatility_pct']:.2f}%\n"
-            f"• Vol Prom: ${analysis['avg_vol']:.2f}\n"
-            f"• Vol Reciente: ${analysis['recent_volume_avg']:.2f}\n"
-            f"• Liq: ${format_number(liquidity)} | MC: ${format_number(market_cap)}\n\n"
-            f"<b>Calidad:</b> Organic {organic_score} | Holders {holder_count}\n"
-            f"<b>Seguridad:</b> Mint {'✅' if mint_disabled else '❌'} | Freeze {'✅' if freeze_disabled else '❌'}\n"
-            f"• LP Lock (RugCheck): {rc_lp}\n"
-            f"• Top Holders: {rc_top}\n\n"
-            f"<b>Mint:</b>\n<code>{mint}</code>\n"
-        )
-
-        if analysis.get('pre_breakout', False):
-            text += (
-                f"\n<b>Estrategia:</b> Pre-ruptura posible\n"
-                f"• Vol reciente {PRE_BREAKOUT_VOLUME_MULTIPLIER}x\n"
-                f"• Entrada escalonada | stop cerca del rango\n"
-                f"• Objetivo: 2–3x del rango\n"
-            )
-        else:
-            text += (
-                f"\n<b>Estrategia:</b> Consolidación\n"
-                f"• Esperar ruptura con volumen\n"
-                f"• Tamaño pequeño | stops prudentes\n"
-            )
-
-        buttons = [
-            ("DexScreener", f"https://dexscreener.com/solana/{mint}"),
-            ("RugCheck", f"https://rugcheck.xyz/tokens/{mint}"),
-            ("Birdeye", f"https://birdeye.so/token/{mint}"),
-            ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
-        ]
-        await self.notifier.send_message(text, buttons)
-        await self.db.mark_notified(mint, "flat", symbol)
+                attempt += 1
+                json_log("helius_connect_error", attempt=attempt, error=str(e))
+                await asyncio.sleep(backoff_delay(attempt))
 
 # ---------------------------
-# FastAPI + Telegram
+# Commands & App wiring
 # ---------------------------
 app = FastAPI()
 telegram_app: Optional[Application] = None
-db: Optional[DB] = None
-pump_monitor: Optional[HeliusPumpMonitor] = None
-flat_scanner: Optional[FlatScanner] = None
+db_pool: Optional[asyncpg.pool.Pool] = None
 http_session: Optional[aiohttp.ClientSession] = None
+http_client: Optional[HttpClient] = None
 cache: Optional[Cache] = None
-analysis_queue: Optional[AnalysisQueue] = None
+notifier: Optional[TelegramNotifier] = None
+core: Optional[MonitorCore] = None
+flat_detector: Optional[FlatDetector] = None
+raydium_grad: Optional[RaydiumGraduationMonitor] = None
+helius_monitor: Optional[HeliusPumpMonitor] = None
 scheduler: Optional[AsyncIOScheduler] = None
 
-# ---------------------------
-# Commands
-# ---------------------------
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
     text = (
-        "🤖 <b>Solana Monitor Bot v4.1</b>\n\n"
-        "• Pump.fun pre-grad + filtros seguridad\n"
-        "• Raydium pools + Jupiter candidatos\n"
-        "• Flat + pre-ruptura, duración mínima\n"
-        "• Cache persistente, cola de análisis\n"
-        "• Botones y resumen cada 8h\n\n"
-        "Comandos: /iniciar /detener /status /config /ajustar_flat /ultimos /buscar <mint>"
+        "🤖 <b>Solana Monitor Bot v5_pro</b>\n\n"
+        "Features: Pump pre-grad, Raydium graduation (2min), Flat watchlist + Post-flat breakout alerts, Smart-wallet tracking.\n"
+        "Commands: /iniciar /detener /status /mints_list /watchlist /rank /buscar <mint>"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_iniciar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    await pump_monitor.start()
-    await flat_scanner.start()
-    await update.message.reply_text("✅ Monitores v4.1 iniciados", parse_mode="HTML")
+    # start monitors
+    if hel i us_monitor and hasattr(helius_monitor, "start"):
+        await hel i us_monitor.start()  # noqa: intentionally guarded (if configured)
+    if raydium_grad:
+        await raydium_grad.start()
+    if flat_detector:
+        await flat_detector.start(notifier)
+    await update.message.reply_text("✅ Monitores iniciados (v5_pro)", parse_mode="HTML")
 
 async def cmd_detener(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    await pump_monitor.stop()
-    await flat_scanner.stop()
+    if hel i us_monitor and hasattr(helius_monitor, "stop"):
+        await hel i us_monitor.stop()  # noqa
+    if raydium_grad:
+        await raydium_grad.stop()
+    if flat_detector:
+        await flat_detector.stop()
     await update.message.reply_text("⛔ Monitores detenidos", parse_mode="HTML")
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    running = (pump_monitor.running if pump_monitor else False) or (flat_scanner.running if flat_scanner else False)
-    cnt = await db.count_alerts_last_24h()
+    running = (raydium_grad.running if raydium_grad else False)
+    cnt = 0
+    async with db_pool.acquire() as conn:
+        v = await conn.fetchval("SELECT COUNT(*) FROM notified_tokens WHERE notified_at >= $1", now_ts() - timedelta(hours=24))
+        cnt = int(v or 0)
     text = (
-        f"<b>📊 ESTADO v4.1</b>\n\n"
-        f"• Estado: {'🟢 Activos' if running else '🔴 Inactivos'}\n"
-        f"• Alertas 24h: {cnt}\n"
-        f"• Intervalo: {CHECK_INTERVAL_MINUTES}m\n"
-        f"• Cache: SQLite\n"
-        f"• Cola: activa\n"
-        f"• Resumen 8h: {'🟢' if scheduler else '🔴'}\n"
+        f"<b>📊 ESTADO v5_pro</b>\n\n"
+        f"• Raydium grad monitor: {'🟢' if running else '🔴'}\n"
+        f"• Alerts 24h: {cnt}\n"
+        f"• Flat watchlist: see /watchlist\n"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
-async def cmd_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def cmd_mints_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
-    text = (
-        "<b>⚙️ Config v4.1</b>\n\n"
-        f"Pump: ${PUMP_PRE_GRADUATION_MIN:,.0f}–${PUMP_PRE_GRADUATION_MAX:,.0f}\n"
-        f"Flat: Liq ${FLAT_LIQUIDITY_MIN:,.0f}, Vol24h ${FLAT_VOLUME_24H_MIN:,.0f}, "
-        f"Volatilidad {FLAT_VOLATILITY_PCT}%, Vol/candle ${FLAT_VOLUME_AVG_PER_CANDLE_USD}\n"
-        f"Organic {FLAT_MIN_ORGANIC_SCORE}+ | Holders {MIN_HOLDER_COUNT}+ | No repetir {FLAT_TOKEN_REPEAT_HOURS}h\n"
-        f"Pre-ruptura mult: {PRE_BREAKOUT_VOLUME_MULTIPLIER}x candles {PRE_BREAKOUT_CANDLES_COUNT}\n"
-        f"Velas: {CANDLES_HOURS}h ({CANDLE_INTERVAL})\n"
-    )
-    await update.message.reply_text(text, parse_mode="HTML")
-
-async def cmd_ajustar_flat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
-        return
-    args = ctx.args or []
-    if len(args) < 2:
-        text = (
-            "<b>Uso:</b> /ajustar_flat <param> <valor>\n"
-            "Params: liquidez, vol24h, volatilidad, volumen_promedio, organic_score, holders, intervalo, horas_sin_repetir, pre_ruptura_mult"
-        )
-        await update.message.reply_text(text, parse_mode="HTML")
-        return
-    param = args[0].lower()
-    val = args[1]
-    global FLAT_VOLATILITY_PCT, FLAT_VOLUME_AVG_PER_CANDLE_USD, FLAT_LIQUIDITY_MIN, FLAT_VOLUME_24H_MIN
-    global FLAT_MIN_ORGANIC_SCORE, MIN_HOLDER_COUNT, CHECK_INTERVAL_MINUTES, FLAT_TOKEN_REPEAT_HOURS
-    global PRE_BREAKOUT_VOLUME_MULTIPLIER
-    try:
-        if param in ("volatilidad", "volatility"):
-            FLAT_VOLATILITY_PCT = float(val)
-        elif param in ("volumen_promedio", "avg_vol"):
-            FLAT_VOLUME_AVG_PER_CANDLE_USD = float(val)
-        elif param in ("liquidez", "liquidity"):
-            FLAT_LIQUIDITY_MIN = float(val)
-        elif param in ("vol24h", "volume24h"):
-            FLAT_VOLUME_24H_MIN = float(val)
-        elif param in ("organic_score", "organic"):
-            FLAT_MIN_ORGANIC_SCORE = float(val)
-        elif param in ("holders", "holder_count"):
-            MIN_HOLDER_COUNT = int(val)
-        elif param in ("intervalo", "interval"):
-            CHECK_INTERVAL_MINUTES = int(val)
-        elif param in ("horas_sin_repetir", "repeat_hours"):
-            FLAT_TOKEN_REPEAT_HOURS = int(val)
-        elif param in ("pre_ruptura_mult", "pre_breakout_mult"):
-            PRE_BREAKOUT_VOLUME_MULTIPLIER = float(val)
-        else:
-            await update.message.reply_text("❌ Parámetro no reconocido.", parse_mode="HTML")
-            return
-        await update.message.reply_text(f"✅ <code>{param}</code> = <code>{val}</code>", parse_mode="HTML")
-    except Exception:
-        await update.message.reply_text("❌ Valor inválido.", parse_mode="HTML")
-
-async def cmd_ultimos(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
-        return
-    rows = await db.last_notifications(limit=5)
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT mint, kind, symbol, notified_at FROM notified_tokens ORDER BY notified_at DESC LIMIT 20")
     if not rows:
-        await update.message.reply_text("No hay tokens recientes.", parse_mode="HTML")
+        await update.message.reply_text("No hay tokens notificados.", parse_mode="HTML")
         return
-    text = "<b>🕒 Últimos tokens notificados:</b>\n\n"
+    text = "<b>🔗 Últimos 20 mints</b>\n\n"
+    keyboard = []
     for r in rows:
-        text += f"• <b>{r['symbol'] or 'UNK'}</b> ({r['kind']})\n"
-        text += f"  {r['notified_at'].strftime('%Y-%m-%d %H:%M')} UTC\n"
-        text += f"  <code>{r['mint']}</code>\n\n"
+        sym = r["symbol"] or "UNK"
+        mint = r["mint"]
+        text += f"• <b>{safe_html(sym)}</b> <code>{mint[:8]}...{mint[-8:]}</code>\n"
+        keyboard.append([
+            InlineKeyboardButton("Dex", url=f"https://dexscreener.com/solana/{mint}"),
+            InlineKeyboardButton("Rug", url=f"https://rugcheck.xyz/tokens/{mint}"),
+            InlineKeyboardButton("Jup", url=f"https://jup.ag/swap/{mint}-SOL"),
+        ])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", reply_markup=reply_markup)
+
+async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
+        return
+    rows = await flat_detector.get_watchlist(limit=50)
+    if not rows:
+        await update.message.reply_text("Watchlist vacía.", parse_mode="HTML")
+        return
+    text = "<b>👀 Watchlist (Flat tokens)</b>\n\n"
+    keyboard = []
+    for r in rows:
+        mint = r["mint"]
+        sym = r["symbol"] or "UNK"
+        text += f"• <b>{safe_html(sym)}</b> <code>{mint[:8]}...{mint[-8:]}</code> detected {r['detected_at'].strftime('%Y-%m-%d %H:%M')}\n"
+        keyboard.append([
+            InlineKeyboardButton("Dex", url=f"https://dexscreener.com/solana/{mint}"),
+            InlineKeyboardButton("Remove", url=f"https://example-remove/{mint}")  # placeholder if you add a remove action via web
+        ])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML", reply_markup=reply_markup)
+
+async def cmd_rank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
+        return
+    # simple ranking: highest recent_avg / avg_vol ratio stored in meta if available
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT mint, symbol, meta FROM flat_watchlist")
+    scored = []
+    for r in rows:
+        meta = r["meta"] or {}
+        try:
+            avg = float(meta.get("avg_vol", 1))
+            recent = float(meta.get("recent_avg", avg))
+            score = recent / (avg+1e-9)
+        except Exception:
+            score = 0.0
+        scored.append((r["mint"], r["symbol"] or "UNK", score))
+    scored.sort(key=lambda x: x[2], reverse=True)
+    text = "<b>🏆 Ranking probable breakouts</b>\n\n"
+    for mint, sym, score in scored[:20]:
+        text += f"• <b>{safe_html(sym)}</b> score {score:.2f}\n"
     await update.message.reply_text(text, parse_mode="HTML")
 
 async def cmd_buscar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
         return
     args = ctx.args or []
-    if len(args) < 1:
+    if not args:
         await update.message.reply_text("Uso: /buscar <mint>", parse_mode="HTML")
         return
     mint = args[0].strip()
-    # Jupiter info
-    token_info = None
-    try:
-        token_info = await jup_client.get_token_info(mint)
-    except Exception:
-        token_info = None
-    # DexScreener basic
-    dexs_resp = await dexs_client.get_token(mint)
-    pairs = dexs_resp.get("pairs", [])
-    price = None
-    liquidity = None
-    volume24 = None
-    if pairs:
-        p0 = pairs[0]
-        price = p0.get("priceUsd") or p0.get("priceNative")
-        liquidity = p0.get("liquidity", {}).get("usd")
-        volume24 = p0.get("volume", {}).get("h24")
-    # RugCheck security
-    rc = await rugcheck_client.get_security(mint)
-    lp_locked = rc.get("lpLocked", "N/A")
-    top_holders_pct = rc.get("topHoldersPercentage", "N/A")
-
-    symbol = (token_info or {}).get("symbol", "UNK")
-    name = (token_info or {}).get("name", "")
-    organic_score = (token_info or {}).get("organicScore", "N/A")
-    holders = (token_info or {}).get("holderCount", "N/A")
-    audit = (token_info or {}).get("audit", {})
-    mint_disabled = audit.get("mintAuthorityDisabled", False)
-    freeze_disabled = audit.get("freezeAuthorityDisabled", False)
-
+    dexs = await core.dexs.token_info(mint)
+    token = dexs.get("token") or {}
+    symbol = token.get("symbol") or "UNK"
+    name = token.get("name") or ""
+    mc = token.get("marketCapUsd") or token.get("marketCap") or 0
+    liq = token.get("liquidity", {}).get("usd") if isinstance(token.get("liquidity"), dict) else token.get("liquidity", 0)
     text = (
-        f"🔎 <b>Consulta de token</b>\n\n"
-        f"<b>{symbol}</b> {name}\n"
-        f"• Precio: {price or 'N/A'}\n"
-        f"• Liquidez: ${format_number(float(liquidity or 0))}\n"
-        f"• Vol 24h: ${format_number(float(volume24 or 0))}\n"
-        f"• Organic: {organic_score} | Holders: {holders}\n"
-        f"• Mint Revocada: {'✅' if mint_disabled else '❌'} | Freeze: {'✅' if freeze_disabled else '❌'}\n"
-        f"• LP Lock: {lp_locked} | Top holders: {top_holders_pct}%\n\n"
+        f"🔎 <b>Consulta token</b>\n\n"
+        f"<b>{safe_html(symbol)}</b> {safe_html(name)}\n"
+        f"• MC: ${format_number(mc)}\n"
+        f"• Liq: ${format_number(liq)}\n"
         f"<b>Mint:</b>\n<code>{mint}</code>"
     )
     buttons = [
         ("DexScreener", f"https://dexscreener.com/solana/{mint}"),
         ("RugCheck", f"https://rugcheck.xyz/tokens/{mint}"),
-        ("Birdeye", f"https://birdeye.so/token/{mint}"),
         ("Jupiter", f"https://jup.ag/swap/{mint}-SOL"),
     ]
-    await notifier.send_message(text, buttons)
+    await notifier.send(text, buttons)
 
 # ---------------------------
-# Resumen automático cada 8h
+# Initialization & startup/shutdown
 # ---------------------------
-async def send_summary():
-    cnt = await db.count_alerts_last_24h()
-    text = (
-        f"📰 <b>Resumen automático (8h)</b>\n\n"
-        f"• Alertas últimas 24h: {cnt}\n"
-        f"• Pump monitor: {'🟢' if pump_monitor.running else '🔴'}\n"
-        f"• Flat scanner: {'🟢' if flat_scanner.running else '🔴'}\n"
-        f"• Intervalo: {CHECK_INTERVAL_MINUTES}m\n"
-        f"• Filtros: Liq ≥ {FLAT_LIQUIDITY_MIN}, Vol24h ≥ {FLAT_VOLUME_24H_MIN}, "
-        f"Organic ≥ {FLAT_MIN_ORGANIC_SCORE}, Holders ≥ {MIN_HOLDER_COUNT}\n"
-    )
-    await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
-
-# ---------------------------
-# Initialization
-# ---------------------------
-async def init_bot():
-    global telegram_app, db, pump_monitor, flat_scanner, http_session, cache, analysis_queue
-    global jup_client, dexs_client, birdeye_client, raydium_client, rugcheck_client, notifier, scheduler
+async def init_app():
+    global telegram_app, db_pool, http_session, http_client, cache, notifier, core, flat_detector, raydium_grad, hel i us_monitor, scheduler
 
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN no configurado")
@@ -1069,99 +853,90 @@ async def init_bot():
     if not TELEGRAM_CHAT_ID:
         raise RuntimeError("TELEGRAM_CHAT_ID no configurado")
 
+    # Telegram app
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", cmd_start))
     telegram_app.add_handler(CommandHandler("iniciar", cmd_iniciar))
     telegram_app.add_handler(CommandHandler("detener", cmd_detener))
     telegram_app.add_handler(CommandHandler("status", cmd_status))
-    telegram_app.add_handler(CommandHandler("ajustar_flat", cmd_ajustar_flat))
-    telegram_app.add_handler(CommandHandler("help", cmd_start))
-    telegram_app.add_handler(CommandHandler("config", cmd_config))
-    telegram_app.add_handler(CommandHandler("ultimos", cmd_ultimos))
+    telegram_app.add_handler(CommandHandler("mints_list", cmd_mints_list))
+    telegram_app.add_handler(CommandHandler("watchlist", cmd_watchlist))
+    telegram_app.add_handler(CommandHandler("rank", cmd_rank))
     telegram_app.add_handler(CommandHandler("buscar", cmd_buscar))
 
-    db = DB(DATABASE_URL)
-    await db.connect()
+    # DB pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=8)
+    async with db_pool.acquire() as conn:
+        await conn.execute(DB_SCHEMA)
 
-    cache = Cache(path="/data/cache.db")
+    # HTTP
     http_session = aiohttp.ClientSession()
     http_client = HttpClient(http_session)
 
-    jup_client = JupiterClient(http_client)
-    dexs_client = DexScreenerClient(http_client, DEXSCREENER_API)
-    birdeye_client = BirdeyeClient(http_client, BIRDEYE_API_BASE)
-    raydium_client = RaydiumClient(http_client)
-    rugcheck_client = RugCheckClient(http_client, RUGCHECK_API_BASE)
+    cache = Cache(path=CACHE_DB_PATH)
     notifier = TelegramNotifier(telegram_app)
+    core = MonitorCore(http_client, db_pool, cache, notifier)
 
-    analysis_queue = AnalysisQueue(maxsize=300)
+    flat_detector = FlatDetector(core, db_pool)
+    raydium_grad = RaydiumGraduationMonitor(core, db_pool, notifier)
+    hel i us_monitor = HeliusPumpMonitor(HELIUS_WSS_URL, core, db_pool, notifier) if HELIUS_WSS_URL else None
 
-    pump_monitor = HeliusPumpMonitor(HELIUS_WSS_URL, http_client, notifier, db, jup_client, cache)
-    flat_scanner = FlatScanner(jup_client, dexs_client, notifier, db, raydium_client, birdeye_client, rugcheck_client, analysis_queue)
-
-    # Scheduler cada 8 horas
+    # Scheduler summary
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_summary, "interval", hours=8)
+    async def send_summary():
+        async with db_pool.acquire() as conn:
+            cnt = await conn.fetchval("SELECT COUNT(*) FROM notified_tokens WHERE notified_at >= $1", now_ts() - timedelta(hours=24))
+        text = f"📰 <b>Resumen (24h)</b>\n• Alerts: {cnt}"
+        await telegram_app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
+    scheduler.add_job(lambda: asyncio.create_task(send_summary()), "interval", hours=8)
     scheduler.start()
 
 @app.on_event("startup")
 async def on_startup():
-    json_log("startup", port=PORT)
-    await init_bot()
+    json_log("startup_init")
+    await init_app()
     await telegram_app.initialize()
     await telegram_app.start()
-    await pump_monitor.start()
-    await flat_scanner.start()
-    json_log("monitors_started")
+    # auto-start monitors
+    if hel i us_monitor:
+        await hel i us_monitor.start()
+    await raydium_grad.start()
+    await flat_detector.start(notifier)
+    json_log("monitors_started_v5_pro")
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    json_log("shutdown")
-    await pump_monitor.stop()
-    await flat_scanner.stop()
-    if scheduler:
-        scheduler.shutdown(wait=False)
+    json_log("shutdown_start")
+    if hel i us_monitor:
+        await hel i us_monitor.stop()
+    if raydium_grad:
+        await raydium_grad.stop()
+    if flat_detector:
+        await flat_detector.stop()
     if telegram_app:
         await telegram_app.stop()
         await telegram_app.shutdown()
     if http_session:
         await http_session.close()
-    if db:
-        await db.close()
+    if db_pool:
+        await db_pool.close()
+    if scheduler:
+        scheduler.shutdown(wait=False)
     json_log("shutdown_done")
 
 @app.get("/test")
 async def test_endpoint():
-    return {
-        "status": "ok",
-        "bot_running": telegram_app is not None,
-        "chat_id": TELEGRAM_CHAT_ID,
-        "version": "4.1",
-        "features": [
-            "Raydium + Jupiter candidates",
-            "Pre-Breakout Detection",
-            "Advanced Security (RugCheck)",
-            "SQLite Cache + Queue",
-            "Fallback Birdeye",
-            "Resumen cada 8h",
-            "Ultimos + Buscar comandos"
-        ]
-    }
-
-@app.get("/")
-async def root():
-    return {"status": "Bot v4.1 funcionando", "version": "4.1", "webhook": "active"}
+    return {"status": "v5_pro ok", "chat_id": TELEGRAM_CHAT_ID}
 
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, req: Request):
     try:
         if token != TELEGRAM_BOT_TOKEN:
-            raise HTTPException(status_code=403, detail="Invalid token")
+            raise HTTPException(status_code=403, detail="invalid token")
         body = await req.json()
         update = Update.de_json(body, telegram_app.bot)
-        if update.effective_user:
-            if update.effective_user.id != TELEGRAM_CHAT_ID:
-                return JSONResponse({"ok": True, "note": "ignored - private bot"})
+        if update.effective_user and update.effective_user.id != TELEGRAM_CHAT_ID:
+            return JSONResponse({"ok": True, "note": "ignored - private bot"})
         await telegram_app.process_update(update)
         return JSONResponse({"ok": True})
     except Exception as e:
@@ -1170,8 +945,8 @@ async def telegram_webhook(token: str, req: Request):
 
 def run_uvicorn():
     import uvicorn
-    uvicorn.run("telegram_bot_v4_1:app", host="0.0.0.0", port=PORT)
+    uvicorn.run("telegram_bot_final_v5_pro:app", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
 
 if __name__ == "__main__":
-    asyncio.run(init_bot())
+    asyncio.run(init_app())
     run_uvicorn()
