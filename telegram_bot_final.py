@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 from math import isfinite
+from decimal import Decimal
 
 import aiohttp
 import asyncpg
