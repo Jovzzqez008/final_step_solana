@@ -580,7 +580,7 @@ class PumpFunMonitor:
         logging.info("⛔ PumpFunMonitor detenido")
 
 class WatchlistMonitor:
-    """MONITOR MEJORADO DE WATCHLIST CON TRIGGERS DUALES"""
+    """MONITOR MEJORADO DE WATCHLIST CON CONVERSIONES DE TIPO ARREGLADAS"""
     def __init__(self, db: Database, notifier: TelegramNotifier):
         self.db = db
         self.notifier = notifier
@@ -599,14 +599,21 @@ class WatchlistMonitor:
         for candidate in candidates:
             try:
                 await self.check_single_candidate(candidate)
-                await asyncio.sleep(1)  # Rate limiting entre candidatos
+                await asyncio.sleep(1)
             except Exception as e:
                 logging.error(f"Error revisando candidato {candidate['mint']}: {str(e)}")
 
     async def check_single_candidate(self, candidate):
-        """Revisar un solo candidato para triggers de precio"""
+        """Revisar un solo candidato para triggers de precio - CONVERSIONES ARREGLADAS"""
         mint = candidate['mint']
         symbol = candidate['symbol'] or 'UNKNOWN'
+        
+        # CONVERSIONES SEGURAS DE TIPOS DECIMAL → FLOAT
+        base_price = self.safe_convert_decimal(candidate['base_price'])
+        if not base_price or base_price <= 0:
+            return
+
+        base_24h_change = self.safe_convert_decimal(candidate['base_price_24h_change'])
         
         # Obtener precio actual
         current_data = await self.get_current_token_data(mint)
@@ -615,12 +622,17 @@ class WatchlistMonitor:
 
         current_price = current_data['price']
         current_mcap = current_data.get('market_cap')
-        base_price = candidate['base_price']
 
-        if not base_price or base_price <= 0:
+        # CONVERSIÓN SEGURA DEL PRECIO ACTUAL
+        try:
+            current_price = float(current_price) if current_price is not None else None
+        except (TypeError, ValueError):
             return
 
-        # Calcular cambio porcentual
+        if current_price is None or current_price <= 0:
+            return
+
+        # Calcular cambio porcentual - AHORA AMBOS SON FLOATS
         price_change_pct = ((current_price - base_price) / base_price) * 100
 
         # Actualizar precio en base de datos
@@ -643,10 +655,10 @@ class WatchlistMonitor:
                 )
                 await self.db.mark_notified(mint, "pre_explosion_up", symbol)
                 await self.db.mark_candidate_triggered(mint)
+                logging.info(f"🎯 Trigger UP disparado: {symbol} +{price_change_pct:.2f}%")
                 return
 
         # 🎯 TRIGGER 2: Reversión desde zona negativa
-        base_24h_change = candidate['base_price_24h_change']
         if (base_24h_change is not None and 
             base_24h_change <= REVERSAL_NEGATIVE_THRESHOLD and
             price_change_pct >= REVERSAL_UP_PCT):
@@ -667,18 +679,44 @@ class WatchlistMonitor:
                 )
                 await self.db.mark_notified(mint, "pre_explosion_reversal", symbol)
                 await self.db.mark_candidate_triggered(mint)
+                logging.info(f"🔄 Trigger REVERSAL disparado: {symbol} +{price_change_pct:.2f}% desde {base_24h_change:.2f}%")
+
+    def safe_convert_decimal(self, value):
+        """CONVERSIÓN SEGURA DE decimal.Decimal A float"""
+        if value is None:
+            return None
+        try:
+            if isinstance(value, Decimal):
+                return float(value)
+            elif isinstance(value, (int, float)):
+                return float(value)
+            else:
+                return float(str(value))
+        except (TypeError, ValueError) as e:
+            logging.warning(f"Error convirtiendo valor {value}: {str(e)}")
+            return None
 
     async def get_current_token_data(self, mint: str) -> Dict:
-        """Obtener datos actualizados del token"""
+        """Obtener datos actualizados del token - CON CONVERSIONES SEGURAS"""
         async with APIClient() as client:
             jupiter = JupiterAPI(client)
             tokens = await jupiter.search_token(mint)
             
             if tokens and len(tokens) > 0:
                 token = tokens[0]
+                price = token.get('usdPrice')
+                market_cap = token.get('mcap')
+                
+                # CONVERSIONES SEGURAS
+                try:
+                    safe_price = float(price) if price is not None else None
+                    safe_mcap = float(market_cap) if market_cap is not None else None
+                except (TypeError, ValueError):
+                    return None
+                    
                 return {
-                    'price': token.get('usdPrice'),
-                    'market_cap': token.get('mcap'),
+                    'price': safe_price,
+                    'market_cap': safe_mcap,
                     'volume_24h': token.get('volume24h')
                 }
             
@@ -687,9 +725,19 @@ class WatchlistMonitor:
             data = await dexscreener.get_token_info(mint)
             if data and 'token' in data:
                 token = data['token']
+                price = token.get('priceUsd')
+                market_cap = token.get('marketCap')
+                
+                # CONVERSIONES SEGURAS
+                try:
+                    safe_price = float(price) if price is not None else None
+                    safe_mcap = float(market_cap) if market_cap is not None else None
+                except (TypeError, ValueError):
+                    return None
+                    
                 return {
-                    'price': token.get('priceUsd'),
-                    'market_cap': token.get('marketCap')
+                    'price': safe_price,
+                    'market_cap': safe_mcap
                 }
 
         return None
