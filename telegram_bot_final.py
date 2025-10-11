@@ -8,7 +8,7 @@ import re
 import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -36,11 +36,11 @@ JUPITER_API_BASE = "https://lite-api.jup.ag/tokens/v2"
 DEXSCREENER_API = "https://api.dexscreener.com/latest"
 
 # Parámetros de trading optimizados para PRE-GRADUACIÓN
-PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "5000"))  # MC mínimo para alerta temprana
-PUMP_MC_MAX = float(os.getenv("PUMP_MC_MAX", "50000"))  # MC máximo para considerar pre-graduación
-GRADUATION_MC_TARGET = float(os.getenv("GRADUATION_MC_TARGET", "65000"))  # MC aproximado de graduación
+PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "5000"))
+PUMP_MC_MAX = float(os.getenv("PUMP_MC_MAX", "50000"))
+GRADUATION_MC_TARGET = float(os.getenv("GRADUATION_MC_TARGET", "65000"))
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1"))  # Revisar cada 1 minuto
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1"))
 PORT = int(os.getenv("PORT", "8080"))
 
 # Regex para detectar mints de Solana
@@ -78,19 +78,6 @@ class Database:
                 CREATE TABLE IF NOT EXISTS seen_tokens (
                     mint TEXT PRIMARY KEY,
                     last_seen TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            
-            # Tabla de métricas para análisis post-graduación
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS pump_metrics (
-                    id SERIAL PRIMARY KEY,
-                    mint TEXT NOT NULL,
-                    timestamp TIMESTAMP DEFAULT NOW(),
-                    market_cap DECIMAL,
-                    price DECIMAL,
-                    volume_5m DECIMAL,
-                    is_graduated BOOLEAN DEFAULT FALSE
                 )
             """)
 
@@ -144,14 +131,6 @@ class Database:
                 INSERT INTO seen_tokens (mint) VALUES ($1)
                 ON CONFLICT (mint) DO UPDATE SET last_seen = NOW()
             """, mint)
-
-    async def add_metric(self, mint: str, market_cap: float = None, price: float = None, volume: float = None, is_graduated: bool = False):
-        """Agregar métrica histórica"""
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO pump_metrics (mint, market_cap, price, volume_5m, is_graduated)
-                VALUES ($1, $2, $3, $4, $5)
-            """, mint, market_cap, price, volume, is_graduated)
 
     async def get_pre_graduation_tokens(self) -> List[Dict]:
         """Obtener tokens detectados que aún no se han graduado"""
@@ -237,7 +216,6 @@ class TelegramNotifier:
             message += f"<b>{symbol}</b>\n"
             message += f"• Market Cap: ${data.get('market_cap', 0):,.0f}\n"
             message += f"• Precio: ${data.get('price', 0):.8f}\n"
-            message += f"• Edad: {data.get('age_minutes', 0)}min\n"
             message += "• ⚡ <b>OPORTUNIDAD PRE-GRADUACIÓN</b>\n\n"
             
         elif alert_type == "pre_graduation":
@@ -252,7 +230,6 @@ class TelegramNotifier:
             message = f"🔥 <b>EXPLOSIÓN POST-GRADUACIÓN</b> 🔥\n\n"
             message += f"<b>{symbol}</b>\n"
             message += f"• Market Cap: ${data.get('market_cap', 0):,.0f}\n"
-            message += f"• Volumen 5m: +{data.get('volume_change_5m', 0):.0f}%\n"
             message += f"• Cambio Precio: {data.get('price_change_5m', 0):.2f}%\n"
             message += "• 🚀 <b>MOMENTUM POST-GRADUACIÓN</b>\n\n"
 
@@ -286,101 +263,91 @@ class PumpFunMonitor:
         self.notifier = notifier
         self.task = None
         self.running = False
-        self.token_cache = {}  # Cache para tokens ya procesados
 
     async def process_ws_message(self, message: str):
         """Procesar mensaje WebSocket y detectar nuevos mints ULTRA-RÁPIDO"""
-        mints = MINT_PATTERN.findall(message)
-        
-        for mint in set(mints):
-            # Verificación ultra-rápida de duplicados
-            if await self.db.seen_recently(mint, minutes=1):
-                continue
-
-            await self.db.mark_seen(mint)
+        try:
+            mints = MINT_PATTERN.findall(message)
             
-            # Obtener datos del token inmediatamente
-            token_data = await self.get_token_data(mint)
-            if not token_data:
-                continue
+            for mint in set(mints):
+                # Verificación ultra-rápida de duplicados
+                if await self.db.seen_recently(mint, minutes=1):
+                    continue
 
-            market_cap = token_data.get('market_cap', 0)
-            symbol = token_data.get('symbol', 'UNKNOWN')
+                await self.db.mark_seen(mint)
+                
+                # Obtener datos del token inmediatamente
+                token_data = await self.get_token_data(mint)
+                if not token_data:
+                    continue
 
-            # ESTRATEGIA 1: Detección temprana (MC bajo)
-            if (PUMP_MC_MIN <= market_cap <= PUMP_MC_MIN * 3 and 
-                not await self.db.was_notified(mint, "pump_early")):
-                
-                await self.notifier.send_pump_alert(
-                    symbol=symbol,
-                    mint=mint,
-                    data=token_data,
-                    alert_type="pump_early"
-                )
-                await self.db.mark_notified(mint, "pump_early", symbol, market_cap)
-                await self.db.add_metric(mint, market_cap=market_cap, price=token_data.get('price'))
+                market_cap = token_data.get('market_cap', 0)
+                symbol = token_data.get('symbol', 'UNKNOWN')
 
-            # ESTRATEGIA 2: Pre-graduación (acercándose al MC objetivo)
-            elif (market_cap >= GRADUATION_MC_TARGET * 0.7 and 
-                  market_cap <= GRADUATION_MC_TARGET and 
-                  not await self.db.was_notified(mint, "pre_graduation")):
-                
-                graduation_percent = (market_cap / GRADUATION_MC_TARGET) * 100
-                token_data['graduation_percent'] = graduation_percent
-                
-                await self.notifier.send_pump_alert(
-                    symbol=symbol,
-                    mint=mint,
-                    data=token_data,
-                    alert_type="pre_graduation"
-                )
-                await self.db.mark_notified(mint, "pre_graduation", symbol, market_cap)
+                # ESTRATEGIA 1: Detección temprana (MC bajo)
+                if (PUMP_MC_MIN <= market_cap <= PUMP_MC_MIN * 3 and 
+                    not await self.db.was_notified(mint, "pump_early")):
+                    
+                    await self.notifier.send_pump_alert(
+                        symbol=symbol,
+                        mint=mint,
+                        data=token_data,
+                        alert_type="pump_early"
+                    )
+                    await self.db.mark_notified(mint, "pump_early", symbol, market_cap)
+
+                # ESTRATEGIA 2: Pre-graduación (acercándose al MC objetivo)
+                elif (market_cap >= GRADUATION_MC_TARGET * 0.7 and 
+                      market_cap <= GRADUATION_MC_TARGET and 
+                      not await self.db.was_notified(mint, "pre_graduation")):
+                    
+                    graduation_percent = (market_cap / GRADUATION_MC_TARGET) * 100
+                    token_data['graduation_percent'] = graduation_percent
+                    
+                    await self.notifier.send_pump_alert(
+                        symbol=symbol,
+                        mint=mint,
+                        data=token_data,
+                        alert_type="pre_graduation"
+                    )
+                    await self.db.mark_notified(mint, "pre_graduation", symbol, market_cap)
+        except Exception as e:
+            logging.error(f"❌ Error procesando mensaje WS: {str(e)}")
 
     async def get_token_data(self, mint: str) -> Dict:
         """Obtener datos del token OPTIMIZADO para velocidad"""
-        async with APIClient() as client:
-            # Primero intentar con Jupiter (más rápido para datos básicos)
-            jupiter = JupiterAPI(client)
-            tokens = await jupiter.search_token(mint)
-            
-            if tokens and len(tokens) > 0:
-                token = tokens[0]
-                return {
-                    'symbol': token.get('symbol', 'UNKNOWN'),
-                    'name': token.get('name', 'Unknown'),
-                    'price': token.get('usdPrice', 0),
-                    'market_cap': token.get('mcap', 0),
-                    'volume_24h': token.get('volume24h', 0),
-                    'age_minutes': self.estimate_token_age(token)
-                }
+        try:
+            async with APIClient() as client:
+                # Primero intentar con Jupiter (más rápido para datos básicos)
+                jupiter = JupiterAPI(client)
+                tokens = await jupiter.search_token(mint)
+                
+                if tokens and len(tokens) > 0:
+                    token = tokens[0]
+                    return {
+                        'symbol': token.get('symbol', 'UNKNOWN'),
+                        'name': token.get('name', 'Unknown'),
+                        'price': token.get('usdPrice', 0),
+                        'market_cap': token.get('mcap', 0),
+                        'volume_24h': token.get('volume24h', 0)
+                    }
 
-            # Fallback a DexScreener si Jupiter no encuentra
-            dexscreener = DexScreenerAPI(client)
-            data = await dexscreener.get_token_info(mint)
-            if data and 'token' in data:
-                token = data['token']
-                return {
-                    'symbol': token.get('symbol', 'UNKNOWN'),
-                    'name': token.get('name', 'Unknown'),
-                    'price': float(token.get('priceUsd', 0)),
-                    'market_cap': float(token.get('marketCap', 0)),
-                    'volume_24h': token.get('volume', {}).get('h24', 0),
-                    'age_minutes': self.estimate_token_age(token)
-                }
-
+                # Fallback a DexScreener si Jupiter no encuentra
+                dexscreener = DexScreenerAPI(client)
+                data = await dexscreener.get_token_info(mint)
+                if data and 'token' in data:
+                    token = data['token']
+                    return {
+                        'symbol': token.get('symbol', 'UNKNOWN'),
+                        'name': token.get('name', 'Unknown'),
+                        'price': float(token.get('priceUsd', 0)),
+                        'market_cap': float(token.get('marketCap', 0)),
+                        'volume_24h': token.get('volume', {}).get('h24', 0)
+                    }
+        except Exception as e:
+            logging.error(f"❌ Error obteniendo datos del token {mint}: {str(e)}")
+        
         return None
-
-    def estimate_token_age(self, token_data: Dict) -> int:
-        """Estimar edad del token en minutos (aproximado)"""
-        # En un escenario real, podrías obtener esto de la transacción de creación
-        # Por ahora, usamos un valor estimado basado en el MC
-        market_cap = token_data.get('market_cap', 0) or token_data.get('mcap', 0)
-        if market_cap < 10000:
-            return 1  # Muy nuevo
-        elif market_cap < 30000:
-            return 5  # Algunos minutos
-        else:
-            return 10  # 10+ minutos
 
     async def start_websocket(self):
         """Iniciar conexión WebSocket a QuickNode con reconexión automática"""
@@ -405,7 +372,7 @@ class PumpFunMonitor:
             except Exception as e:
                 logging.error(f"❌ WebSocket error: {str(e)}")
                 await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 30)  # Max 30 segundos
+                reconnect_delay = min(reconnect_delay * 2, 30)
 
     async def start(self):
         """Iniciar monitor"""
@@ -435,58 +402,58 @@ class PostGraduationScanner:
 
     async def scan_graduated_tokens(self):
         """Escanear tokens que han sido graduados para detectar explosiones"""
-        # Obtener tokens que detectamos pre-graduación
-        tokens = await self.db.get_pre_graduation_tokens()
-        
-        for token in tokens:
-            mint = token['mint']
+        try:
+            # Obtener tokens que detectamos pre-graduación
+            tokens = await self.db.get_pre_graduation_tokens()
             
-            # Verificar si el token se ha graduado (MC > objetivo)
-            current_data = await self.get_current_token_data(mint)
-            if not current_data:
-                continue
-
-            current_mc = current_data.get('market_cap', 0)
-            previous_mc = token.get('market_cap', 0)
-
-            # Si el token supera el MC de graduación, marcarlo como graduado
-            if current_mc > GRADUATION_MC_TARGET and not await self.db.was_notified(mint, "graduated"):
-                await self.db.mark_graduated(mint)
-                await self.db.mark_notified(mint, "graduated")
-
-            # Detectar explosión post-graduación (aumento significativo de volumen/precio)
-            if (current_mc > GRADUATION_MC_TARGET and 
-                current_data.get('volume_change_5m', 0) > 100 and
-                not await self.db.was_notified(mint, "post_graduation_pump")):
+            for token in tokens:
+                mint = token['mint']
                 
-                await self.notifier.send_pump_alert(
-                    symbol=token['symbol'],
-                    mint=mint,
-                    data=current_data,
-                    alert_type="post_graduation_pump"
-                )
-                await self.db.mark_notified(mint, "post_graduation_pump")
-                await self.db.add_metric(mint, market_cap=current_mc, 
-                                       price=current_data.get('price'),
-                                       volume=current_data.get('volume_5m'),
-                                       is_graduated=True)
+                # Verificar si el token se ha graduado (MC > objetivo)
+                current_data = await self.get_current_token_data(mint)
+                if not current_data:
+                    continue
+
+                current_mc = current_data.get('market_cap', 0)
+                previous_mc = token.get('market_cap', 0)
+
+                # Si el token supera el MC de graduación, marcarlo como graduado
+                if current_mc > GRADUATION_MC_TARGET and not await self.db.was_notified(mint, "graduated"):
+                    await self.db.mark_graduated(mint)
+                    await self.db.mark_notified(mint, "graduated")
+
+                # Detectar explosión post-graduación (aumento significativo de precio)
+                if (current_mc > GRADUATION_MC_TARGET and 
+                    current_data.get('price_change_5m', 0) > 10 and
+                    not await self.db.was_notified(mint, "post_graduation_pump")):
+                    
+                    await self.notifier.send_pump_alert(
+                        symbol=token['symbol'],
+                        mint=mint,
+                        data=current_data,
+                        alert_type="post_graduation_pump"
+                    )
+                    await self.db.mark_notified(mint, "post_graduation_pump")
+        except Exception as e:
+            logging.error(f"❌ Error en scan_graduated_tokens: {str(e)}")
 
     async def get_current_token_data(self, mint: str) -> Dict:
         """Obtener datos actualizados del token"""
-        async with APIClient() as client:
-            jupiter = JupiterAPI(client)
-            tokens = await jupiter.search_token(mint)
-            
-            if tokens and len(tokens) > 0:
-                token = tokens[0]
-                stats_5m = token.get('stats5m', {})
-                return {
-                    'market_cap': token.get('mcap', 0),
-                    'price': token.get('usdPrice', 0),
-                    'volume_5m': stats_5m.get('volume', 0),
-                    'volume_change_5m': stats_5m.get('volumeChange', 0),
-                    'price_change_5m': stats_5m.get('priceChange', 0)
-                }
+        try:
+            async with APIClient() as client:
+                jupiter = JupiterAPI(client)
+                tokens = await jupiter.search_token(mint)
+                
+                if tokens and len(tokens) > 0:
+                    token = tokens[0]
+                    stats_5m = token.get('stats5m', {})
+                    return {
+                        'market_cap': token.get('mcap', 0),
+                        'price': token.get('usdPrice', 0),
+                        'price_change_5m': stats_5m.get('priceChange', 0)
+                    }
+        except Exception as e:
+            logging.error(f"❌ Error obteniendo datos actualizados {mint}: {str(e)}")
         return None
 
     async def run(self):
@@ -495,7 +462,7 @@ class PostGraduationScanner:
         while self.running:
             try:
                 await self.scan_graduated_tokens()
-                await asyncio.sleep(CHECK_INTERVAL * 60)  # Revisar cada X minutos
+                await asyncio.sleep(CHECK_INTERVAL * 60)
             except Exception as e:
                 logging.error(f"❌ Error en PostGraduationScanner: {str(e)}")
                 await asyncio.sleep(30)
@@ -536,6 +503,7 @@ def is_authorized(update: Update) -> bool:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start enfocado en Pump.fun"""
     if not is_authorized(update):
+        await update.message.reply_text("❌ No autorizado")
         return
     
     welcome_text = """
@@ -565,6 +533,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def estrategia_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /estrategia - Mostrar parámetros de trading"""
     if not is_authorized(update):
+        await update.message.reply_text("❌ No autorizado")
         return
 
     strategy_text = f"""
@@ -596,6 +565,7 @@ async def estrategia_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /iniciar - Iniciar monitores"""
     if not is_authorized(update):
+        await update.message.reply_text("❌ No autorizado")
         return
 
     try:
@@ -619,6 +589,7 @@ async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /detener - Detener monitores"""
     if not is_authorized(update):
+        await update.message.reply_text("❌ No autorizado")
         return
 
     try:
@@ -640,6 +611,7 @@ async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /status - Estado del sistema"""
     if not is_authorized(update):
+        await update.message.reply_text("❌ No autorizado")
         return
 
     pump_status = "🟢 ACTIVO" if pump_monitor and pump_monitor.running else "🔴 INACTIVO"
@@ -662,6 +634,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def silent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /silent - Modo silencioso"""
     if not is_authorized(update):
+        await update.message.reply_text("❌ No autorizado")
         return
 
     args = context.args
@@ -675,12 +648,9 @@ async def silent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Modo silencioso: {status}")
 
 # ========== WEBHOOK ENDPOINTS ==========
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
     """Endpoint para webhooks de Telegram"""
-    if token != TELEGRAM_BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
-    
     try:
         data = await request.json()
         update = Update.de_json(data, telegram_app.bot)
@@ -703,11 +673,6 @@ async def health_check():
         "monitors": {
             "pump_monitor": pump_monitor.running if pump_monitor else False,
             "post_graduation_scanner": post_graduation_scanner.running if post_graduation_scanner else False
-        },
-        "parameters": {
-            "pump_mc_min": PUMP_MC_MIN,
-            "pump_mc_max": PUMP_MC_MAX,
-            "graduation_target": GRADUATION_MC_TARGET
         }
     }
 
@@ -765,7 +730,17 @@ async def startup_event():
     try:
         await initialize_app()
         await telegram_app.initialize()
-        await telegram_app.start()
+        
+        # Configurar webhook si está en producción
+        if os.getenv("RAILWAY_STATIC_URL"):
+            webhook_url = f"{os.getenv('RAILWAY_STATIC_URL')}/webhook"
+            await telegram_app.bot.set_webhook(webhook_url)
+            logging.info(f"✅ Webhook configurado: {webhook_url}")
+        else:
+            # Usar polling en desarrollo
+            await telegram_app.start()
+            logging.info("✅ Bot iniciado con polling")
+            
         logging.info("🚀 Bot listo - Usa /iniciar para comenzar")
     except Exception as e:
         logging.error(f"❌ Error en startup: {str(e)}")
