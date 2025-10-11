@@ -359,7 +359,7 @@ class PreExplosion:
             except Exception:
                 boosted_ok = False
 
-            # Prepare message and send
+            # Prepare message and send - CORREGIDO EL ERROR DE F-STRING
             sym = t.get("symbol") or t.get("name") or "UNK"
             txt = (f"🔥 <b>PRE-EXPLOSIÓN</b>\n\n"
                    f"<b>{safe_html(sym)}</b>\n"
@@ -367,7 +367,7 @@ class PreExplosion:
                    f"• Vol5m: {vc}\n"
                    f"• Traders5m: {int(nt)}\n"
                    f"• PriceChg5m: {pc:.2f}%\n"
-                   f"{'• Boosted: Sí\n' if boosted_ok else ''}"
+                   f"{'• Boosted: Sí' if boosted_ok else ''}\n"  # 🆕 CORRECCIÓN: \n fuera de la expresión
                    f"\n<b>Mint:</b>\n<code>{mint}</code>\n\n"
                    f"• Revisa rápidamente con los botones y decide manualmente.")
             buttons = build_buttons(mint)
