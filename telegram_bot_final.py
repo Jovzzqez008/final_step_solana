@@ -1,7 +1,5 @@
-# telegram_bot_pump_fun_multisource.py
-# SOLANA PUMP.FUN BOT - FUENTES MÚLTIPLES
-# PostgreSQL + Múltiples APIs + Detección Avanzada
-# Deployment: Railway (Puerto 8080)
+# telegram_bot_pump_fun_multisource_fixed.py
+# SOLANA PUMP.FUN BOT - FUENTES MÚLTIPLES (ESQUEMA CORREGIDO)
 
 import os
 import re
@@ -34,35 +32,35 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 # MÚLTIPLES FUENTES PARA DETECCIÓN
 JUPITER_API_BASE = "https://lite-api.jup.ag/tokens/v2"
 DEXSCREENER_API = "https://api.dexscreener.com/latest"
-PUMP_FUN_API = "https://api.pump.fun"  # API no oficial de Pump.fun
-BIRDEYE_API = "https://public-api.birdeye.so"  # Alternativa confiable
+BIRDEYE_API = "https://public-api.birdeye.so"
 
 # Parámetros de trading optimizados
 PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "3000"))
 PUMP_MC_MAX = float(os.getenv("PUMP_MC_MAX", "50000"))
 GRADUATION_MC_TARGET = float(os.getenv("GRADUATION_MC_TARGET", "65000"))
 
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1"))  # 1 minuto
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "1"))
 PORT = int(os.getenv("PORT", "8080"))
 
 # Regex para detectar mints de Solana
 MINT_PATTERN = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
 
-# ========== BASE DE DATOS POSTGRESQL OPTIMIZADA ==========
+# ========== BASE DE DATOS POSTGRESQL CORREGIDA ==========
 class Database:
     def __init__(self):
         self.pool = None
 
     async def connect(self):
-        """Conectar a PostgreSQL y crear tablas optimizadas"""
+        """Conectar a PostgreSQL y crear/actualizar tablas"""
         self.pool = await asyncpg.create_pool(DATABASE_URL)
         await self._create_tables()
+        await self._update_tables()  # Actualizar esquema si es necesario
         logging.info("✅ PostgreSQL conectado y tablas verificadas")
 
     async def _create_tables(self):
-        """Crear tablas esenciales para estrategia Pump.fun"""
+        """Crear tablas esenciales con esquema actualizado"""
         async with self.pool.acquire() as conn:
-            # Tabla de notificaciones de Pump.fun
+            # Tabla de notificaciones de Pump.fun (ESQUEMA ACTUALIZADO)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS pump_notifications (
                     id SERIAL PRIMARY KEY,
@@ -76,14 +74,50 @@ class Database:
                 )
             """)
             
-            # Tabla de tokens vistos (para evitar duplicados)
+            # Tabla de tokens vistos (ESQUEMA ACTUALIZADO)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS seen_tokens (
                     mint TEXT PRIMARY KEY,
                     last_seen TIMESTAMP DEFAULT NOW(),
-                    source TEXT
+                    source TEXT DEFAULT 'unknown'
                 )
             """)
+            
+            # Eliminar tablas antiguas si existen
+            try:
+                await conn.execute("DROP TABLE IF EXISTS notifications")
+                await conn.execute("DROP TABLE IF EXISTS metrics")
+                logging.info("✅ Tablas antiguas eliminadas")
+            except Exception as e:
+                logging.warning(f"⚠️ No se pudieron eliminar tablas antiguas: {e}")
+
+    async def _update_tables(self):
+        """Actualizar tablas existentes con nuevas columnas"""
+        async with self.pool.acquire() as conn:
+            try:
+                # Agregar columnas faltantes a pump_notifications
+                await conn.execute("""
+                    ALTER TABLE pump_notifications 
+                    ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'
+                """)
+                await conn.execute("""
+                    ALTER TABLE pump_notifications 
+                    ADD COLUMN IF NOT EXISTS market_cap DECIMAL
+                """)
+                await conn.execute("""
+                    ALTER TABLE pump_notifications 
+                    ADD COLUMN IF NOT EXISTS graduated BOOLEAN DEFAULT FALSE
+                """)
+                
+                # Agregar columnas faltantes a seen_tokens
+                await conn.execute("""
+                    ALTER TABLE seen_tokens 
+                    ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'unknown'
+                """)
+                
+                logging.info("✅ Esquema de base de datos actualizado")
+            except Exception as e:
+                logging.error(f"❌ Error actualizando esquema: {e}")
 
     async def was_notified(self, mint: str, alert_type: str = None) -> bool:
         """Verificar si un token ya fue notificado"""
@@ -107,6 +141,7 @@ class Database:
                     alert_type = EXCLUDED.alert_type,
                     symbol = EXCLUDED.symbol,
                     market_cap = EXCLUDED.market_cap,
+                    source = EXCLUDED.source,
                     detected_at = NOW()
             """, mint, alert_type, symbol, market_cap, source)
 
@@ -221,8 +256,7 @@ class DexScreenerAPI:
 
     async def get_recent_pairs(self, limit: int = 50) -> List[Dict]:
         """Obtener pairs recientes - FUENTE SECUNDARIA"""
-        url = f"{self.base_url}/dex/pairs"
-        # Buscar pairs nuevos en Solana
+        url = f"{self.base_url}/dex/pairs/recent"
         data = await self.client.fetch_json(url, params={"limit": limit})
         
         if isinstance(data, list):
@@ -236,26 +270,7 @@ class DexScreenerAPI:
         url = f"{self.base_url}/tokens/{mint}"
         return await self.client.fetch_json(url)
 
-class BirdEyeAPI:
-    def __init__(self, client: APIClient):
-        self.client = client
-        self.base_url = BIRDEYE_API
-        self.api_key = os.getenv("BIRDEYE_API_KEY", "")
-
-    async def get_new_tokens(self, limit: int = 30) -> List[Dict]:
-        """Obtener tokens nuevos desde BirdEye - FUENTE TERCIARIA"""
-        url = f"{self.base_url}/defi/token_new_list"
-        headers = {}
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
-            
-        data = await self.client.fetch_json(url, params={"limit": limit}, headers=headers)
-        
-        if isinstance(data, dict) and data.get("data", {}).get("items"):
-            return data["data"]["items"]
-        return []
-
-# ========== NOTIFICADOR TELEGRAM MEJORADO ==========
+# ========== NOTIFICADOR TELEGRAM ==========
 class TelegramNotifier:
     def __init__(self, bot_app: Application):
         self.app = bot_app
@@ -316,7 +331,7 @@ class TelegramNotifier:
         except Exception as e:
             logging.error(f"❌ Error enviando alerta: {str(e)}")
 
-# ========== MONITOR PRINCIPAL CON MÚLTIPLES FUENTES ==========
+# ========== MONITOR PRINCIPAL SIMPLIFICADO ==========
 class PumpFunMonitor:
     def __init__(self, db: Database, notifier: TelegramNotifier):
         self.db = db
@@ -333,34 +348,34 @@ class PumpFunMonitor:
         tokens_found = 0
         async with APIClient() as client:
             # FUENTE 1: Jupiter Recent Tokens (PRINCIPAL)
-            jupiter = JupiterAPI(client)
-            recent_tokens = await jupiter.get_recent_tokens(50)
-            tokens_found += await self.process_jupiter_tokens(recent_tokens, "jupiter_recent")
+            try:
+                jupiter = JupiterAPI(client)
+                recent_tokens = await jupiter.get_recent_tokens(30)
+                tokens_found += await self.process_tokens(recent_tokens, "jupiter_recent")
+            except Exception as e:
+                logging.error(f"❌ Error en Jupiter Recent: {e}")
 
             # FUENTE 2: Jupiter Trending Tokens
-            trending_tokens = await jupiter.get_trending_tokens("5m", 30)
-            tokens_found += await self.process_jupiter_tokens(trending_tokens, "jupiter_trending")
+            try:
+                trending_tokens = await jupiter.get_trending_tokens("5m", 20)
+                tokens_found += await self.process_tokens(trending_tokens, "jupiter_trending")
+            except Exception as e:
+                logging.error(f"❌ Error en Jupiter Trending: {e}")
 
-            # FUENTE 3: DexScreener Recent Pairs
-            dexscreener = DexScreenerAPI(client)
-            recent_pairs = await dexscreener.get_recent_pairs(30)
-            tokens_found += await self.process_dexscreener_pairs(recent_pairs, "dexscreener")
+        logging.info(f"✅ Escaneo #{self.scan_round} completado. Tokens procesados: {tokens_found}")
 
-            # FUENTE 4: BirdEye New Tokens (si está configurado)
-            birdeye = BirdEyeAPI(client)
-            new_tokens = await birdeye.get_new_tokens(20)
-            tokens_found += await self.process_birdeye_tokens(new_tokens, "birdeye")
-
-        logging.info(f"✅ Escaneo #{self.scan_round} completado. Tokens encontrados: {tokens_found}")
-
-    async def process_jupiter_tokens(self, tokens: List[Dict], source: str) -> int:
-        """Procesar tokens de Jupiter API"""
+    async def process_tokens(self, tokens: List[Dict], source: str) -> int:
+        """Procesar tokens de cualquier fuente"""
         processed = 0
         for token in tokens:
+            if not isinstance(token, dict):
+                continue
+
             mint = token.get('id')
             if not mint:
                 continue
 
+            # Verificar si ya fue procesado recientemente
             if await self.db.seen_recently(mint, minutes=2):
                 continue
 
@@ -370,68 +385,9 @@ class PumpFunMonitor:
             symbol = token.get('symbol', 'UNKNOWN')
             price = token.get('usdPrice', 0)
 
-            # Solo procesar tokens con market cap razonable (evitar spam)
+            # Solo procesar tokens con market cap razonable
             if market_cap < 1000 or market_cap > 100000:
                 continue
-
-            processed += await self.evaluate_token(mint, symbol, market_cap, price, source)
-            
-        return processed
-
-    async def process_dexscreener_pairs(self, pairs: List[Dict], source: str) -> int:
-        """Procesar pairs de DexScreener"""
-        processed = 0
-        for pair in pairs:
-            if not isinstance(pair, dict):
-                continue
-                
-            base_token = pair.get('baseToken', {})
-            if not base_token:
-                continue
-
-            mint = base_token.get('address')
-            if not mint:
-                continue
-
-            if await self.db.seen_recently(mint, minutes=2):
-                continue
-
-            await self.db.mark_seen(mint, source)
-            
-            market_cap = float(pair.get('marketCap', 0))
-            symbol = base_token.get('symbol', 'UNKNOWN')
-            price = float(pair.get('priceUsd', 0))
-
-            # Filtrar por edad del pair (buscar muy nuevos)
-            pair_created = pair.get('pairCreatedAt', 0)
-            if pair_created > 0:
-                age_minutes = (datetime.now().timestamp() - pair_created/1000) / 60
-                if age_minutes > 30:  # Ignorar pairs con más de 30 minutos
-                    continue
-
-            processed += await self.evaluate_token(mint, symbol, market_cap, price, source)
-            
-        return processed
-
-    async def process_birdeye_tokens(self, tokens: List[Dict], source: str) -> int:
-        """Procesar tokens de BirdEye"""
-        processed = 0
-        for token in tokens:
-            if not isinstance(token, dict):
-                continue
-                
-            mint = token.get('address')
-            if not mint:
-                continue
-
-            if await self.db.seen_recently(mint, minutes=2):
-                continue
-
-            await self.db.mark_seen(mint, source)
-            
-            market_cap = float(token.get('market_cap', 0))
-            symbol = token.get('symbol', 'UNKNOWN')
-            price = float(token.get('price', 0))
 
             processed += await self.evaluate_token(mint, symbol, market_cap, price, source)
             
@@ -457,6 +413,7 @@ class PumpFunMonitor:
             )
             await self.db.mark_notified(mint, "pump_early", symbol, market_cap, source)
             processed += 1
+            logging.info(f"🚨 Alerta EARLY enviada: {symbol} - ${market_cap:,.0f}")
 
         # ESTRATEGIA 2: Pre-graduación (acercándose al MC objetivo)
         elif (market_cap >= GRADUATION_MC_TARGET * 0.7 and 
@@ -477,6 +434,7 @@ class PumpFunMonitor:
             )
             await self.db.mark_notified(mint, "pre_graduation", symbol, market_cap, source)
             processed += 1
+            logging.info(f"🎯 Alerta PRE-GRAD enviada: {symbol} - ${market_cap:,.0f}")
 
         return processed
 
@@ -486,17 +444,17 @@ class PumpFunMonitor:
         while self.running:
             try:
                 await self.scan_all_sources()
-                await asyncio.sleep(CHECK_INTERVAL * 60)  # Esperar entre escaneos
+                await asyncio.sleep(CHECK_INTERVAL * 60)
             except Exception as e:
                 logging.error(f"❌ Error en PumpFunMonitor: {str(e)}")
-                await asyncio.sleep(30)  # Esperar 30 segundos en caso de error
+                await asyncio.sleep(30)
 
     async def start(self):
         """Iniciar monitor"""
         if self.task and not self.task.done():
             return
         self.task = asyncio.create_task(self.run())
-        logging.info("✅ PumpFunMonitor iniciado - MÚLTIPLES FUENTES ACTIVAS")
+        logging.info("✅ PumpFunMonitor iniciado - 2 FUENTES ACTIVAS")
 
     async def stop(self):
         """Detener monitor"""
@@ -509,7 +467,7 @@ class PumpFunMonitor:
                 pass
         logging.info("⛔ PumpFunMonitor detenido")
 
-# ========== SCANNER POST-GRADUACIÓN MEJORADO ==========
+# ========== SCANNER POST-GRADUACIÓN SIMPLIFICADO ==========
 class PostGraduationScanner:
     def __init__(self, db: Database, notifier: TelegramNotifier):
         self.db = db
@@ -521,7 +479,6 @@ class PostGraduationScanner:
         """Escanear tokens que han sido graduados para detectar explosiones"""
         try:
             tokens = await self.db.get_pre_graduation_tokens()
-            logging.info(f"🔍 Escaneando {len(tokens)} tokens para graduación...")
             
             for token in tokens:
                 mint = token['mint']
@@ -531,7 +488,6 @@ class PostGraduationScanner:
                     continue
 
                 current_mc = current_data.get('market_cap', 0)
-                previous_mc = token.get('market_cap', 0)
 
                 # Si el token supera el MC de graduación, marcarlo como graduado
                 if current_mc > GRADUATION_MC_TARGET and not await self.db.was_notified(mint, "graduated"):
@@ -541,7 +497,7 @@ class PostGraduationScanner:
 
                 # Detectar explosión post-graduación
                 if (current_mc > GRADUATION_MC_TARGET and 
-                    current_data.get('price_change_5m', 0) > 15 and  # 15% de aumento en 5min
+                    current_data.get('price_change_5m', 0) > 15 and
                     not await self.db.was_notified(mint, "post_graduation_pump")):
                     
                     await self.notifier.send_pump_alert(
@@ -549,7 +505,7 @@ class PostGraduationScanner:
                         mint=mint,
                         data=current_data,
                         alert_type="post_graduation_pump",
-                        source="post_graduation_scanner"
+                        source="post_graduation"
                     )
                     await self.db.mark_notified(mint, "post_graduation_pump")
                     logging.info(f"🔥 Explosión post-graduación: {token['symbol']}")
@@ -582,7 +538,7 @@ class PostGraduationScanner:
         while self.running:
             try:
                 await self.scan_graduated_tokens()
-                await asyncio.sleep(2 * 60)  # Revisar cada 2 minutos
+                await asyncio.sleep(2 * 60)
             except Exception as e:
                 logging.error(f"❌ Error en PostGraduationScanner: {str(e)}")
                 await asyncio.sleep(30)
@@ -606,7 +562,7 @@ class PostGraduationScanner:
         logging.info("⛔ PostGraduationScanner detenido")
 
 # ========== APLICACIÓN FASTAPI + TELEGRAM ==========
-app = FastAPI(title="Solana Pump.fun Bot - Fuentes Múltiples")
+app = FastAPI(title="Solana Pump.fun Bot - Esquema Corregido")
 
 # Variables globales
 db = Database()
@@ -619,102 +575,34 @@ def is_authorized(update: Update) -> bool:
     """Verificar si el usuario está autorizado"""
     return update.effective_user and update.effective_user.id == OWNER_ID
 
-# ========== COMANDOS TELEGRAM MEJORADOS ==========
+# ========== COMANDOS TELEGRAM ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /start enfocado en Pump.fun"""
+    """Comando /start"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
     
     welcome_text = """
-🎯 <b>SOLANA PUMP.FUN BOT - FUENTES MÚLTIPLES</b> 🚀
+🎯 <b>SOLANA PUMP.FUN BOT - ESQUEMA CORREGIDO</b> 🚀
 
 <b>Fuentes activas:</b>
 • 📡 Jupiter API (Recent Tokens)
-• 📡 Jupiter API (Trending Tokens)  
-• 📡 DexScreener (Recent Pairs)
-• 📡 BirdEye API (New Tokens)
+• 📡 Jupiter API (Trending Tokens)
 
 <b>Comandos:</b>
 /iniciar - Activar monitores
 /detener - Pausar monitores  
 /status - Estado del sistema
 /silent on|off - Modo silencioso
-/estrategia - Ver parámetros
-/fuentes - Ver fuentes activas
 
 <b>Alertas:</b>
 🚨 EARLY - MC bajo ($3K-$9K)
 🎯 PRE-GRAD - Cerca de graduación ($45K-$65K)  
 🔥 POST-GRAD - Explosión después de graduación
 
-<code>Sistema multi-fuente para máxima cobertura</code>
+<code>Base de datos actualizada y funcionando</code>
     """
     await update.message.reply_text(welcome_text, parse_mode="HTML")
-
-async def fuentes_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /fuentes - Mostrar fuentes activas"""
-    if not is_authorized(update):
-        await update.message.reply_text("❌ No autorizado")
-        return
-
-    fuentes_text = """
-📡 <b>FUENTES DE DATOS ACTIVAS</b>
-
-<b>Principales:</b>
-• ✅ Jupiter Recent Tokens (50 tokens)
-• ✅ Jupiter Trending Tokens (30 tokens)
-• ✅ DexScreener Recent Pairs (30 pairs)
-
-<b>Secundarias:</b>
-• ✅ BirdEye New Tokens (20 tokens)
-
-<b>Ventajas:</b>
-• 🎯 Mayor cobertura que WebSocket
-• ⚡ Detección cada 1 minuto  
-• 🔄 Múltiples APIs de respaldo
-• 📊 Filtrado inteligente
-
-<b>Estadísticas:</b>
-• Escaneos: Continuos
-• Intervalo: 1 minuto
-• Tokens por escaneo: 130+
-• Fuentes: 4 diferentes
-    """
-    await update.message.reply_text(fuentes_text, parse_mode="HTML")
-
-async def estrategia_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /estrategia - Mostrar parámetros de trading"""
-    if not is_authorized(update):
-        await update.message.reply_text("❌ No autorizado")
-        return
-
-    strategy_text = f"""
-📊 <b>PARÁMETROS DE ESTRATEGIA</b>
-
-🎯 <b>Detección Temprana:</b>
-• MC Mínimo: ${PUMP_MC_MIN:,.0f}
-• MC Máximo Early: ${PUMP_MC_MIN * 3:,.0f}
-
-🎓 <b>Pre-Graduación:</b>
-• MC Objetivo: ${GRADUATION_MC_TARGET:,.0f}
-• Rango Alerta: ${GRADUATION_MC_TARGET * 0.7:,.0f} - ${GRADUATION_MC_TARGET:,.0f}
-
-⚡ <b>Configuración:</b>
-• Intervalo Escaneo: {CHECK_INTERVAL} minuto(s)
-• Fuentes Activas: 4
-• Tokens por Escaneo: 130+
-
-<b>Ejemplo Tariffcoin:</b>
-• Creación: ~$1,000 MC
-• Alerta Early: ~$3,000 MC  
-• Pre-Graduación: ~$45,000 MC
-• Graduación: ~$65,000 MC
-• Explosión: +12,000% post-graduación
-
-<i>Objetivo: Detección temprana con múltiples fuentes</i>
-    """
-    await update.message.reply_text(strategy_text, parse_mode="HTML")
 
 async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /iniciar - Iniciar monitores"""
@@ -730,9 +618,9 @@ async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             "✅ <b>MONITORES ACTIVADOS</b>\n\n"
-            "🎯 Pump.fun Monitor → ESCANEANDO 4 FUENTES\n"
+            "🎯 Pump.fun Monitor → ESCANEANDO 2 FUENTES\n"
             "🔥 Post-Graduation Scanner → ACTIVO\n\n"
-            "<i>Buscando oportunidades en 130+ tokens por escaneo...</i>",
+            "<i>Buscando oportunidades pre-graduación...</i>",
             parse_mode="HTML"
         )
         logging.info(f"📱 Monitores iniciados por: {update.effective_user.id}")
@@ -773,20 +661,13 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     silent_status = "🔇 ON" if notifier and notifier.silent_mode else "🔔 OFF"
 
     status_text = (
-        "📊 <b>ESTADO DEL SISTEMA - FUENTES MÚLTIPLES</b>\n\n"
+        "📊 <b>ESTADO DEL SISTEMA</b>\n\n"
         f"🎯 Pump.fun Monitor: {pump_status}\n"
         f"🔥 Post-Graduation: {post_status}\n"
         f"🔊 Modo Silencioso: {silent_status}\n\n"
         
-        "<b>📡 Fuentes Activas:</b>\n"
-        "• ✅ Jupiter Recent (50 tokens)\n"
-        "• ✅ Jupiter Trending (30 tokens)\n"
-        "• ✅ DexScreener Pairs (30 pairs)\n"
-        "• ✅ BirdEye New (20 tokens)\n\n"
-        
         "<b>⚙️ Configuración:</b>\n"
         f"• Intervalo: {CHECK_INTERVAL} minuto(s)\n"
-        f"• Tokens por escaneo: 130+\n"
         f"• Base Datos: {'✅ CONECTADO' if db.pool else '❌ DESCONECTADO'}\n"
     )
 
@@ -829,17 +710,10 @@ async def health_check():
     """Endpoint de health check"""
     return {
         "status": "healthy",
-        "strategy": "pump_fun_multi_source",
         "timestamp": datetime.utcnow().isoformat(),
         "monitors": {
             "pump_monitor": pump_monitor.running if pump_monitor else False,
             "post_graduation_scanner": post_graduation_scanner.running if post_graduation_scanner else False
-        },
-        "sources": {
-            "jupiter_recent": True,
-            "jupiter_trending": True,
-            "dexscreener": True,
-            "birdeye": True
         }
     }
 
@@ -847,10 +721,8 @@ async def health_check():
 async def root():
     """Endpoint raíz"""
     return {
-        "message": "Solana Pump.fun Bot - Fuentes Múltiples",
-        "status": "operational",
-        "sources": 4,
-        "health": "/health"
+        "message": "Solana Pump.fun Bot - Esquema Corregido",
+        "status": "operational"
     }
 
 # ========== INICIALIZACIÓN ==========
@@ -882,15 +754,13 @@ async def initialize_app():
     telegram_app.add_handler(CommandHandler("detener", detener_command))
     telegram_app.add_handler(CommandHandler("status", status_command))
     telegram_app.add_handler(CommandHandler("silent", silent_command))
-    telegram_app.add_handler(CommandHandler("estrategia", estrategia_command))
-    telegram_app.add_handler(CommandHandler("fuentes", fuentes_command))
 
     # Inicializar notificador y monitores
     notifier = TelegramNotifier(telegram_app)
     pump_monitor = PumpFunMonitor(db, notifier)
     post_graduation_scanner = PostGraduationScanner(db, notifier)
 
-    logging.info("✅ Bot de Pump.fun inicializado - 4 FUENTES ACTIVAS")
+    logging.info("✅ Bot de Pump.fun inicializado - ESQUEMA CORREGIDO")
 
 @app.on_event("startup")
 async def startup_event():
