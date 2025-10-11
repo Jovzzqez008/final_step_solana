@@ -1,5 +1,5 @@
-# telegram_bot_final_v7_pro_enhanced.py
-# SOLANA MONITOR BOT v7 PRO - MEJORADO CON WATCHLIST + PRE-GRADUACIÓN
+# telegram_bot_final_v7_pro_complete.py
+# SOLANA MONITOR BOT v7 PRO - COMPLETO CON TODOS LOS COMANDOS
 # PostgreSQL + QuickNode WSS + Jupiter V2 + Sistema de Triggers Mejorado
 
 import os
@@ -36,19 +36,19 @@ JUPITER_API_BASE = os.getenv("JUPITER_API_URL", "https://lite-api.jup.ag/tokens/
 DEXSCREENER_API = "https://api.dexscreener.com/latest"
 
 # Parámetros de trading MEJORADOS
-PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "20000"))  # Más bajo para detección temprana
+PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "10000"))
 PRE_EXPLOSION_MC_MIN = float(os.getenv("PRE_EXPLOSION_MC_MIN", "50000"))
-PRE_GRADUATION_MC_THRESHOLD = float(os.getenv("PRE_GRADUATION_MC_THRESHOLD", "50000"))  # Alerta antes de graduación
+PRE_GRADUATION_MC_THRESHOLD = float(os.getenv("PRE_GRADUATION_MC_THRESHOLD", "25000"))
 
 # Triggers de Pre-Explosión
-WATCHLIST_INTERVAL = 60  # Segundos entre chequeos de watchlist
-UP_TRIGGER_PCT = 10.0    # +10% trigger normal
-REVERSAL_NEGATIVE_THRESHOLD = -20.0  # Umbral negativo para considerar "deep negative"
-REVERSAL_UP_PCT = 12.0   # +12% trigger desde zona negativa
+WATCHLIST_INTERVAL = 60
+UP_TRIGGER_PCT = 10.0
+REVERSAL_NEGATIVE_THRESHOLD = -20.0
+REVERSAL_UP_PCT = 12.0
 
 # Filtros de calidad
-MIN_ORGANIC_SCORE = int(os.getenv("MIN_ORGANIC_SCORE", "30"))  # Filtro anti-basura
-MAX_WATCHLIST_SIZE = 100  # Máximo tokens en watchlist simultáneos
+MIN_ORGANIC_SCORE = int(os.getenv("MIN_ORGANIC_SCORE", "30"))
+MAX_WATCHLIST_SIZE = 100
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "2"))
 PORT = int(os.getenv("PORT", "8080"))
@@ -103,7 +103,7 @@ class Database:
                 )
             """)
 
-            # 🆕 TABLA DE CANDIDATOS (WATCHLIST)
+            # TABLA DE CANDIDATOS (WATCHLIST)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS candidates (
                     id SERIAL PRIMARY KEY,
@@ -177,7 +177,7 @@ class Database:
                 VALUES ($1, $2, $3, $4, $5)
             """, mint, market_cap, price, volume, organic_score)
 
-    # 🆕 MÉTODOS PARA SISTEMA DE WATCHLIST
+    # MÉTODOS PARA SISTEMA DE WATCHLIST
     async def add_candidate(self, mint: str, symbol: str = None, name: str = None,
                           base_price: float = None, base_price_24h_change: float = None,
                           market_cap: float = None, organic_score: int = None, 
@@ -219,7 +219,7 @@ class Database:
                 return False
 
     async def get_watchlist_candidates(self, limit: int = 15) -> List[asyncpg.Record]:
-        """Obtener candidatos para monitoreo (priorizando organic score y antigüedad)"""
+        """Obtener candidatos para monitoreo"""
         async with self.pool.acquire() as conn:
             return await conn.fetch("""
                 SELECT * FROM candidates 
@@ -240,7 +240,7 @@ class Database:
             """, mint, price, market_cap)
 
     async def mark_candidate_triggered(self, mint: str):
-        """Marcar candidato como triggered (ya se disparó alerta)"""
+        """Marcar candidato como triggered"""
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 UPDATE candidates 
@@ -255,6 +255,21 @@ class Database:
                 DELETE FROM candidates 
                 WHERE created_at < NOW() - INTERVAL '1 hour' * $1
             """, hours)
+
+    async def get_stats(self):
+        """Obtener estadísticas del sistema"""
+        async with self.pool.acquire() as conn:
+            total_candidates = await conn.fetchval("SELECT COUNT(*) FROM candidates")
+            watching_candidates = await conn.fetchval("SELECT COUNT(*) FROM candidates WHERE status = 'watching'")
+            triggered_candidates = await conn.fetchval("SELECT COUNT(*) FROM candidates WHERE status = 'triggered'")
+            total_notifications = await conn.fetchval("SELECT COUNT(*) FROM notifications")
+            
+            return {
+                'total_candidates': total_candidates,
+                'watching_candidates': watching_candidates,
+                'triggered_candidates': triggered_candidates,
+                'total_notifications': total_notifications
+            }
 
 # ========== CLIENTES API ROBUSTOS ==========
 class APIClient:
@@ -445,7 +460,7 @@ class PumpFunMonitor:
             market_cap = token_data.get('market_cap', 0)
             organic_score = token_data.get('organic_score', 0)
 
-            # 🆕 AÑADIR A WATCHLIST SI CUMPLE CRITERIOS MÍNIMOS
+            # AÑADIR A WATCHLIST SI CUMPLE CRITERIOS MÍNIMOS
             if (market_cap >= PUMP_MC_MIN and 
                 organic_score >= MIN_ORGANIC_SCORE and
                 token_data.get('price')):
@@ -464,7 +479,7 @@ class PumpFunMonitor:
                 if added:
                     logging.info(f"✅ Candidato añadido a watchlist: {token_data.get('symbol')}")
 
-            # 🆕 ALERTA INMEDIATA SI ES MUY PROMETEDOR (PRE-GRADUACIÓN)
+            # ALERTA INMEDIATA SI ES MUY PROMETEDOR (PRE-GRADUACIÓN)
             if (market_cap >= PUMP_MC_MIN and 
                 market_cap <= PRE_GRADUATION_MC_THRESHOLD and
                 organic_score >= 50 and
@@ -565,7 +580,7 @@ class PumpFunMonitor:
         logging.info("⛔ PumpFunMonitor detenido")
 
 class WatchlistMonitor:
-    """🆕 MONITOR MEJORADO DE WATCHLIST CON TRIGGERS DUALES"""
+    """MONITOR MEJORADO DE WATCHLIST CON TRIGGERS DUALES"""
     def __init__(self, db: Database, notifier: TelegramNotifier):
         self.db = db
         self.notifier = notifier
@@ -805,7 +820,7 @@ def is_authorized(update: Update) -> bool:
     """Verificar si el usuario está autorizado"""
     return update.effective_user and update.effective_user.id == OWNER_ID
 
-# ========== COMANDOS TELEGRAM MEJORADOS ==========
+# ========== COMANDOS TELEGRAM COMPLETOS ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start mejorado"""
     if not is_authorized(update):
@@ -831,10 +846,150 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /status - Ver estado y estadísticas
 /watchlist - Ver tokens en observación
 /silent on|off - Modo silencioso
+/estadisticas - Estadísticas del sistema
 
 <code>Sistema optimizado para detección temprana</code>
     """
     await update.message.reply_text(welcome_text, parse_mode="HTML")
+
+async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /iniciar - Iniciar todos los monitores"""
+    if not is_authorized(update):
+        return
+
+    try:
+        # Iniciar monitores en secuencia
+        if pump_monitor:
+            await pump_monitor.start()
+        if watchlist_monitor:
+            await watchlist_monitor.start()
+        if trending_scanner:
+            await trending_scanner.start()
+
+        await update.message.reply_text(
+            "✅ <b>TODOS LOS MONITORES INICIADOS</b>\n\n"
+            "🎯 Pump.Fun Monitor → ACTIVO\n"
+            "📊 Watchlist Monitor → ACTIVO\n"  
+            "📈 Trending Scanner → ACTIVO\n\n"
+            "<i>El sistema está ahora monitoreando tokens en tiempo real...</i>",
+            parse_mode="HTML"
+        )
+        logging.info(f"📱 Monitores iniciados por usuario: {update.effective_user.id}")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error iniciando monitores: {str(e)}")
+        logging.error(f"❌ Error en iniciar_command: {str(e)}")
+
+async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /detener - Detener todos los monitores"""
+    if not is_authorized(update):
+        return
+
+    try:
+        # Detener monitores en secuencia
+        if pump_monitor:
+            await pump_monitor.stop()
+        if watchlist_monitor:
+            await watchlist_monitor.stop()
+        if trending_scanner:
+            await trending_scanner.stop()
+
+        await update.message.reply_text(
+            "⛔ <b>TODOS LOS MONITORES DETENIDOS</b>\n\n"
+            "El sistema ha dejado de monitorear el mercado.\n"
+            "Usa /iniciar para reactivar.",
+            parse_mode="HTML"
+        )
+        logging.info(f"📱 Monitores detenidos por usuario: {update.effective_user.id}")
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error deteniendo monitores: {str(e)}")
+        logging.error(f"❌ Error en detener_command: {str(e)}")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /status - Ver estado de monitores"""
+    if not is_authorized(update):
+        return
+
+    # Verificar estado de cada monitor
+    pump_status = "🟢 ACTIVO" if pump_monitor and pump_monitor.running else "🔴 INACTIVO"
+    watchlist_status = "🟢 ACTIVO" if watchlist_monitor and watchlist_monitor.running else "🔴 INACTIVO"
+    trend_status = "🟢 ACTIVO" if trending_scanner and trending_scanner.running else "🔴 INACTIVO"
+    silent_status = "🔇 ON" if notifier and notifier.silent_mode else "🔔 OFF"
+
+    # Obtener estadísticas
+    stats = await db.get_stats()
+
+    status_text = (
+        "📊 <b>ESTADO DE MONITORES</b>\n\n"
+        f"🎯 Pump.Fun Monitor: {pump_status}\n"
+        f"📊 Watchlist Monitor: {watchlist_status}\n"
+        f"📈 Trending Scanner: {trend_status}\n"
+        f"🔊 Modo Silencioso: {silent_status}\n\n"
+        
+        "<b>📈 ESTADÍSTICAS:</b>\n"
+        f"• Tokens en observación: {stats['watching_candidates']}\n"
+        f"• Total candidatos: {stats['total_candidates']}\n"
+        f"• Alertas disparadas: {stats['triggered_candidates']}\n"
+        f"• Notificaciones totales: {stats['total_notifications']}\n\n"
+        
+        "<b>⚙️ PARÁMETROS ACTIVOS:</b>\n"
+        f"• Watchlist Interval: {WATCHLIST_INTERVAL}s\n"
+        f"• Up Trigger: {UP_TRIGGER_PCT}%\n"
+        f"• Reversal Trigger: {REVERSAL_UP_PCT}% (desde ≤{REVERSAL_NEGATIVE_THRESHOLD}%)\n"
+        f"• Min Organic Score: {MIN_ORGANIC_SCORE}\n\n"
+        
+        "<b>🔧 CONFIGURACIÓN:</b>\n"
+        f"• QuickNode WSS: {'✅ CONFIGURADO' if QUICKNODE_WSS_URL else '❌ NO CONFIGURADO'}\n"
+        f"• Base Datos: {'✅ CONECTADO' if db.pool else '❌ DESCONECTADO'}\n"
+    )
+
+    await update.message.reply_text(status_text, parse_mode="HTML")
+
+async def silent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /silent - Modo silencioso"""
+    if not is_authorized(update):
+        return
+
+    args = context.args
+    if not args or args[0] not in ['on', 'off']:
+        await update.message.reply_text("Uso: /silent on|off")
+        return
+
+    if notifier:
+        notifier.silent_mode = (args[0] == 'on')
+        status = "🔇 ACTIVADO" if notifier.silent_mode else "🔔 DESACTIVADO"
+        await update.message.reply_text(f"Modo silencioso: {status}")
+
+async def estadisticas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /estadisticas - Métricas del bot"""
+    if not is_authorized(update):
+        return
+
+    stats = await db.get_stats()
+    
+    stats_text = (
+        "📈 <b>ESTADÍSTICAS DEL SISTEMA</b>\n\n"
+        f"<b>Base de Datos:</b>\n"
+        f"• Total Candidatos: {stats['total_candidates']}\n"
+        f"• En Observación: {stats['watching_candidates']}\n"
+        f"• Alertas Disparadas: {stats['triggered_candidates']}\n"
+        f"• Notificaciones: {stats['total_notifications']}\n\n"
+        
+        "<b>Monitores Activos:</b>\n"
+        "• 🎯 Pump.Fun Monitor (WSS QuickNode)\n"
+        "• 📊 Watchlist Monitor (Triggers Duales)\n"
+        "• 📈 Trending Scanner (Jupiter API)\n\n"
+        
+        "<b>Triggers Configurados:</b>\n"
+        f"• Subida Normal: ≥ {UP_TRIGGER_PCT}%\n"
+        f"• Reversión: ≥ {REVERSAL_UP_PCT}% desde zona ≤ {REVERSAL_NEGATIVE_THRESHOLD}%\n"
+        f"• Organic Score Mínimo: {MIN_ORGANIC_SCORE}\n\n"
+        
+        "<i>El sistema está optimizado para detección\ntemprana de oportunidades en Solana.</i>"
+    )
+
+    await update.message.reply_text(stats_text, parse_mode="HTML")
 
 async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /watchlist - Ver tokens en observación"""
@@ -876,9 +1031,7 @@ async def watchlist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Error obteniendo watchlist: {str(e)}")
         logging.error(f"Error en watchlist_command: {str(e)}")
 
-# [Los demás comandos (iniciar, detener, status, silent) se mantienen igual que en tu versión original]
-# ... (incluir los comandos existentes de tu script)
-
+# ========== WEBHOOK ENDPOINTS ==========
 @app.post("/webhook/{token}")
 async def telegram_webhook(token: str, request: Request):
     """Endpoint para webhooks de Telegram"""
@@ -917,6 +1070,16 @@ async def health_check():
         }
     }
 
+@app.get("/")
+async def root():
+    """Endpoint raíz"""
+    return {
+        "message": "Solana Monitor Bot v7 PRO - Enhanced Watchlist System",
+        "status": "operational",
+        "docs": "/docs",
+        "health": "/health"
+    }
+
 # ========== INICIALIZACIÓN ==========
 async def initialize_app():
     """Inicializar toda la aplicación"""
@@ -940,18 +1103,19 @@ async def initialize_app():
     # Inicializar aplicación de Telegram
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Registrar comandos (incluyendo el nuevo /watchlist)
+    # Registrar TODOS los comandos
     telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("iniciar", iniciar_command))  # Mantener existente
-    telegram_app.add_handler(CommandHandler("detener", detener_command))  # Mantener existente  
-    telegram_app.add_handler(CommandHandler("status", status_command))    # Mantener existente
-    telegram_app.add_handler(CommandHandler("silent", silent_command))    # Mantener existente
+    telegram_app.add_handler(CommandHandler("iniciar", iniciar_command))
+    telegram_app.add_handler(CommandHandler("detener", detener_command))
+    telegram_app.add_handler(CommandHandler("status", status_command))
+    telegram_app.add_handler(CommandHandler("silent", silent_command))
+    telegram_app.add_handler(CommandHandler("estadisticas", estadisticas_command))
     telegram_app.add_handler(CommandHandler("watchlist", watchlist_command))
 
     # Inicializar notificador y monitores MEJORADOS
     notifier = TelegramNotifier(telegram_app)
     pump_monitor = PumpFunMonitor(db, notifier)
-    watchlist_monitor = WatchlistMonitor(db, notifier)  # 🆕 Reemplaza PreExplosionScanner
+    watchlist_monitor = WatchlistMonitor(db, notifier)
     trending_scanner = TrendingScanner(db, notifier)
 
     logging.info("✅ Aplicación mejorada inicializada correctamente")
