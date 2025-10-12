@@ -1,25 +1,28 @@
-# sniper_bot_graduacion_inmediata.py
-# SNIPER BOT - ALERTA INMEDIATA AL GRADUARSE
+# telegram_bot_final.py
+# PUMP.FUN GRADUATION SNIPER - QUICKNODE WSS + FASTAPI
 
 import os
 import re
 import json
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import aiohttp
 import asyncpg
-from fastapi import FastAPI, Request
+import websockets
+from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import JSONResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ========== CONFIGURACIÓN ==========
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    level=LOG_LEVEL,
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
 # Variables de entorno críticas
@@ -27,582 +30,537 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
+DOMAIN_URL = os.getenv("DOMAIN_URL")
 
-# APIs
-PUMP_FUN_API_BASE = "https://frontend-api.pump.fun"
-DEXSCREENER_API = "https://api.dexscreener.com/latest/dex"
+# QuickNode WebSocket
+QUICKNODE_WSS_URL = os.getenv("QUICKNODE_WSS_URL")
 
-# Parámetros de graduación
+# Parámetros de trading
+CHECK_INTERVAL_SECS = int(os.getenv("CHECK_INTERVAL_SECS", "10"))
 GRADUATION_MC_TARGET = float(os.getenv("GRADUATION_MC_TARGET", "69000"))
-CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "5"))  # Segundos entre checks
+PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "3000"))
+
 PORT = int(os.getenv("PORT", "8080"))
 
-# ========== BASE DE DATOS POSTGRESQL ==========
+# Regex para direcciones de Solana
+MINT_PATTERN = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
+
+# ========== BASE DE DATOS ==========
 class Database:
     def __init__(self):
         self.pool = None
 
     async def connect(self):
+        """Conectar a PostgreSQL"""
         if not DATABASE_URL:
-            raise RuntimeError("DATABASE_URL not set")
+            raise RuntimeError("DATABASE_URL no configurada")
+        
         self.pool = await asyncpg.create_pool(DATABASE_URL)
         await self._create_tables()
-        logging.info("✅ PostgreSQL conectado")
+        logging.info("✅ PostgreSQL conectado y tablas verificadas")
 
     async def _create_tables(self):
+        """Crear tablas necesarias"""
         async with self.pool.acquire() as conn:
-            # Tabla de tokens graduados (solo para evitar duplicados)
+            # Tabla de notificaciones
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS immediate_graduation_alerts (
+                CREATE TABLE IF NOT EXISTS graduation_alerts (
                     id SERIAL PRIMARY KEY,
                     mint TEXT UNIQUE NOT NULL,
                     symbol TEXT,
-                    name TEXT,
                     market_cap DECIMAL DEFAULT 0,
                     price DECIMAL DEFAULT 0,
                     liquidity DECIMAL DEFAULT 0,
-                    volume_24h DECIMAL DEFAULT 0,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    graduated_at TIMESTAMP DEFAULT NOW(),
-                    alert_sent BOOLEAN DEFAULT FALSE,
-                    alert_sent_at TIMESTAMP,
-                    dex_screener_url TEXT,
-                    initial_dex TEXT
+                    alert_type TEXT NOT NULL,
+                    source TEXT DEFAULT 'quicknode',
+                    detected_at TIMESTAMP DEFAULT NOW(),
+                    tx_signature TEXT,
+                    dex_name TEXT
                 )
             """)
             
-            # Tabla de tokens en monitoreo pre-graduación
+            # Tabla de tokens vistos (cache)
             await conn.execute("""
-                CREATE TABLE IF NOT EXISTS pre_graduation_tokens (
-                    id SERIAL PRIMARY KEY,
-                    mint TEXT UNIQUE NOT NULL,
-                    symbol TEXT,
-                    name TEXT,
-                    market_cap DECIMAL DEFAULT 0,
-                    last_checked TIMESTAMP DEFAULT NOW(),
-                    created_at TIMESTAMP DEFAULT NOW()
+                CREATE TABLE IF NOT EXISTS seen_mints (
+                    mint TEXT PRIMARY KEY,
+                    last_seen TIMESTAMP DEFAULT NOW(),
+                    source TEXT
                 )
             """)
 
-    async def add_pre_graduation_token(self, mint: str, symbol: str = None, name: str = None, market_cap: float = 0):
-        """Agregar token a monitoreo pre-graduación"""
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO pre_graduation_tokens (mint, symbol, name, market_cap) 
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (mint) DO UPDATE SET 
-                    market_cap = $4,
-                    last_checked = NOW()
-            """, mint, symbol, name, market_cap)
-
-    async def mark_immediate_alert_sent(self, mint: str, data: Dict):
-        """Marcar alerta inmediata enviada"""
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO immediate_graduation_alerts 
-                (mint, symbol, name, market_cap, price, liquidity, volume_24h, alert_sent, alert_sent_at, dex_screener_url, initial_dex)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, TRUE, NOW(), $8, $9)
-                ON CONFLICT (mint) DO NOTHING
-            """, mint, data.get('symbol'), data.get('name'), data.get('market_cap'),
-                data.get('price'), data.get('liquidity'), data.get('volume_24h'),
-                data.get('dex_screener_url'), data.get('current_dex'))
-
-    async def was_immediate_alert_sent(self, mint: str) -> bool:
-        """Verificar si ya se envió alerta inmediata"""
+    async def was_alerted(self, mint: str) -> bool:
+        """Verificar si ya se alertó sobre este token"""
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT 1 FROM immediate_graduation_alerts WHERE mint = $1", 
+                "SELECT 1 FROM graduation_alerts WHERE mint = $1", 
                 mint
             )
             return bool(row)
 
-    async def get_pre_graduation_tokens(self) -> List[Dict]:
-        """Obtener tokens en monitoreo pre-graduación"""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT mint, symbol, name, market_cap 
-                FROM pre_graduation_tokens 
-                WHERE last_checked > NOW() - INTERVAL '1 hour'
-                ORDER BY market_cap DESC
-                LIMIT 200
-            """)
-            return [dict(row) for row in rows]
-
-    async def cleanup_old_pre_graduation(self):
-        """Limpiar tokens pre-graduación antiguos"""
+    async def mark_alerted(self, mint: str, symbol: str, market_cap: float, 
+                          price: float, liquidity: float, tx_signature: str, dex_name: str):
+        """Marcar token como alertado"""
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                DELETE FROM pre_graduation_tokens 
-                WHERE last_checked < NOW() - INTERVAL '2 hours'
-            """)
+                INSERT INTO graduation_alerts 
+                (mint, symbol, market_cap, price, liquidity, alert_type, source, tx_signature, dex_name)
+                VALUES ($1, $2, $3, $4, $5, 'graduated', 'quicknode_wss', $6, $7)
+                ON CONFLICT (mint) DO NOTHING
+            """, mint, symbol, market_cap, price, liquidity, tx_signature, dex_name)
 
-# ========== CLIENTE API PUMP.FUN ==========
-class PumpFunAPI:
-    def __init__(self):
-        self.base_url = PUMP_FUN_API_BASE
-        self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "application/json",
-            "Origin": "https://pump.fun",
-            "Referer": "https://pump.fun/"
-        }
+    async def seen_recently(self, mint: str, minutes: int = 5) -> bool:
+        """Verificar si token fue visto recientemente"""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("""
+                SELECT 1 FROM seen_mints 
+                WHERE mint = $1 AND last_seen >= NOW() - INTERVAL '1 minute' * $2
+            """, mint, minutes)
+            return bool(row)
 
-    async def get_all_recent_coins(self, limit: int = 200) -> List[Dict]:
-        """Obtener TODOS los coins recientes de Pump.fun"""
-        url = f"{self.base_url}/coins"
-        params = {
-            "limit": limit,
-            "offset": 0,
-            "sort": "createdAt",
-            "order": "DESC",
-            "includeNsfw": "true"
-        }
-        
-        try:
-            async with aiohttp.ClientSession(headers=self.headers) as session:
-                async with session.get(url, params=params, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if isinstance(data, list):
-                            coins = []
-                            for coin in data:
-                                parsed_coin = self._parse_coin_data(coin)
-                                if parsed_coin:
-                                    coins.append(parsed_coin)
-                            return coins
-        except Exception as e:
-            logging.error(f"❌ Error obteniendo coins: {str(e)}")
-        
-        return []
+    async def mark_seen(self, mint: str, source: str = "quicknode"):
+        """Marcar token como visto"""
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO seen_mints (mint, source) VALUES ($1, $2)
+                ON CONFLICT (mint) DO UPDATE SET last_seen = NOW(), source = $2
+            """, mint, source)
 
-    def _parse_coin_data(self, data: Dict) -> Optional[Dict]:
-        """Parsear datos de un coin"""
-        if not data:
-            return None
-            
-        mint = data.get('mint') or data.get('id')
-        if not mint:
-            return None
-            
-        market_cap = data.get('marketCap') or data.get('mcap') or 0
-        price = data.get('price') or data.get('usdPrice') or 0
-        liquidity = data.get('liquidity', {}).get('usd', 0) if isinstance(data.get('liquidity'), dict) else data.get('liquidity', 0)
-
-        return {
-            'mint': mint,
-            'symbol': data.get('symbol', 'UNKNOWN'),
-            'name': data.get('name', ''),
-            'market_cap': float(market_cap),
-            'price': float(price),
-            'liquidity': float(liquidity),
-            'volume_24h': data.get('volume24h', 0),
-            'created_at': data.get('createdAt')
-        }
-
-# ========== CLIENTE DEXSCREENER ==========
-class DexScreenerAPI:
-    def __init__(self):
-        self.base_url = DEXSCREENER_API
-
-    async def get_immediate_token_data(self, mint: str) -> Optional[Dict]:
-        """Obtener datos inmediatos del token recién graduado"""
-        url = f"{self.base_url}/tokens/{mint}"
-        
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=8) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        return self._parse_immediate_data(data, mint)
-        except Exception as e:
-            logging.error(f"❌ Error obteniendo datos inmediatos para {mint}: {str(e)}")
-        
-        return None
-
-    def _parse_immediate_data(self, data: Dict, mint: str) -> Optional[Dict]:
-        """Parsear datos inmediatos post-graduación"""
-        pairs = data.get('pairs', [])
-        if not pairs:
-            return None
-
-        # Tomar el primer pair disponible (más rápido)
-        pair = pairs[0]
-
-        price_change = pair.get('priceChange', {})
-        if isinstance(price_change, dict):
-            price_change_24h = price_change.get('h24', 0)
-        else:
-            price_change_24h = price_change
-
-        return {
-            'mint': mint,
-            'market_cap': pair.get('marketCap', 0),
-            'price': pair.get('priceUsd', 0),
-            'liquidity': pair.get('liquidity', {}).get('usd', 0),
-            'volume_24h': pair.get('volume', {}).get('h24', 0),
-            'price_change_24h': float(price_change_24h),
-            'dex_screener_url': pair.get('url'),
-            'current_dex': pair.get('dexId', 'unknown')
-        }
+    async def get_recent_alerts(self, limit: int = 20) -> List[Dict]:
+        """Obtener alertas recientes"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT mint, symbol, market_cap, price, liquidity, source, detected_at, dex_name
+                FROM graduation_alerts 
+                ORDER BY detected_at DESC 
+                LIMIT $1
+            """, limit)
+            return [dict(row) for row in rows]
 
 # ========== NOTIFICADOR TELEGRAM ==========
-def build_immediate_buttons(mint: str, dex_url: str = None) -> InlineKeyboardMarkup:
-    """Construir botones para alerta inmediata"""
-    buttons = [
-        [InlineKeyboardButton("⚡ Comprar Ahora", url=f"https://pump.fun/coin/{mint}")],
-        [InlineKeyboardButton("📊 DexScreener", url=dex_url or f"https://dexscreener.com/solana/{mint}")],
-        [InlineKeyboardButton("🔄 Raydium", url=f"https://raydium.io/swap/?inputCurrency=sol&outputCurrency={mint}")],
-        [InlineKeyboardButton("🛡️ RugCheck", url=f"https://rugcheck.xyz/tokens/{mint}")]
-    ]
-    return InlineKeyboardMarkup(buttons)
-
 class TelegramNotifier:
     def __init__(self, bot_app: Application):
         self.app = bot_app
         self.silent_mode = False
 
-    async def send_immediate_graduation_alert(self, symbol: str, mint: str, data: Dict):
-        """Enviar alerta INMEDIATA de graduación"""
+    async def send_graduation_alert(self, symbol: str, mint: str, data: Dict):
+        """Enviar alerta de graduación inmediata"""
         if self.silent_mode:
+            logging.info(f"🔇 Silent mode - Skipping alert for {symbol}")
             return
 
         market_cap = data.get('market_cap', 0)
         price = data.get('price', 0)
-        dex = data.get('current_dex', 'unknown').upper()
+        liquidity = data.get('liquidity', 0)
+        dex_name = data.get('dex_name', 'Unknown DEX')
+        tx_signature = data.get('tx_signature', '')[:16] + '...' if data.get('tx_signature') else 'N/A'
 
         message_lines = [
-            "🎓 <b>¡TOKEN GRADUADO AHORA MISMO!</b> 🎓",
+            "🎓 <b>¡GRADUACIÓN DETECTADA EN TIEMPO REAL!</b> 🎓",
             "",
             f"<b>{symbol}</b>",
             f"• Market Cap: <b>${market_cap:,.0f}</b>",
             f"• Precio: <b>${price:.8f}</b>",
-            f"• DEX: <b>{dex}</b>",
-            f"• Estado: <b>GRADUACIÓN INMEDIATA</b>",
+            f"• Liquidez: <b>${liquidity:,.0f}</b>",
+            f"• DEX: <b>{dex_name.upper()}</b>",
+            f"• TX: <code>{tx_signature}</code>",
             "",
-            "🚨 <b>ACABA DE GRADUARSE</b>",
-            "• Token recién salido de Pump.fun",
-            "• Oportunidad de entrada inmediata",
-            "• Momento crítico de decisión",
+            "⚡ <b>ACCIÓN INMEDIATA REQUERIDA</b>",
+            "• Token recién graduado de Pump.fun",
+            "• Pool creado en DEX",
+            "• Oportunidad de entrada temprana",
             "",
-            "<b>Mint:</b>",
+            "<b>Mint Address:</b>",
             f"<code>{mint}</code>",
             "",
-            "⚡ <i>¡Actúa rápido - Graduación en tiempo real!</i>"
+            "🚀 <i>¡Bot activo con QuickNode WSS!</i>"
         ]
-        
+
         message = "\n".join(message_lines)
+
+        # Botones de acción rápida
+        keyboard = [
+            [InlineKeyboardButton("⚡ Comprar Jupiter", url=f"https://jup.ag/swap/{mint}-SOL")],
+            [InlineKeyboardButton("📊 Ver en DexScreener", url=f"https://dexscreener.com/solana/{mint}")],
+            [InlineKeyboardButton("🔍 Raydium Swap", url=f"https://raydium.io/swap/?inputCurrency=sol&outputCurrency={mint}")],
+            [InlineKeyboardButton("🛡️ Rug Check", url=f"https://rugcheck.xyz/tokens/{mint}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
             await self.app.bot.send_message(
                 chat_id=TELEGRAM_CHAT_ID,
                 text=message,
                 parse_mode="HTML",
-                reply_markup=build_immediate_buttons(mint, data.get('dex_screener_url')),
+                reply_markup=reply_markup,
                 disable_web_page_preview=True
             )
-            logging.info(f"✅ Alerta INMEDIATA enviada: {symbol} - ${market_cap:,.0f}")
+            logging.info(f"✅ Alerta de graduación enviada: {symbol}")
         except Exception as e:
-            logging.error(f"❌ Error enviando alerta inmediata: {str(e)}")
+            logging.error(f"❌ Error enviando alerta Telegram: {str(e)}")
 
-# ========== MONITOR GRADUACIÓN INMEDIATA ==========
-class ImmediateGraduationMonitor:
-    def __init__(self, db: Database, notifier: TelegramNotifier):
+# ========== CLIENTE QUICKNODE WSS ==========
+class QuickNodeMonitor:
+    def __init__(self, wss_url: str, db: Database, notifier: TelegramNotifier):
+        self.wss_url = wss_url
         self.db = db
         self.notifier = notifier
-        self.pump_api = PumpFunAPI()
-        self.dex_api = DexScreenerAPI()
-        
+        self.websocket = None
         self.running = False
-        self.scan_round = 0
-        self.stats = {
-            'tokens_scanned': 0,
-            'graduations_detected': 0,
-            'immediate_alerts_sent': 0
-        }
+        self.reconnect_delay = 1
+        self.task = None
 
-    async def scan_for_immediate_graduations(self):
-        """Escanear para detectar graduaciones inmediatas"""
-        self.scan_round += 1
-        logging.info(f"🔍 Escaneo inmediato #{self.scan_round} - Buscando graduaciones...")
-        
-        try:
-            # Obtener TODOS los tokens recientes
-            all_coins = await self.pump_api.get_all_recent_coins(200)
-            self.stats['tokens_scanned'] = len(all_coins)
-            
-            graduation_detected = False
-            
-            for coin in all_coins:
-                mint = coin['mint']
-                symbol = coin['symbol']
-                market_cap = coin['market_cap']
-                
-                # Verificar si el token acaba de graduarse
-                if market_cap >= GRADUATION_MC_TARGET:
-                    # Verificar si ya alertamos sobre este token
-                    if not await self.db.was_immediate_alert_sent(mint):
-                        logging.info(f"🎓 GRADUACIÓN DETECTADA: {symbol} - ${market_cap:,.0f}")
-                        
-                        # Obtener datos inmediatos post-graduación
-                        immediate_data = await self.dex_api.get_immediate_token_data(mint)
-                        if not immediate_data:
-                            immediate_data = coin  # Usar datos de Pump.fun como fallback
-                        
-                        # ENVIAR ALERTA INMEDIATA
-                        await self.notifier.send_immediate_graduation_alert(
-                            symbol=symbol,
-                            mint=mint,
-                            data=immediate_data
-                        )
-                        
-                        # Marcar como alertado
-                        await self.db.mark_immediate_alert_sent(mint, immediate_data)
-                        
-                        self.stats['graduations_detected'] += 1
-                        self.stats['immediate_alerts_sent'] += 1
-                        graduation_detected = True
-                
-                # También guardar tokens pre-graduación para monitoreo
-                elif market_cap >= GRADUATION_MC_TARGET * 0.5:  # Monitorear desde 50% del target
-                    await self.db.add_pre_graduation_token(
-                        mint, symbol, coin['name'], market_cap
-                    )
-            
-            if graduation_detected:
-                logging.info("🚨 ¡Graduaciones detectadas y alertadas!")
-            else:
-                logging.info(f"✅ Escaneo #{self.scan_round} completado - {len(all_coins)} tokens escaneados")
-                
-        except Exception as e:
-            logging.error(f"❌ Error en escaneo inmediato: {str(e)}")
+        # Patrones para detectar creación de pools
+        self.pool_creation_keywords = [
+            'initialize', 'create', 'new_pool', 'initialize2', 
+            'create_pool', 'initialize_pool', 'init_pool',
+            'add_liquidity', 'initialize_account', 'raydium',
+            'open_book', 'create_amm', 'initialize_amm'
+        ]
 
-    async def monitor_pre_graduation_tokens(self):
-        """Monitorear tokens cercanos a graduación"""
+    async def connect(self):
+        """Conectar a QuickNode WebSocket"""
         try:
-            pre_graduation_tokens = await self.db.get_pre_graduation_tokens()
+            self.websocket = await websockets.connect(
+                self.wss_url,
+                ping_interval=30,
+                ping_timeout=10,
+                close_timeout=10
+            )
             
-            for token in pre_graduation_tokens:
-                mint = token['mint']
-                symbol = token['symbol']
-                previous_mc = token['market_cap']
-                
-                # Verificar si ya se graduó
-                if not await self.db.was_immediate_alert_sent(mint):
-                    # Obtener datos actualizados
-                    immediate_data = await self.dex_api.get_immediate_token_data(mint)
-                    if immediate_data:
-                        current_mc = immediate_data.get('market_cap', 0)
-                        
-                        # Si se graduó, enviar alerta
-                        if current_mc >= GRADUATION_MC_TARGET:
-                            logging.info(f"🎓 GRADUACIÓN DETECTADA (pre-monitoreo): {symbol}")
-                            
-                            await self.notifier.send_immediate_graduation_alert(
-                                symbol=symbol,
-                                mint=mint,
-                                data=immediate_data
-                            )
-                            
-                            await self.db.mark_immediate_alert_sent(mint, immediate_data)
-                            self.stats['graduations_detected'] += 1
-                            self.stats['immediate_alerts_sent'] += 1
-                        
-                        # Actualizar en base de datos
-                        await self.db.add_pre_graduation_token(
-                            mint, symbol, token.get('name'), current_mc
-                        )
+            # Suscribirse a logs
+            subscribe_message = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "logsSubscribe",
+                "params": [
+                    {"mentions": []},  # Escuchar todos los logs
+                    {"commitment": "confirmed"}
+                ]
+            }
             
-            # Limpiar tokens antiguos
-            await self.db.cleanup_old_pre_graduation()
+            await self.websocket.send(json.dumps(subscribe_message))
+            response = await self.websocket.recv()
+            logging.info("✅ QuickNode WebSocket conectado y suscrito")
+            return True
             
         except Exception as e:
-            logging.error(f"❌ Error monitoreando pre-graduación: {str(e)}")
+            logging.error(f"❌ Error conectando QuickNode: {str(e)}")
+            return False
 
-    async def start(self):
-        """Iniciar monitor de graduación inmediata"""
+    async def listen(self):
+        """Escuchar mensajes del WebSocket"""
         self.running = True
         
-        # Iniciar escaneo continuo
-        asyncio.create_task(self._continuous_immediate_scan())
-        
-        # Iniciar monitoreo de tokens pre-graduación
-        asyncio.create_task(self._continuous_pre_graduation_monitor())
-        
-        logging.info("✅ Monitor GRADUACIÓN INMEDIATA iniciado")
-
-    async def _continuous_immediate_scan(self):
-        """Escaneo continuo inmediato"""
         while self.running:
             try:
-                await self.scan_for_immediate_graduations()
-            except Exception as e:
-                logging.error(f"❌ Error en escaneo continuo: {str(e)}")
-            await asyncio.sleep(CHECK_INTERVAL)
+                if not self.websocket:
+                    success = await self.connect()
+                    if not success:
+                        await asyncio.sleep(self.reconnect_delay)
+                        self.reconnect_delay = min(self.reconnect_delay * 2, 60)
+                        continue
+                    self.reconnect_delay = 1
 
-    async def _continuous_pre_graduation_monitor(self):
-        """Monitoreo continuo pre-graduación"""
-        while self.running:
-            try:
-                await self.monitor_pre_graduation_tokens()
+                message = await asyncio.wait_for(self.websocket.recv(), timeout=30)
+                data = json.loads(message)
+                
+                await self.process_message(data)
+                
+            except asyncio.TimeoutError:
+                continue
+            except websockets.exceptions.ConnectionClosed:
+                logging.warning(f"🔌 Conexión WebSocket cerrada, reconectando...")
+                self.websocket = None
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
             except Exception as e:
-                logging.error(f"❌ Error en monitoreo pre-graduación: {str(e)}")
-            await asyncio.sleep(15)  # Cada 15 segundos para tokens cercanos
+                logging.error(f"❌ Error en WebSocket: {str(e)}")
+                self.websocket = None
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
+
+    async def process_message(self, data: Dict):
+        """Procesar mensaje del WebSocket"""
+        try:
+            if data.get('method') == 'logsNotification':
+                params = data.get('params', {})
+                result = params.get('result', {})
+                logs = result.get('logs', [])
+                signature = result.get('signature', '')
+                
+                await self.analyze_logs(logs, signature)
+                
+        except Exception as e:
+            logging.error(f"❌ Error procesando mensaje: {str(e)}")
+
+    async def analyze_logs(self, logs: List[str], signature: str):
+        """Analizar logs en busca de creación de pools"""
+        try:
+            logs_text = ' '.join(logs).lower()
+            
+            # Buscar patrones de creación de pool
+            pool_created = any(keyword in logs_text for keyword in self.pool_creation_keywords)
+            
+            if pool_created:
+                # Extraer mints de los logs
+                mints_found = MINT_PATTERN.findall(' '.join(logs))
+                unique_mints = list(set(mints_found))
+                
+                for mint in unique_mints:
+                    if not await self.db.seen_recently(mint):
+                        await self.db.mark_seen(mint)
+                        await self.process_new_pool(mint, signature, logs_text)
+                        
+        except Exception as e:
+            logging.error(f"❌ Error analizando logs: {str(e)}")
+
+    async def process_new_pool(self, mint: str, signature: str, logs_text: str):
+        """Procesar nuevo pool detectado"""
+        try:
+            # Verificar si ya alertamos sobre este mint
+            if await self.db.was_alerted(mint):
+                return
+
+            # Determinar DEX basado en logs
+            dex_name = "unknown"
+            if 'raydium' in logs_text.lower():
+                dex_name = "raydium"
+            elif 'orca' in logs_text.lower():
+                dex_name = "orca"
+            elif 'jupiter' in logs_text.lower():
+                dex_name = "jupiter"
+            elif 'pump' in logs_text.lower():
+                dex_name = "pump.fun"
+
+            # Obtener datos del token desde Jupiter API
+            token_data = await self.get_token_data(mint)
+            symbol = token_data.get('symbol', 'UNKNOWN')
+            market_cap = token_data.get('market_cap', 0)
+            price = token_data.get('price', 0)
+            liquidity = token_data.get('liquidity', 0)
+
+            # Solo alertar si el market cap es razonable
+            if market_cap >= PUMP_MC_MIN:
+                # Enviar alerta
+                alert_data = {
+                    'market_cap': market_cap,
+                    'price': price,
+                    'liquidity': liquidity,
+                    'dex_name': dex_name,
+                    'tx_signature': signature
+                }
+                
+                await self.notifier.send_graduation_alert(symbol, mint, alert_data)
+                
+                # Guardar en base de datos
+                await self.db.mark_alerted(
+                    mint, symbol, market_cap, price, liquidity, signature, dex_name
+                )
+                
+                logging.info(f"🎓 Pool detectado: {symbol} en {dex_name} - MC: ${market_cap:,.0f}")
+
+        except Exception as e:
+            logging.error(f"❌ Error procesando pool {mint}: {str(e)}")
+
+    async def get_token_data(self, mint: str) -> Dict:
+        """Obtener datos del token desde Jupiter API"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Intentar con Jupiter API
+                url = f"https://api.jup.ag/tokens/v2/search?query={mint}"
+                async with session.get(url, timeout=8) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            token = data[0]
+                            return {
+                                'symbol': token.get('symbol', 'UNKNOWN'),
+                                'market_cap': token.get('mcap', 0),
+                                'price': token.get('usdPrice', 0),
+                                'liquidity': token.get('liquidity', 0)
+                            }
+        except Exception as e:
+            logging.error(f"❌ Error obteniendo datos de token {mint}: {str(e)}")
+        
+        return {'symbol': 'UNKNOWN', 'market_cap': 0, 'price': 0, 'liquidity': 0}
+
+    async def start(self):
+        """Iniciar monitor"""
+        if self.task and not self.task.done():
+            return
+            
+        self.task = asyncio.create_task(self.listen())
+        logging.info("✅ QuickNode Monitor iniciado")
 
     async def stop(self):
         """Detener monitor"""
         self.running = False
-        logging.info("⛔ Monitor GRADUACIÓN INMEDIATA detenido")
+        if self.websocket:
+            await self.websocket.close()
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        logging.info("⛔ QuickNode Monitor detenido")
 
-# ========== FASTAPI + TELEGRAM APP ==========
-app = FastAPI(title="Graduación Inmediata Sniper Bot")
-
+# ========== FASTAPI APP CON LIFESPAN ==========
 # Variables globales
 db = Database()
 telegram_app: Optional[Application] = None
 notifier: Optional[TelegramNotifier] = None
-immediate_monitor: Optional[ImmediateGraduationMonitor] = None
+quicknode_monitor: Optional[QuickNodeMonitor] = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan manager para FastAPI (reemplaza on_event)"""
+    # Startup
+    await startup()
+    yield
+    # Shutdown
+    await shutdown()
+
+app = FastAPI(title="Pump.fun Graduation Sniper - QuickNode", lifespan=lifespan)
 
 def is_authorized(update: Update) -> bool:
+    """Verificar si usuario está autorizado"""
     return update.effective_user and update.effective_user.id == OWNER_ID
 
 # ========== COMANDOS TELEGRAM ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /start"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
     
-    welcome_text = f"""
-🎓 <b>SNIPER BOT - GRADUACIÓN INMEDIATA</b> ⚡
+    welcome_text = """
+🎓 <b>PUMP.FUN GRADUATION SNIPER BOT</b> ⚡
 
-<b>Función Exclusiva:</b>
-• 🚨 Alertar CUANDO SE GRADÚAN los tokens
-• ⚡ Detección en TIEMPO REAL
-• 📈 Market Cap: <b>${GRADUATION_MC_TARGET:,.0f}+</b>
-• 🔄 Intervalo: <b>{CHECK_INTERVAL} segundos</b>
-
-<b>Características:</b>
-• Escaneo cada <b>{CHECK_INTERVAL}s</b> de tokens
-• Alertas INSTANTÁNEAS al graduarse
-• Enlaces directos a DEXs
-• Sin retrasos, sin esperas
+<b>Tecnología:</b>
+• 🔗 QuickNode WebSocket (Tiempo real)
+• 🗄️ PostgreSQL (Railway)
+• 🤖 Telegram Bot API
+• ⚡ Detección inmediata
 
 <b>Comandos:</b>
-/graduacion_on - Activar detector
-/graduacion_off - Pausar detector  
+/iniciar - Activar monitor QuickNode
+/detener - Pausar monitor
 /status - Estado del sistema
-/stats - Estadísticas de detección
+/alertas - Últimas alertas
 /silent on|off - Modo silencioso
 
-<code>Alertas en el momento exacto de graduación</code>
+<code>Detección en tiempo real de graduaciones</code>
     """
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
-async def graduacion_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Activar detector de graduación inmediata"""
+async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /iniciar - Activar monitor"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
 
     try:
-        if immediate_monitor:
-            await immediate_monitor.start()
+        if quicknode_monitor:
+            await quicknode_monitor.start()
 
         await update.message.reply_text(
-            "⚡ <b>DETECTOR DE GRADUACIÓN ACTIVADO</b>\n\n"
-            "🎓 Objetivo: Tokens al graduarse\n"
-            "⏱️  Velocidad: Escaneo cada 5 segundos\n"
-            "📈 Trigger: MC ≥ $69,000\n"
-            "🚨 Estado: <b>ALERTAS INMEDIATAS ACTIVAS</b>\n\n"
-            "<i>Escaneando tokens en tiempo real...</i>",
+            "✅ <b>MONITOR QUICKNODE ACTIVADO</b>\n\n"
+            "🔗 WebSocket: CONECTADO\n"
+            "🎯 Objetivo: Detección pools\n"
+            "⚡ Velocidad: TIEMPO REAL\n"
+            "📊 Fuente: QuickNode WSS\n\n"
+            "<i>Escaneando transacciones en tiempo real...</i>",
             parse_mode="HTML"
         )
-        logging.info(f"⚡ Detector de graduación activado por: {update.effective_user.id}")
+        logging.info(f"📱 Monitor activado por: {update.effective_user.id}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error activando detector: {str(e)}")
+        await update.message.reply_text(f"❌ Error activando monitor: {str(e)}")
 
-async def graduacion_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Desactivar detector de graduación inmediata"""
+async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /detener - Pausar monitor"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
 
     try:
-        if immediate_monitor:
-            await immediate_monitor.stop()
+        if quicknode_monitor:
+            await quicknode_monitor.stop()
 
         await update.message.reply_text(
-            "⛔ <b>DETECTOR DE GRADUACIÓN DESACTIVADO</b>\n\n"
-            "Las alertas inmediatas han sido pausadas.\n"
-            "Usa /graduacion_on para reactivar.",
+            "⛔ <b>MONITOR QUICKNODE DETENIDO</b>\n\n"
+            "La detección en tiempo real ha sido pausada.\n"
+            "Usa /iniciar para reactivar.",
             parse_mode="HTML"
         )
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error desactivando detector: {str(e)}")
+        await update.message.reply_text(f"❌ Error deteniendo monitor: {str(e)}")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estado del sistema"""
+    """Comando /status - Estado del sistema"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
 
-    monitor_status = "🟢 ACTIVO" if immediate_monitor and immediate_monitor.running else "🔴 INACTIVO"
+    monitor_status = "🟢 ACTIVO" if quicknode_monitor and quicknode_monitor.running else "🔴 INACTIVO"
     silent_status = "🔇 ON" if notifier and notifier.silent_mode else "🔔 OFF"
     
-    stats = immediate_monitor.stats if immediate_monitor else {}
-    current_time = datetime.utcnow().strftime("%H:%M:%S")
+    # Obtener estadísticas
+    recent_alerts = await db.get_recent_alerts(5)
+    alerts_count = len(recent_alerts)
 
     status_text = (
-        "📊 <b>ESTADO GRADUACIÓN INMEDIATA</b>\n\n"
-        f"⚡ Detector: {monitor_status}\n"
-        f"🔊 Silencioso: {silent_status}\n"
-        f"🕐 Último escaneo: {current_time} UTC\n\n"
+        "📊 <b>ESTADO DEL SISTEMA</b>\n\n"
+        f"🎯 QuickNode Monitor: {monitor_status}\n"
+        f"🔊 Modo Silencioso: {silent_status}\n"
+        f"📈 Alertas Recientes: <b>{alerts_count}</b>\n\n"
         
-        "<b>📈 Estadísticas:</b>\n"
-        f"• Escaneos realizados: {stats.get('scan_round', 0)}\n"
-        f"• Tokens escaneados: {stats.get('tokens_scanned', 0)}\n"
-        f"• Graduaciones detectadas: {stats.get('graduations_detected', 0)}\n"
-        f"• Alertas enviadas: {stats.get('immediate_alerts_sent', 0)}\n\n"
+        "<b>🔗 Conexiones:</b>\n"
+        f"• WebSocket: {'✅ CONECTADO' if quicknode_monitor and quicknode_monitor.websocket else '❌ DESCONECTADO'}\n"
+        f"• Base Datos: {'✅ CONECTADO' if db.pool else '❌ DESCONECTADO'}\n"
+        f"• Telegram Bot: {'✅ ACTIVO' if telegram_app else '❌ INACTIVO'}\n\n"
         
         "<b>⚙️ Configuración:</b>\n"
-        f"• MC Graduación: <b>${GRADUATION_MC_TARGET:,.0f}</b>\n"
-        f"• Intervalo: <b>{CHECK_INTERVAL} segundos</b>\n"
-        f"• Velocidad: <b>ALTA PRIORIDAD</b>\n"
+        f"• MC Mínimo: ${PUMP_MC_MIN:,.0f}\n"
+        f"• QuickNode: {'✅ CONFIGURADO' if QUICKNODE_WSS_URL else '❌ NO CONFIGURADO'}\n"
     )
 
     await update.message.reply_text(status_text, parse_mode="HTML")
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Estadísticas detalladas"""
+async def alertas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /alertas - Últimas alertas"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
 
-    stats = immediate_monitor.stats if immediate_monitor else {}
-    
-    efficiency = 0
-    if stats.get('tokens_scanned', 0) > 0:
-        efficiency = (stats.get('graduations_detected', 0) / stats.get('tokens_scanned', 0)) * 100
+    alerts = await db.get_recent_alerts(8)
+    if not alerts:
+        await update.message.reply_text("No hay alertas recientes.")
+        return
 
-    stats_text = (
-        "📊 <b>ESTADÍSTICAS DETALLADAS</b>\n\n"
-        f"• Rondas de escaneo: <b>{stats.get('scan_round', 0)}</b>\n"
-        f"• Total tokens analizados: <b>{stats.get('tokens_scanned', 0)}</b>\n"
-        f"• Graduaciones detectadas: <b>{stats.get('graduations_detected', 0)}</b>\n"
-        f"• Alertas inmediatas: <b>{stats.get('immediate_alerts_sent', 0)}</b>\n"
-        f"• Eficiencia: <b>{efficiency:.2f}%</b>\n\n"
+    lines = ["<b>🎓 Últimas Graduaciones Detectadas:</b>\n"]
+    for alert in alerts:
+        symbol = alert.get('symbol', 'UNKNOWN')
+        market_cap = alert.get('market_cap', 0)
+        dex = alert.get('dex_name', 'unknown').upper()
+        detected_at = alert.get('detected_at')
         
-        "<b>🎯 Rendimiento:</b>\n"
-        f"• Tokens/escaneo: <b>{stats.get('tokens_scanned', 0) / max(stats.get('scan_round', 1), 1):.1f}</b>\n"
-        f"• Graduaciones/hora: <b>{stats.get('graduations_detected', 0) / max(stats.get('scan_round', 1) * CHECK_INTERVAL / 3600, 1):.1f}</b>\n"
-        f"• Velocidad respuesta: <b>INMEDIATA</b>\n"
-    )
+        if isinstance(detected_at, datetime):
+            time_str = detected_at.strftime("%H:%M:%S")
+        else:
+            time_str = "reciente"
+        
+        lines.append(f"• <b>{symbol}</b>")
+        lines.append(f"  MC: ${float(market_cap):,.0f} | DEX: {dex}")
+        lines.append(f"  Hora: {time_str}")
+        lines.append("")
 
-    await update.message.reply_text(stats_text, parse_mode="HTML")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
 
 async def silent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Modo silencioso"""
+    """Comando /silent - Modo silencioso"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
@@ -617,9 +575,13 @@ async def silent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "🔇 ACTIVADO" if notifier.silent_mode else "🔔 DESACTIVADO"
         await update.message.reply_text(f"Modo silencioso: {status}")
 
-# ========== WEBHOOK ENDPOINTS ==========
-@app.post("/webhook")
-async def telegram_webhook(request: Request):
+# ========== ENDPOINTS WEB ==========
+@app.post("/webhook/{token}")
+async def telegram_webhook(token: str, request: Request):
+    """Webhook para Telegram"""
+    if token != TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=403, detail="Token inválido")
+    
     try:
         data = await request.json()
         update = Update.de_json(data, telegram_app.bot)
@@ -629,94 +591,108 @@ async def telegram_webhook(request: Request):
             
         return JSONResponse({"status": "ok"})
     except Exception as e:
-        logging.error(f"❌ Webhook error: {str(e)}")
+        logging.error(f"❌ Error en webhook: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.get("/last")
+async def get_last_alerts(limit: int = 20):
+    """Endpoint para últimas alertas"""
+    alerts = await db.get_recent_alerts(limit)
+    for alert in alerts:
+        if isinstance(alert.get('detected_at'), datetime):
+            alert['detected_at'] = alert['detected_at'].isoformat()
+    return JSONResponse({"alerts": alerts})
 
 @app.get("/health")
 async def health_check():
-    stats = immediate_monitor.stats if immediate_monitor else {}
+    """Health check endpoint"""
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "immediate_graduation": {
-            "running": immediate_monitor.running if immediate_monitor else False,
-            "stats": stats
-        },
-        "response_time": "immediate",
-        "scan_interval_seconds": CHECK_INTERVAL
+        "services": {
+            "database": bool(db.pool),
+            "telegram_bot": bool(telegram_app),
+            "quicknode_monitor": quicknode_monitor.running if quicknode_monitor else False,
+            "websocket_connected": quicknode_monitor.websocket is not None if quicknode_monitor else False
+        }
     }
 
 @app.get("/")
 async def root():
+    """Endpoint raíz"""
     return {
-        "message": "Immediate Graduation Sniper Bot",
+        "message": "Pump.fun Graduation Sniper Bot",
         "status": "operational",
-        "function": "instant_graduation_alerts"
+        "technology": "QuickNode WSS + FastAPI",
+        "version": "2.0"
     }
 
 # ========== INICIALIZACIÓN ==========
-async def initialize_app():
-    global telegram_app, notifier, immediate_monitor
+async def startup():
+    """Inicialización de la aplicación"""
+    global telegram_app, notifier, quicknode_monitor
 
+    # Verificar variables requeridas
     required_vars = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
         "OWNER_ID": OWNER_ID,
-        "DATABASE_URL": DATABASE_URL
+        "DATABASE_URL": DATABASE_URL,
+        "QUICKNODE_WSS_URL": QUICKNODE_WSS_URL
     }
     
     missing = [k for k, v in required_vars.items() if not v]
     if missing:
         raise RuntimeError(f"❌ Faltan variables: {', '.join(missing)}")
 
+    # Conectar a base de datos
     await db.connect()
 
+    # Inicializar aplicación de Telegram
     telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Registrar comandos
     telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("graduacion_on", graduacion_on_command))
-    telegram_app.add_handler(CommandHandler("graduacion_off", graduacion_off_command))
+    telegram_app.add_handler(CommandHandler("iniciar", iniciar_command))
+    telegram_app.add_handler(CommandHandler("detener", detener_command))
     telegram_app.add_handler(CommandHandler("status", status_command))
-    telegram_app.add_handler(CommandHandler("stats", stats_command))
+    telegram_app.add_handler(CommandHandler("alertas", alertas_command))
     telegram_app.add_handler(CommandHandler("silent", silent_command))
 
+    # Inicializar notificador y monitor
     notifier = TelegramNotifier(telegram_app)
-    immediate_monitor = ImmediateGraduationMonitor(db, notifier)
+    quicknode_monitor = QuickNodeMonitor(QUICKNODE_WSS_URL, db, notifier)
 
-    logging.info("✅ Graduación Inmediata Bot inicializado")
-
-@app.on_event("startup")
-async def startup_event():
-    try:
-        await initialize_app()
-        await telegram_app.initialize()
-        
-        if os.getenv("RAILWAY_STATIC_URL"):
-            webhook_url = f"{os.getenv('RAILWAY_STATIC_URL')}/webhook"
-            await telegram_app.bot.set_webhook(webhook_url)
-            logging.info(f"✅ Webhook configurado: {webhook_url}")
-        else:
-            await telegram_app.start()
-            logging.info("✅ Bot iniciado con polling")
-            
-        logging.info("🚀 Bot de Graduación Inmediata listo - Usa /graduacion_on para comenzar")
-    except Exception as e:
-        logging.error(f"❌ Error en startup: {str(e)}")
-        raise
-
-@app.on_event("shutdown") 
-async def shutdown_event():
-    logging.info("🛑 Apagando bot de graduación inmediata...")
+    # Inicializar Telegram
+    await telegram_app.initialize()
     
-    if immediate_monitor:
-        await immediate_monitor.stop()
+    # Configurar webhook si hay DOMAIN_URL
+    if DOMAIN_URL:
+        webhook_url = f"{DOMAIN_URL.rstrip('/')}/webhook/{TELEGRAM_BOT_TOKEN}"
+        await telegram_app.bot.set_webhook(webhook_url)
+        logging.info(f"✅ Webhook configurado: {webhook_url}")
+    else:
+        await telegram_app.start()
+        logging.info("✅ Bot iniciado con polling")
 
+    logging.info("🚀 Bot de Graduación listo - Usa /iniciar para comenzar")
+
+async def shutdown():
+    """Apagado de la aplicación"""
+    logging.info("🛑 Apagando bot...")
+    
+    if quicknode_monitor:
+        await quicknode_monitor.stop()
+    
     if telegram_app:
+        try:
+            await telegram_app.bot.delete_webhook()
+        except Exception:
+            pass
         await telegram_app.stop()
         await telegram_app.shutdown()
 
-    logging.info("✅ Bot de graduación inmediata apagado")
+    logging.info("✅ Bot apagado correctamente")
 
 # ========== EJECUCIÓN LOCAL ==========
 if __name__ == "__main__":
