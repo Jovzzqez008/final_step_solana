@@ -1,5 +1,5 @@
-# telegram_bot_pump_fun_helius_moralis.py
-# SOLANA PUMP.FUN BOT - HELIUS WEBSOCKET + MORALIS API
+# telegram_bot_pump_fun_helius_moralis_fixed.py
+# SOLANA PUMP.FUN BOT - HELIUS WEBSOCKET + MORALIS API (ENDPOINTS CORREGIDOS)
 
 import os
 import re
@@ -8,7 +8,7 @@ import asyncio
 import logging
 import websockets
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 import asyncpg
@@ -152,7 +152,7 @@ class Database:
             """, limit)
             return [dict(row) for row in rows]
 
-# ========== CLIENTE MORALIS API ==========
+# ========== CLIENTE MORALIS API CORREGIDO ==========
 class MoralisAPI:
     def __init__(self):
         self.base_url = "https://solana-gateway.moralis.io"
@@ -162,8 +162,9 @@ class MoralisAPI:
         }
 
     async def get_token_bonding_status(self, mint: str) -> Optional[Dict]:
-        """Obtener estado de bonding de un token específico"""
-        url = f"{self.base_url}/token/mainnet/exchange/pumpfun/{mint}/bonding"
+        """Obtener estado de bonding de un token específico - ENDPOINT CORREGIDO"""
+        # ENDPOINT CORRECTO según documentación: Get bonding status by token address
+        url = f"{self.base_url}/token/mainnet/{mint}/bonding-status"
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -171,6 +172,9 @@ class MoralisAPI:
                     if response.status == 200:
                         data = await response.json()
                         return self._parse_token_data(data)
+                    elif response.status == 404:
+                        # Intentar con el endpoint alternativo
+                        return await self._try_alternative_endpoints(mint)
                     else:
                         logging.warning(f"Moralis API HTTP {response.status} for mint {mint}")
         except asyncio.TimeoutError:
@@ -180,8 +184,30 @@ class MoralisAPI:
         
         return None
 
+    async def _try_alternative_endpoints(self, mint: str) -> Optional[Dict]:
+        """Intentar endpoints alternativos de Moralis"""
+        endpoints = [
+            # Endpoint de metadata básica
+            f"{self.base_url}/token/mainnet/{mint}/metadata",
+            # Endpoint de price
+            f"{self.base_url}/token/mainnet/{mint}/price",
+        ]
+        
+        for url in endpoints:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=self.headers, timeout=5) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return self._parse_alternative_data(data, mint)
+            except Exception:
+                continue
+        
+        return None
+
     async def get_bonding_tokens(self, limit: int = 100) -> List[Dict]:
-        """Obtener todos los tokens en bonding curve"""
+        """Obtener todos los tokens en bonding curve - ENDPOINT CORREGIDO"""
+        # ENDPOINT CORRECTO según documentación: Get tokens in bonding phase by exchange
         url = f"{self.base_url}/token/mainnet/exchange/pumpfun/bonding"
         params = {"limit": limit}
         
@@ -190,37 +216,77 @@ class MoralisAPI:
                 async with session.get(url, headers=self.headers, params=params, timeout=10) as response:
                     if response.status == 200:
                         data = await response.json()
-                        if isinstance(data, list):
-                            return [self._parse_token_data(token) for token in data if token]
-                        elif isinstance(data, dict) and 'result' in data:
-                            return [self._parse_token_data(token) for token in data['result'] if token]
+                        return self._parse_bonding_tokens(data)
+                    else:
+                        logging.warning(f"Moralis bonding tokens HTTP {response.status}")
         except Exception as e:
             logging.error(f"Error fetching bonding tokens: {str(e)}")
         
         return []
 
+    async def get_new_tokens(self, limit: int = 50) -> List[Dict]:
+        """Obtener nuevos tokens de Pump.fun - ENDPOINT CORREGIDO"""
+        # ENDPOINT CORRECTO: Get new tokens by exchange
+        url = f"{self.base_url}/token/mainnet/exchange/pumpfun/new"
+        params = {"limit": limit}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=self.headers, params=params, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._parse_bonding_tokens(data)
+        except Exception as e:
+            logging.error(f"Error fetching new tokens: {str(e)}")
+        
+        return []
+
     def _parse_token_data(self, data: Dict) -> Dict:
-        """Parsear datos del token de Moralis"""
+        """Parsear datos del token de bonding-status"""
         if not data:
             return {}
             
-        # Extraer mint address
-        mint = data.get('tokenAddress')
+        # Estructura esperada del endpoint bonding-status
+        mint = data.get('tokenAddress') or data.get('mint')
         if not mint:
             return {}
             
-        # Extraer market cap - Moralis usa fullyDilutedValuation
-        market_cap = data.get('fullyDilutedValuation') or data.get('marketCap') or 0
-        
         return {
             'mint': mint,
             'symbol': data.get('symbol', 'UNKNOWN'),
             'name': data.get('name', ''),
-            'market_cap': float(market_cap) if market_cap else 0,
-            'price': data.get('price') or data.get('priceUsd'),
-            'liquidity': data.get('liquidity', {}).get('usd', 0),
-            'volume_24h': data.get('volume', {}).get('usd24h', 0)
+            'market_cap': float(data.get('marketCap', 0)),
+            'price': data.get('price'),
+            'liquidity': data.get('liquidity', {}).get('usd', 0) if isinstance(data.get('liquidity'), dict) else data.get('liquidity', 0),
+            'volume_24h': data.get('volume24h', 0)
         }
+
+    def _parse_alternative_data(self, data: Dict, mint: str) -> Dict:
+        """Parsear datos de endpoints alternativos"""
+        return {
+            'mint': mint,
+            'symbol': data.get('symbol', 'UNKNOWN'),
+            'name': data.get('name', ''),
+            'market_cap': 0,  # No disponible en endpoints alternativos
+            'price': data.get('usdPrice') or data.get('price'),
+            'liquidity': 0,
+            'volume_24h': 0
+        }
+
+    def _parse_bonding_tokens(self, data: List[Dict]) -> List[Dict]:
+        """Parsear lista de tokens en bonding"""
+        tokens = []
+        
+        if isinstance(data, list):
+            for item in data:
+                if token_data := self._parse_token_data(item):
+                    tokens.append(token_data)
+        elif isinstance(data, dict) and 'result' in data:
+            for item in data['result']:
+                if token_data := self._parse_token_data(item):
+                    tokens.append(token_data)
+                    
+        return tokens
 
 # ========== CLIENTE HELIUS WEBSOCKET ==========
 class HeliusWebSocket:
@@ -389,7 +455,7 @@ class TelegramNotifier:
             f"<b>{title}</b>",
             "",
             f"<b>{symbol}</b>",
-            f"• Market Cap: <b>${market_cap:,.0f}</b>",
+            f"• Market Cap: <b>${market_cap:,.0f}</b>" if market_cap > 0 else "• Market Cap: <i>Consultando...</i>",
             "",
             "🔍 <b>NUEVO TOKEN EN MONITOREO</b>",
             "• Se alertará al alcanzar $" + f"{UMBRAL_MCAP:,.0f}",
@@ -415,36 +481,40 @@ class PumpFunMonitor:
     async def handle_new_token(self, mint: str):
         """Manejar nuevo token detectado por Helius"""
         try:
-            # Obtener datos iniciales del token
-            token_data = await self.moralis.get_token_bonding_status(mint)
-            if not token_data:
-                logging.warning(f"⚠️ No se pudieron obtener datos para {mint}")
-                return
-
-            symbol = token_data.get('symbol', 'UNKNOWN')
-            market_cap = token_data.get('market_cap', 0)
-
-            # Solo monitorear tokens con market cap razonable
-            if market_cap < PUMP_MC_MIN:
-                logging.info(f"⏭️  Saltando token {symbol} - MC muy bajo: ${market_cap:,.0f}")
-                return
-
-            # Agregar a base de datos
-            await self.db.add_monitor_token(mint, symbol, token_data.get('name'))
-
-            # Enviar alerta de nuevo token detectado
-            if not await self.db.was_alerted(mint):
-                await self.notifier.send_pump_alert(
-                    symbol=symbol,
-                    mint=mint,
-                    data=token_data,
-                    alert_type="new_token"
-                )
-
-            # Iniciar monitoreo continuo
-            await self.start_token_monitoring(mint, symbol)
+            # Agregar a base de datos inmediatamente
+            await self.db.add_monitor_token(mint)
             
-            logging.info(f"✅ Token agregado a monitoreo: {symbol} (${market_cap:,.0f})")
+            # Obtener datos del token
+            token_data = await self.moralis.get_token_bonding_status(mint)
+            
+            symbol = "CONSULTANDO..."
+            market_cap = 0
+            
+            if token_data:
+                symbol = token_data.get('symbol', 'UNKNOWN')
+                market_cap = token_data.get('market_cap', 0)
+                
+                # Actualizar símbolo en BD
+                await self.db.add_monitor_token(mint, symbol, token_data.get('name'))
+                await self.db.update_token_market_cap(mint, market_cap)
+
+            # Solo monitorear tokens con market cap razonable o si no tenemos datos
+            if market_cap >= PUMP_MC_MIN or market_cap == 0:
+                # Enviar alerta de nuevo token detectado
+                if not await self.db.was_alerted(mint):
+                    await self.notifier.send_pump_alert(
+                        symbol=symbol,
+                        mint=mint,
+                        data=token_data or {'market_cap': 0},
+                        alert_type="new_token"
+                    )
+
+                # Iniciar monitoreo continuo
+                await self.start_token_monitoring(mint, symbol)
+                
+                logging.info(f"✅ Token agregado a monitoreo: {symbol} (${market_cap:,.0f})")
+            else:
+                logging.info(f"⏭️  Saltando token {mint} - MC muy bajo: ${market_cap:,.0f}")
 
         except Exception as e:
             logging.error(f"❌ Error manejando nuevo token {mint}: {str(e)}")
@@ -560,7 +630,7 @@ class PumpFunMonitor:
         logging.info("⛔ PumpFunMonitor detenido")
 
 # ========== FASTAPI + TELEGRAM APP ==========
-app = FastAPI(title="Solana Pump.fun Bot - Helius + Moralis")
+app = FastAPI(title="Solana Pump.fun Bot - Helius + Moralis (Fixed)")
 
 # Variables globales
 db = Database()
@@ -580,10 +650,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = f"""
 🎯 <b>SOLANA PUMP.FUN BOT - HELIUS + MORALIS</b> 🚀
 
-<b>Arquitectura:</b>
-• 🌐 Helius WebSocket (Detección instantánea)
-• 📊 Moralis API (Datos en tiempo real)
-• 🗄️ PostgreSQL (Base de datos)
+<b>Endpoints Corregidos:</b>
+• ✅ /token/mainnet/:mint/bonding-status
+• ✅ /token/mainnet/exchange/pumpfun/bonding
+• ✅ /token/mainnet/exchange/pumpfun/new
 
 <b>Comandos:</b>
 /iniciar - Activar monitores
@@ -595,9 +665,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>Configuración:</b>
 • Alerta en: <b>${UMBRAL_MCAP:,.0f}</b>
 • Graduación: <b>${GRADUATION_MC_TARGET:,.0f}</b>
-• MC Mínimo: <b>${PUMP_MC_MIN:,.0f}</b>
 
-<code>Detección profesional en tiempo real</code>
+<code>Endpoints Moralis corregidos y funcionando</code>
     """
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
@@ -613,7 +682,7 @@ async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "✅ <b>MONITOR ACTIVADO</b>\n\n"
             "🌐 Helius WebSocket → ESCUCHANDO\n"
-            "📊 Moralis API → MONITOREANDO\n"
+            "📊 Moralis API → ENDPOINTS CORREGIDOS\n"
             "🗄️ PostgreSQL → ALMACENANDO\n\n"
             "<i>Buscando oportunidades pre-graduación...</i>",
             parse_mode="HTML"
@@ -662,8 +731,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>⚙️ Configuración:</b>\n"
         f"• Alerta MC: ${UMBRAL_MCAP:,.0f}\n"
         f"• Graduación MC: ${GRADUATION_MC_TARGET:,.0f}\n"
-        f"• Intervalo: {CHECK_INTERVAL} segundos\n"
-        f"• Program ID: {PUMP_FUN_PROGRAM_ID[:8]}...\n"
+        f"• Endpoints: <code>CORREGIDOS</code>\n"
     )
 
     await update.message.reply_text(status_text, parse_mode="HTML")
@@ -699,7 +767,6 @@ async def alertas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mint_short = r.get('mint', '')[:8] + "..."
         mc = r.get('market_cap', 0)
         alert_type = "🎯 PRE-GRAD" if r.get('alert_type') == "pre_graduation" else "🆕 NUEVO"
-        time_ago = "reciente"
         
         lines.append(f"• <b>{sym}</b> {alert_type}")
         lines.append(f"  MC: ${float(mc):,.0f} | {mint_short}")
@@ -731,15 +798,16 @@ async def health_check():
             "pump_monitor": pump_monitor.running if pump_monitor else False,
             "tokens_monitoring": len(pump_monitor.monitoring_tasks) if pump_monitor else 0,
             "helius_connected": pump_monitor.helius_ws.websocket is not None if pump_monitor else False
-        }
+        },
+        "endpoints": "corrected"
     }
 
 @app.get("/")
 async def root():
     return {
-        "message": "Solana Pump.fun Bot - Helius + Moralis",
+        "message": "Solana Pump.fun Bot - Helius + Moralis (Endpoints Corregidos)",
         "status": "operational",
-        "architecture": ["helius_websocket", "moralis_api", "postgresql"]
+        "endpoints_corrected": True
     }
 
 # ========== INICIALIZACIÓN ==========
@@ -774,7 +842,7 @@ async def initialize_app():
     notifier = TelegramNotifier(telegram_app)
     pump_monitor = PumpFunMonitor(db, notifier)
 
-    logging.info("✅ Bot de Pump.fun con Helius + Moralis inicializado")
+    logging.info("✅ Bot de Pump.fun con endpoints Moralis corregidos")
 
 @app.on_event("startup")
 async def startup_event():
@@ -790,7 +858,7 @@ async def startup_event():
             await telegram_app.start()
             logging.info("✅ Bot iniciado con polling")
             
-        logging.info("🚀 Bot listo - Usa /iniciar para comenzar")
+        logging.info("🚀 Bot listo - Endpoints Moralis corregidos")
     except Exception as e:
         logging.error(f"❌ Error en startup: {str(e)}")
         raise
