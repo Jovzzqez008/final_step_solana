@@ -1,5 +1,5 @@
-# telegram_bot_pump_fun_ultra_final.py
-# SOLANA PUMP.FUN BOT - GRAPHQL + WEBSOCKET DUAL SOURCE (ULTRA RÁPIDO)
+# telegram_bot_pump_fun_direct.py
+# SOLANA PUMP.FUN BOT - API DIRECTA DE PUMP.FUN
 
 import os
 import re
@@ -7,11 +7,10 @@ import json
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, List, Optional
 
 import aiohttp
 import asyncpg
-import websockets
 from fastapi import FastAPI, Request
 from starlette.responses import JSONResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,12 +28,10 @@ TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
 OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# FUENTES DUALES: GraphQL + WebSocket
-PUMP_FUN_GRAPHQL_URL = "https://pump.fun/api/graphql"
-PUMP_FUN_WEBSOCKET_URL = os.getenv("PUMP_FUN_WEBSOCKET_URL", "wss://pump.fun/api/graphql")
-
-# Fallback externo
-DEXSCREENER_API = "https://api.dexscreener.com/latest"
+# API REAL DE PUMP.FUN - ENDPOINTS QUE SÍ FUNCIONAN
+PUMP_FUN_API_BASE = "https://api.pump.fun"
+PUMP_FUN_COINS_URL = f"{PUMP_FUN_API_BASE}/coins"
+PUMP_FUN_COIN_URL = f"{PUMP_FUN_API_BASE}/coin"
 
 # Parámetros de trading
 PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "3000"))
@@ -67,14 +64,14 @@ class Database:
                     market_cap DECIMAL,
                     detected_at TIMESTAMP DEFAULT NOW(),
                     graduated BOOLEAN DEFAULT FALSE,
-                    source TEXT DEFAULT 'unknown'
+                    source TEXT DEFAULT 'pump.fun'
                 )
             """)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS seen_tokens (
                     mint TEXT PRIMARY KEY,
                     last_seen TIMESTAMP DEFAULT NOW(),
-                    source TEXT DEFAULT 'unknown'
+                    source TEXT DEFAULT 'pump.fun'
                 )
             """)
 
@@ -89,7 +86,7 @@ class Database:
                 row = await conn.fetchrow("SELECT 1 FROM pump_notifications WHERE mint = $1", mint)
             return bool(row)
 
-    async def mark_notified(self, mint: str, alert_type: str, symbol: str = None, market_cap: float = None, source: str = "unknown"):
+    async def mark_notified(self, mint: str, alert_type: str, symbol: str = None, market_cap: float = None, source: str = "pump.fun"):
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO pump_notifications (mint, alert_type, symbol, market_cap, source)
@@ -114,7 +111,7 @@ class Database:
             """, mint, minutes)
             return bool(row)
 
-    async def mark_seen(self, mint: str, source: str = "unknown"):
+    async def mark_seen(self, mint: str, source: str = "pump.fun"):
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO seen_tokens (mint, source) VALUES ($1, $2)
@@ -140,20 +137,17 @@ class Database:
             )
             return [dict(r) for r in rows]
 
-# ========== CLIENTE HTTP CON HEADERS ANTI-CLOUDFLARE ==========
+# ========== CLIENTE HTTP PARA PUMP.FUN ==========
 class APIClient:
     def __init__(self):
         self.session = None
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Accept": "application/json",
             "Origin": "https://pump.fun",
-            "Referer": "https://pump.fun/",
-            "Content-Type": "application/json",
-            "x-fun-platform": "pumpfun-web"
+            "Referer": "https://pump.fun/"
         })
         return self
 
@@ -161,195 +155,69 @@ class APIClient:
         if self.session:
             await self.session.close()
 
-    async def fetch_json(self, url: str, method: str = "GET", data: dict = None, timeout: int = 10) -> Any:
+    async def fetch_json(self, url: str, params: dict = None, timeout: int = 10) -> Any:
         try:
-            if method.upper() == "POST":
-                async with self.session.post(url, json=data, timeout=timeout) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        logging.warning(f"HTTP {response.status} from {url}")
-            else:
-                async with self.session.get(url, timeout=timeout) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        logging.warning(f"HTTP {response.status} from {url}")
+            async with self.session.get(url, params=params, timeout=timeout) as response:
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    logging.warning(f"HTTP {response.status} from {url}")
         except asyncio.TimeoutError:
             logging.warning(f"Timeout fetching {url}")
         except Exception as e:
             logging.error(f"Error fetching {url}: {str(e)}")
         return None
 
-# ========== PUMP.FUN GRAPHQL CLIENT ==========
-class PumpFunGraphQL:
+# ========== API DIRECTA DE PUMP.FUN ==========
+class PumpFunAPI:
     def __init__(self, client: APIClient):
         self.client = client
-        self.url = PUMP_FUN_GRAPHQL_URL
 
-    async def get_recent_tokens(self, limit: int = 50) -> List[Dict]:
-        """Consulta GraphQL interna de Pump.fun - TOKENS NUEVOS EN TIEMPO REAL"""
-        query = """
-        {
-            feed(input: {limit: %d, filter: NEW}) {
-                coins {
-                    id
-                    mint
-                    name
-                    symbol
-                    marketCap
-                    createdAt
-                    creator {
-                        address
-                    }
-                }
-            }
+    async def get_all_coins(self, limit: int = 100) -> List[Dict]:
+        """Obtener TODOS los coins de Pump.fun - ENDPOINT REAL"""
+        url = f"{PUMP_FUN_COINS_URL}"
+        params = {
+            "sort": "createdAt",  # Ordenar por más recientes
+            "order": "desc",
+            "limit": limit
         }
-        """ % limit
+        
+        data = await self.client.fetch_json(url, params=params)
+        
+        if data and isinstance(data, list):
+            logging.info(f"✅ Pump.fun API: {len(data)} coins obtenidos")
+            return data
+        elif data and isinstance(data, dict) and 'coins' in data:
+            return data['coins']
+        else:
+            logging.warning("⚠️ Formato inesperado de la API de Pump.fun")
+            return []
 
-        data = await self.client.fetch_json(self.url, method="POST", data={"query": query})
+    async def get_coin_by_mint(self, mint: str) -> Optional[Dict]:
+        """Obtener coin específico por mint address"""
+        url = f"{PUMP_FUN_COIN_URL}/{mint}"
+        data = await self.client.fetch_json(url)
         
-        if data and "data" in data and "feed" in data["data"]:
-            coins = data["data"]["feed"].get("coins", [])
-            logging.info(f"✅ GraphQL: {len(coins)} tokens nuevos detectados")
-            return coins
-        return []
-
-    async def get_token_by_mint(self, mint: str) -> Optional[Dict]:
-        """Obtener token específico por mint address"""
-        query = """
-        query GetToken($mint: String!) {
-            coin(mint: $mint) {
-                id
-                mint
-                name
-                symbol
-                marketCap
-                createdAt
-                creator {
-                    address
-                }
-            }
-        }
-        """
-        
-        data = await self.client.fetch_json(self.url, method="POST", data={
-            "query": query,
-            "variables": {"mint": mint}
-        })
-        
-        if data and "data" in data and "coin" in data["data"]:
-            return data["data"]["coin"]
+        if data and isinstance(data, dict):
+            return data
         return None
 
-# ========== PUMP.FUN WEBSOCKET CLIENT ==========
-class PumpFunWebSocket:
-    def __init__(self, on_new_token: Callable):
-        self.url = PUMP_FUN_WEBSOCKET_URL
-        self.on_new_token = on_new_token
-        self.websocket = None
-        self.running = False
-        self.task = None
-
-    async def connect(self):
-        """Conectar y autenticar WebSocket"""
-        try:
-            self.websocket = await websockets.connect(self.url, ping_interval=20, ping_timeout=10)
-            
-            # Subscription query para nuevos tokens
-            subscribe_message = {
-                "type": "connection_init",
-                "payload": {}
-            }
-            await self.websocket.send(json.dumps(subscribe_message))
-            
-            # Esperar conexión establecida
-            response = await self.websocket.recv()
-            logging.info(f"✅ WebSocket conectado: {response}")
-            
-            # Suscribirse a nuevos tokens
-            subscription_query = {
-                "id": "1",
-                "type": "start",
-                "payload": {
-                    "query": """
-                    subscription {
-                        coinSub {
-                            id
-                            mint
-                            name
-                            symbol
-                            marketCap
-                            createdAt
-                            creator {
-                                address
-                            }
-                        }
-                    }
-                    """
-                }
-            }
-            
-            await self.websocket.send(json.dumps(subscription_query))
-            logging.info("✅ Suscrito a nuevos tokens via WebSocket")
-            
-        except Exception as e:
-            logging.error(f"❌ Error conectando WebSocket: {str(e)}")
-            raise
-
-    async def listen(self):
-        """Escuchar mensajes del WebSocket"""
-        self.running = True
-        reconnect_delay = 1
+    async def get_trending_coins(self, limit: int = 50) -> List[Dict]:
+        """Obtener coins en tendencia"""
+        url = f"{PUMP_FUN_COINS_URL}"
+        params = {
+            "sort": "volume",  # Ordenar por volumen (tendencia)
+            "order": "desc",
+            "limit": limit
+        }
         
-        while self.running:
-            try:
-                if not self.websocket:
-                    await self.connect()
-                    reconnect_delay = 1
-                
-                message = await self.websocket.recv()
-                data = json.loads(message)
-                
-                if data.get("type") == "data" and "payload" in data:
-                    coin_data = data["payload"].get("data", {}).get("coinSub")
-                    if coin_data:
-                        logging.info(f"🚀 WebSocket NEW TOKEN: {coin_data.get('symbol')} - {coin_data.get('mint')}")
-                        await self.on_new_token(coin_data, "websocket")
-                
-                reconnect_delay = 1  # Reset delay on successful message
-                
-            except websockets.exceptions.ConnectionClosed:
-                logging.warning(f"🔌 WebSocket desconectado, reconectando en {reconnect_delay}s...")
-                self.websocket = None
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 30)  # Exponential backoff
-                
-            except Exception as e:
-                logging.error(f"❌ Error en WebSocket: {str(e)}")
-                self.websocket = None
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, 30)
-
-    async def start(self):
-        """Iniciar listener de WebSocket"""
-        if self.task and not self.task.done():
-            return
-        self.task = asyncio.create_task(self.listen())
-        logging.info("✅ PumpFunWebSocket iniciado")
-
-    async def stop(self):
-        """Detener WebSocket"""
-        self.running = False
-        if self.websocket:
-            await self.websocket.close()
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
-        logging.info("⛔ PumpFunWebSocket detenido")
+        data = await self.client.fetch_json(url, params=params)
+        
+        if data and isinstance(data, list):
+            return data
+        elif data and isinstance(data, dict) and 'coins' in data:
+            return data['coins']
+        return []
 
 # ========== NOTIFICADOR TELEGRAM ==========
 def build_buttons_for_mint(mint: str) -> InlineKeyboardMarkup:
@@ -384,7 +252,18 @@ class TelegramNotifier:
                 pass
         
         if data.get('price'):
-            msg_lines.append(f"• Precio: {data.get('price')}")
+            try:
+                price_str = f"• Precio: ${float(data['price']):.8f}"
+                msg_lines.append(price_str)
+            except Exception:
+                pass
+        
+        if data.get('liquidity'):
+            try:
+                liq_str = f"• Liquidez: ${float(data['liquidity']):,.0f}"
+                msg_lines.append(liq_str)
+            except Exception:
+                pass
         
         if alert_type == "pump_early":
             msg_lines.append("• ⚡ <b>OPORTUNIDAD PRE-GRADUACIÓN</b>")
@@ -394,11 +273,11 @@ class TelegramNotifier:
                 msg_lines.append(f"• Progreso: {data['graduation_percent']:.1f}%")
         elif alert_type == "post_graduation_pump":
             msg_lines.append("• 🔥 <b>EXPLOSIÓN POST-GRADUACIÓN</b>")
-            if data.get('price_change_5m'):
-                msg_lines.append(f"• Cambio 5m: {data['price_change_5m']:.2f}%")
+            if data.get('price_change_24h'):
+                msg_lines.append(f"• Cambio 24h: {data['price_change_24h']:.2f}%")
         
         msg_lines.append(f"• Fuente: {source}")
-        msg_lines.append("• 🚀 <b>ULTRA EARLY DETECTION</b>" if source == "websocket" else "• ⚡ <b>EARLY DETECTION</b>")
+        msg_lines.append("• 🎯 <b>DETECCIÓN DIRECTA PUMP.FUN</b>")
         msg_lines.append("")
         msg_lines.append("<b>Mint:</b>")
         msg_lines.append(f"<code>{mint}</code>")
@@ -417,120 +296,142 @@ class TelegramNotifier:
         except Exception as e:
             logging.error(f"❌ Error enviando alerta Telegram: {str(e)}")
 
-# ========== MONITOR PRINCIPAL DUAL SOURCE ==========
+# ========== MONITOR PRINCIPAL CON API DIRECTA PUMP.FUN ==========
 class PumpFunMonitor:
     def __init__(self, db: Database, notifier: TelegramNotifier):
         self.db = db
         self.notifier = notifier
-        self.graphql_client = None
-        self.websocket = None
         self.running = False
         self.tasks = []
         self.scan_round = 0
 
-    async def handle_new_token(self, token_data: Dict, source: str):
-        """Procesar nuevo token desde cualquier fuente"""
-        mint = token_data.get('mint')
-        symbol = token_data.get('symbol', 'UNKNOWN')
-        market_cap = token_data.get('marketCap', 0)
-        
-        if not mint:
-            return
-
-        # Evitar duplicados recientes
-        if await self.db.seen_recently(mint, minutes=1):
-            return
-
-        await self.db.mark_seen(mint, source)
-        
+    async def process_pumpfun_coin(self, coin: Dict) -> bool:
+        """Procesar un coin de Pump.fun y enviar alertas si cumple criterios"""
         try:
-            market_cap = float(market_cap) if market_cap else 0
-        except (TypeError, ValueError):
-            market_cap = 0
-
-        # Filtro por market cap
-        if market_cap < PUMP_MC_MIN or market_cap > PUMP_MC_MAX:
-            return
-
-        # ALERTA EARLY - Detección inmediata
-        if not await self.db.was_notified(mint, "pump_early"):
-            speed_indicator = "🚀 ULTRA EARLY" if source == "websocket" else "⚡ EARLY"
+            mint = coin.get('mint')
+            symbol = coin.get('symbol', 'UNKNOWN')
+            name = coin.get('name', '')
             
-            await self.notifier.send_pump_alert(
-                title=f"PUMP.FUN {speed_indicator} DETECTION",
-                symbol=symbol,
-                mint=mint,
-                data={"market_cap": market_cap},
-                alert_type="pump_early",
-                source=source
-            )
-            await self.db.mark_notified(mint, "pump_early", symbol, market_cap, source)
-            logging.info(f"🚨 Alerta EARLY enviada: {symbol} (${market_cap:,.0f}) via {source}")
+            if not mint:
+                return False
 
-        # PRE-GRADUACIÓN - Si está cerca del objetivo
-        if (market_cap >= GRADUATION_MC_TARGET * 0.7 and 
-            market_cap <= GRADUATION_MC_TARGET and 
-            not await self.db.was_notified(mint, "pre_graduation")):
-            
-            graduation_percent = (market_cap / GRADUATION_MC_TARGET) * 100
-            
-            await self.notifier.send_pump_alert(
-                title="PRE-GRADUACIÓN INMINENTE",
-                symbol=symbol,
-                mint=mint,
-                data={
-                    'market_cap': market_cap,
-                    'graduation_percent': graduation_percent
-                },
-                alert_type="pre_graduation",
-                source=source
-            )
-            await self.db.mark_notified(mint, "pre_graduation", symbol, market_cap, source)
-            logging.info(f"🎯 Alerta PRE-GRAD enviada: {symbol} (${market_cap:,.0f})")
+            # Evitar duplicados recientes
+            if await self.db.seen_recently(mint, minutes=2):
+                return False
 
-    async def graphql_scanner(self):
-        """Scanner periódico via GraphQL"""
+            await self.db.mark_seen(mint, "pump.fun")
+
+            # Obtener métricas de Pump.fun
+            market_cap = coin.get('marketCap')
+            price = coin.get('price')
+            liquidity = coin.get('liquidity')
+            volume = coin.get('volume')
+            created_at = coin.get('createdAt')
+            price_change_24h = coin.get('priceChange24h', 0)
+
+            # Convertir a float
+            try:
+                market_cap = float(market_cap) if market_cap else 0
+                price = float(price) if price else 0
+                liquidity = float(liquidity) if liquidity else 0
+                price_change_24h = float(price_change_24h) if price_change_24h else 0
+            except (TypeError, ValueError):
+                return False
+
+            # Filtro por market cap
+            if market_cap < PUMP_MC_MIN or market_cap > PUMP_MC_MAX:
+                return False
+
+            # ALERTA EARLY - Detección inmediata
+            if not await self.db.was_notified(mint, "pump_early"):
+                await self.notifier.send_pump_alert(
+                    title="PUMP.FUN EARLY DETECTION",
+                    symbol=symbol,
+                    mint=mint,
+                    data={
+                        "market_cap": market_cap,
+                        "price": price,
+                        "liquidity": liquidity
+                    },
+                    alert_type="pump_early",
+                    source="pump.fun"
+                )
+                await self.db.mark_notified(mint, "pump_early", symbol, market_cap, "pump.fun")
+                logging.info(f"🚨 Alerta EARLY enviada: {symbol} (${market_cap:,.0f})")
+                return True
+
+            # PRE-GRADUACIÓN - Si está cerca del objetivo
+            if (market_cap >= GRADUATION_MC_TARGET * 0.7 and 
+                market_cap <= GRADUATION_MC_TARGET and 
+                not await self.db.was_notified(mint, "pre_graduation")):
+                
+                graduation_percent = (market_cap / GRADUATION_MC_TARGET) * 100
+                
+                await self.notifier.send_pump_alert(
+                    title="PRE-GRADUACIÓN INMINENTE",
+                    symbol=symbol,
+                    mint=mint,
+                    data={
+                        'market_cap': market_cap,
+                        'graduation_percent': graduation_percent
+                    },
+                    alert_type="pre_graduation",
+                    source="pump.fun"
+                )
+                await self.db.mark_notified(mint, "pre_graduation", symbol, market_cap, "pump.fun")
+                logging.info(f"🎯 Alerta PRE-GRAD enviada: {symbol} (${market_cap:,.0f})")
+                return True
+
+        except Exception as e:
+            logging.error(f"❌ Error procesando coin: {str(e)}")
+        
+        return False
+
+    async def pumpfun_scanner(self):
+        """Scanner principal usando API directa de Pump.fun"""
         while self.running:
             try:
                 self.scan_round += 1
-                logging.info(f"🔄 GraphQL Scan round #{self.scan_round}")
+                logging.info(f"🔄 Pump.fun Scan round #{self.scan_round}")
                 
                 async with APIClient() as client:
-                    graphql = PumpFunGraphQL(client)
-                    tokens = await graphql.get_recent_tokens(30)
+                    pump = PumpFunAPI(client)
                     
-                    for token in tokens:
-                        await self.handle_new_token(token, "graphql")
-                        
+                    # Obtener coins más recientes
+                    coins = await pump.get_all_coins(80)
+                    
+                    if not coins:
+                        logging.warning("⚠️ No se pudieron obtener coins de Pump.fun")
+                        # Intentar con trending como fallback
+                        coins = await pump.get_trending_coins(50)
+                        if not coins:
+                            continue
+
+                    processed = 0
+                    for coin in coins:
+                        if await self.process_pumpfun_coin(coin):
+                            processed += 1
+
+                    logging.info(f"✅ Scan round #{self.scan_round} completado. Alertas: {processed}")
+                    
             except Exception as e:
-                logging.error(f"❌ Error en GraphQL scanner: {str(e)}")
+                logging.error(f"❌ Error en Pump.fun scanner: {str(e)}")
             
             await asyncio.sleep(max(30, CHECK_INTERVAL * 60))
 
     async def start(self):
-        """Iniciar monitor dual (GraphQL + WebSocket)"""
+        """Iniciar monitor"""
         self.running = True
         
-        # Iniciar WebSocket si está configurado
-        if PUMP_FUN_WEBSOCKET_URL and PUMP_FUN_WEBSOCKET_URL.startswith("wss://"):
-            self.websocket = PumpFunWebSocket(self.handle_new_token)
-            await self.websocket.start()
-            logging.info("✅ WebSocket monitor iniciado")
-        else:
-            logging.warning("⚠️ WebSocket URL no configurada, solo usando GraphQL")
+        # Iniciar scanner principal
+        scanner_task = asyncio.create_task(self.pumpfun_scanner())
+        self.tasks.append(scanner_task)
         
-        # Iniciar scanner GraphQL
-        graphql_task = asyncio.create_task(self.graphql_scanner())
-        self.tasks.append(graphql_task)
-        
-        logging.info("✅ PumpFunMonitor DUAL SOURCE iniciado")
+        logging.info("✅ PumpFunMonitor con API DIRECTA iniciado")
 
     async def stop(self):
         """Detener monitor"""
         self.running = False
-        
-        if self.websocket:
-            await self.websocket.stop()
         
         for task in self.tasks:
             if not task.done():
@@ -556,22 +457,25 @@ class PostGraduationScanner:
             tokens = await self.db.get_pre_graduation_tokens()
             
             async with APIClient() as client:
-                graphql = PumpFunGraphQL(client)
+                pump = PumpFunAPI(client)
                 
                 for token in tokens:
                     mint = token['mint']
                     symbol = token.get('symbol', 'UNKNOWN')
                     
-                    # Obtener datos actualizados
-                    current_data = await graphql.get_token_by_mint(mint)
+                    # Obtener datos actualizados de Pump.fun
+                    current_data = await pump.get_coin_by_mint(mint)
                     if not current_data:
                         continue
                     
                     current_mc = current_data.get('marketCap', 0)
+                    price_change_24h = current_data.get('priceChange24h', 0)
+                    
                     try:
                         current_mc = float(current_mc)
+                        price_change_24h = float(price_change_24h)
                     except (TypeError, ValueError):
-                        current_mc = 0
+                        continue
 
                     # Marcar como graduado si supera el target
                     if current_mc > GRADUATION_MC_TARGET and not await self.db.was_notified(mint, "graduated"):
@@ -579,20 +483,24 @@ class PostGraduationScanner:
                         await self.db.mark_notified(mint, "graduated")
                         logging.info(f"🎓 Token graduado: {symbol} - MC: ${current_mc:,.0f}")
 
-                    # Detectar explosión post-graduación (simulado - GraphQL no tiene price_change_5m)
-                    if (current_mc > GRADUATION_MC_TARGET * 1.1 and 
+                    # Detectar explosión post-graduación
+                    if (current_mc > GRADUATION_MC_TARGET and 
+                        price_change_24h > 20 and 
                         not await self.db.was_notified(mint, "post_graduation_pump")):
                         
                         await self.notifier.send_pump_alert(
                             title="EXPLOSIÓN POST-GRADUACIÓN",
                             symbol=symbol,
                             mint=mint,
-                            data={"market_cap": current_mc},
+                            data={
+                                "market_cap": current_mc,
+                                "price_change_24h": price_change_24h
+                            },
                             alert_type="post_graduation_pump",
-                            source="post_graduation"
+                            source="pump.fun"
                         )
                         await self.db.mark_notified(mint, "post_graduation_pump")
-                        logging.info(f"🔥 Explosión post-graduación: {symbol}")
+                        logging.info(f"🔥 Explosión post-graduación: {symbol} (+{price_change_24h:.1f}%)")
 
         except Exception as e:
             logging.error(f"❌ Error en scan_graduated_tokens: {str(e)}")
@@ -626,7 +534,7 @@ class PostGraduationScanner:
         logging.info("⛔ PostGraduationScanner detenido")
 
 # ========== FASTAPI + TELEGRAM APP ==========
-app = FastAPI(title="Solana Pump.fun Bot - DUAL SOURCE ULTRA")
+app = FastAPI(title="Solana Pump.fun Bot - API Directa")
 
 # Variables globales
 db = Database()
@@ -644,12 +552,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No autorizado")
         return
     
-    welcome_text = """
-🎯 <b>SOLANA PUMP.FUN BOT - DUAL SOURCE ULTRA</b> 🚀
+    welcome_text = f"""
+🎯 <b>SOLANA PUMP.FUN BOT - API DIRECTA</b> 🚀
 
-<b>Fuentes activas:</b>
-• 📡 GraphQL Interno Pump.fun (NEW tokens)
-• 🌐 WebSocket Real-time (ULTRA EARLY)
+<b>Fuente principal:</b>
+• 🎯 API Directa de Pump.fun (100% real)
 
 <b>Comandos:</b>
 /iniciar - Activar monitores
@@ -659,11 +566,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 /lista - Últimos tokens detectados
 
 <b>Alertas:</b>
-🚨 EARLY - MC bajo ($3K-$50K)
-🎯 PRE-GRAD - Cerca de graduación  
+🚨 EARLY - MC bajo (${PUMP_MC_MIN:,.0f}-${PUMP_MC_MAX:,.0f})
+🎯 PRE-GRAD - Cerca de graduación (${GRADUATION_MC_TARGET:,.0f})  
 🔥 POST-GRAD - Explosión post-graduación
 
-<code>Dual Source: GraphQL + WebSocket</code>
+<code>Conectado directamente a la API de Pump.fun</code>
     """
     await update.message.reply_text(welcome_text, parse_mode="HTML")
 
@@ -679,10 +586,10 @@ async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await post_graduation_scanner.start()
 
         await update.message.reply_text(
-            "✅ <b>MONITORES DUAL ACTIVADOS</b>\n\n"
-            "🎯 Pump.fun Monitor → GRAPHQL + WEBSOCKET\n"
+            "✅ <b>MONITOR PUMP.FUN ACTIVADO</b>\n\n"
+            "🎯 API Directa Pump.fun → ESCANEANDO\n"
             "🔥 Post-Graduation Scanner → ACTIVO\n\n"
-            "<i>Buscando oportunidades ULTRA EARLY...</i>",
+            "<i>Buscando oportunidades directamente en Pump.fun...</i>",
             parse_mode="HTML"
         )
         logging.info(f"📱 Monitores iniciados por: {update.effective_user.id}")
@@ -719,12 +626,10 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pump_status = "🟢 ACTIVO" if pump_monitor and pump_monitor.running else "🔴 INACTIVO"
     post_status = "🟢 ACTIVO" if post_graduation_scanner and post_graduation_scanner.running else "🔴 INACTIVO"
     silent_status = "🔇 ON" if notifier and notifier.silent_mode else "🔔 OFF"
-    websocket_status = "🟢 CONECTADO" if pump_monitor and pump_monitor.websocket else "🔴 NO CONFIGURADO"
 
     status_text = (
-        "📊 <b>ESTADO DEL SISTEMA DUAL</b>\n\n"
+        "📊 <b>ESTADO DEL SISTEMA PUMP.FUN</b>\n\n"
         f"🎯 Pump.fun Monitor: {pump_status}\n"
-        f"🌐 WebSocket: {websocket_status}\n"
         f"🔥 Post-Graduation: {post_status}\n"
         f"🔊 Modo Silencioso: {silent_status}\n\n"
         
@@ -733,6 +638,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• MC Máximo: ${PUMP_MC_MAX:,.0f}\n"
         f"• Objetivo Graduación: ${GRADUATION_MC_TARGET:,.0f}\n"
         f"• Intervalo: {CHECK_INTERVAL} minuto(s)\n"
+        f"• API: {PUMP_FUN_API_BASE}\n"
     )
 
     await update.message.reply_text(status_text, parse_mode="HTML")
@@ -768,7 +674,6 @@ async def lista_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mint = r.get('mint', '')
         mc = r.get('market_cap', 0)
         alert_type = r.get('alert_type', '')
-        detected = r.get('detected_at')
         
         lines.append(f"• <b>{sym}</b> [{alert_type}]")
         lines.append(f"  MC: ${float(mc):,.0f}")
@@ -798,17 +703,17 @@ async def health_check():
         "timestamp": datetime.utcnow().isoformat(),
         "monitors": {
             "pump_monitor": pump_monitor.running if pump_monitor else False,
-            "post_graduation_scanner": post_graduation_scanner.running if post_graduation_scanner else False,
-            "websocket_connected": pump_monitor.websocket is not None if pump_monitor else False
-        }
+            "post_graduation_scanner": post_graduation_scanner.running if post_graduation_scanner else False
+        },
+        "api": PUMP_FUN_API_BASE
     }
 
 @app.get("/")
 async def root():
     return {
-        "message": "Solana Pump.fun Bot - DUAL SOURCE ULTRA",
+        "message": "Solana Pump.fun Bot - API Directa",
         "status": "operational",
-        "sources": ["graphql", "websocket"]
+        "api": PUMP_FUN_API_BASE
     }
 
 # ========== INICIALIZACIÓN ==========
@@ -841,7 +746,7 @@ async def initialize_app():
     pump_monitor = PumpFunMonitor(db, notifier)
     post_graduation_scanner = PostGraduationScanner(db, notifier)
 
-    logging.info("✅ Bot de Pump.fun DUAL SOURCE inicializado")
+    logging.info("✅ Bot de Pump.fun con API DIRECTA inicializado")
 
 @app.on_event("startup")
 async def startup_event():
@@ -857,14 +762,14 @@ async def startup_event():
             await telegram_app.start()
             logging.info("✅ Bot iniciado con polling")
             
-        logging.info("🚀 Bot DUAL SOURCE listo - Usa /iniciar para comenzar")
+        logging.info("🚀 Bot con API DIRECTA listo - Usa /iniciar para comenzar")
     except Exception as e:
         logging.error(f"❌ Error en startup: {str(e)}")
         raise
 
 @app.on_event("shutdown") 
 async def shutdown_event():
-    logging.info("🛑 Apagando bot DUAL SOURCE...")
+    logging.info("🛑 Apagando bot...")
     
     if pump_monitor:
         await pump_monitor.stop()
@@ -875,7 +780,7 @@ async def shutdown_event():
         await telegram_app.stop()
         await telegram_app.shutdown()
 
-    logging.info("✅ Bot DUAL SOURCE apagado")
+    logging.info("✅ Bot apagado")
 
 # ========== EJECUCIÓN LOCAL ==========
 if __name__ == "__main__":
