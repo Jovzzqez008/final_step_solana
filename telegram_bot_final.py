@@ -1,641 +1,508 @@
-# pumpfun_detector_live.py
-"""
-Pump.fun early detector (Helius + Helius-RPC + Moralis + Solscan) -> Telegram alerts
-- Detects mints via Helius logsSubscribe (Pump.fun program)
-- Enriches via Helius RPC, Solscan and Moralis bonding endpoints
-- Scores each mint for "risk" and sends informative alerts to Telegram
-- Tracks tokens until pre-graduation/graduation thresholds
-- Creates Postgres tables automatically
-
-Environment variables (Railway):
-  HELIUS_WSS_URL        (required) wss://.../?api-key=KEY
-  HELIUS_RPC_URL        (optional) https://.../?api-key=KEY (fallback derived from WSS)
-  MORALIS_API_KEY       (required for bonding / market cap enrichment)
-  TELEGRA M_BOT_TOKEN   (required)
-  TELEGRAM_CHAT_ID      (required)
-  DATABASE_URL          (required) postgres://...
-  UMBRAL_MCAP           (optional, default 55000)
-  GRADUATION_MC_TARGET  (optional, default 69000)
-  TOKEN_POLL_INTERVAL   (optional, default 7)
-  PUMP_FUN_PROGRAM_ID   (optional, default program id)
-  SOLSCAN_API_BASE      (optional, default https://public-api.solscan.io)
-"""
+# telegram_bot_pumpfun_sniper.py
+# Pump.fun SNIPER Bot - Detecta tokens al momento de graduación (GraphQL)
+# Polling: 22 segundos, User-Agent: PC (Chrome)
+# Requiere env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, OWNER_ID, DATABASE_URL
 
 import os
 import re
 import json
 import asyncio
 import logging
-from typing import Optional, Dict, Any, List
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import aiohttp
-import websockets
 import asyncpg
+from fastapi import FastAPI, Request, HTTPException, Query
+from starlette.responses import JSONResponse
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ---------------- logging ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("pumpfun_detector")
+# ---------- CONFIG ----------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# ---------------- env / config ----------------
-HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-HELIUS_RPC_URL = os.getenv("HELIUS_RPC_URL") or (HELIUS_WSS_URL.replace("wss://", "https://") if HELIUS_WSS_URL else None)
-MORALIS_API_KEY = os.getenv("MORALIS_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID = int(os.getenv("TELEGRAM_CHAT_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
-UMBRAL_MCAP = float(os.getenv("UMBRAL_MCAP", "55000"))
-GRADUATION_MC_TARGET = float(os.getenv("GRADUATION_MC_TARGET", "69000"))
-TOKEN_POLL_INTERVAL = int(os.getenv("TOKEN_POLL_INTERVAL", "7"))
-PUMP_FUN_PROGRAM_ID = os.getenv("PUMP_FUN_PROGRAM_ID", "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
-SOLSCAN_API_BASE = os.getenv("SOLSCAN_API_BASE", "https://public-api.solscan.io")
 
-# sanity checks
-required = {
-    "HELIUS_WSS_URL": HELIUS_WSS_URL,
-    "HELIUS_RPC_URL": HELIUS_RPC_URL,
-    "MORALIS_API_KEY": MORALIS_API_KEY,
-    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-    "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-    "DATABASE_URL": DATABASE_URL
-}
-missing = [k for k, v in required.items() if not v]
-if missing:
-    log.error(f"Faltan variables de entorno requeridas: {missing}")
-    # raise SystemExit so user sees it immediately
-    raise SystemExit(1)
+POLL_SECONDS = 22  # polling cada 22 segundos (solicitado)
+PUMP_FUN_GRAPHQL = "https://pump.fun/api/graphql"
 
-# mint pattern heuristic (base58-ish)
-MINT_PATTERN = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+# detect mints like "...pump" or solana mint pattern
+MINT_RE = re.compile(r'[1-9A-HJ-NP-Za-km-z]{32,44}')
+PUMP_SUFFIX = "pump"
 
-# ---------------- helpers ----------------
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-def generate_links(mint: str) -> Dict[str,str]:
-    return {
-        "pumpfun": f"https://pump.fun/coin/{mint}",
-        "dexscreener": f"https://dexscreener.com/solana/{mint}",
-        "rugcheck": f"https://rugcheck.xyz/tokens/{mint}",
-        "solscan": f"https://solscan.io/token/{mint}"
-    }
-
-# ---------------- DATABASE ----------------
-class Database:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
+# ---------- DB (asyncpg) ----------
+class DB:
+    def __init__(self):
         self.pool: Optional[asyncpg.pool.Pool] = None
 
     async def connect(self):
-        self.pool = await asyncpg.create_pool(dsn=self.dsn, min_size=1, max_size=6)
-        log.info("Connected to Postgres")
-        await self._ensure_tables()
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL not set")
+        self.pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=6)
+        await self._init()
+        logging.info("✅ Postgres connected")
 
-    async def close(self):
-        if self.pool:
-            await self.pool.close()
-
-    async def _ensure_tables(self):
-        q_tokens = """
-        CREATE TABLE IF NOT EXISTS tokens (
-            mint TEXT PRIMARY KEY,
-            symbol TEXT,
-            creator TEXT,
-            first_seen TIMESTAMP WITH TIME ZONE,
-            last_seen TIMESTAMP WITH TIME ZONE,
-            market_cap DOUBLE PRECISION,
-            price DOUBLE PRECISION,
-            score INTEGER,
-            risk_reasons JSONB,
-            notified_pre_graduation BOOLEAN DEFAULT FALSE,
-            graduated BOOLEAN DEFAULT FALSE,
-            raw JSONB
-        );
-        """
-        q_events = """
-        CREATE TABLE IF NOT EXISTS events (
-            id SERIAL PRIMARY KEY,
-            mint TEXT,
-            type TEXT,
-            payload JSONB,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-        );
-        """
-        async with self.pool.acquire() as conn:
-            await conn.execute(q_tokens)
-            await conn.execute(q_events)
-        log.info("DB: ensured tokens and events tables")
-
-    async def upsert_token(self, mint: str, fields: Dict[str, Any]):
-        # fields may include symbol, creator, market_cap, price, score, risk_reasons, raw
+    async def _init(self):
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO tokens (mint, symbol, creator, first_seen, last_seen, market_cap, price, score, risk_reasons, raw)
-                VALUES ($1,$2,$3,NOW(),NOW(),$4,$5,$6,$7,$8)
-                ON CONFLICT (mint) DO UPDATE
-                SET last_seen = NOW(),
-                    market_cap = COALESCE($4, tokens.market_cap),
-                    price = COALESCE($5, tokens.price),
-                    symbol = COALESCE($2, tokens.symbol),
-                    creator = COALESCE($3, tokens.creator),
-                    score = COALESCE($6, tokens.score),
-                    risk_reasons = COALESCE($7, tokens.risk_reasons),
-                    raw = COALESCE($8, tokens.raw)
-            """, mint,
-                 fields.get("symbol"),
-                 fields.get("creator"),
-                 fields.get("market_cap"),
-                 fields.get("price"),
-                 fields.get("score"),
-                 json.dumps(fields.get("risk_reasons") or []),
-                 json.dumps(fields.get("raw") or {}))
+                CREATE TABLE IF NOT EXISTS pump_notifications (
+                    mint TEXT PRIMARY KEY,
+                    symbol TEXT,
+                    alert_type TEXT,
+                    detected_at TIMESTAMP DEFAULT NOW(),
+                    meta JSONB
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS seen_tokens (
+                    mint TEXT PRIMARY KEY,
+                    last_seen TIMESTAMP DEFAULT NOW()
+                );
+            """)
 
-    async def record_event(self, mint: str, etype: str, payload: Dict[str, Any]):
+    async def was_notified(self, mint: str) -> bool:
         async with self.pool.acquire() as conn:
-            await conn.execute("INSERT INTO events (mint, type, payload) VALUES ($1,$2,$3)", mint, etype, json.dumps(payload))
+            r = await conn.fetchrow("SELECT 1 FROM pump_notifications WHERE mint=$1", mint)
+            return bool(r)
 
-    async def mark_notified_pre(self, mint: str):
+    async def mark_notified(self, mint: str, symbol: str, alert_type: str, meta: dict):
         async with self.pool.acquire() as conn:
-            await conn.execute("UPDATE tokens SET notified_pre_graduation = TRUE WHERE mint = $1", mint)
+            await conn.execute("""
+                INSERT INTO pump_notifications (mint, symbol, alert_type, meta)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (mint) DO UPDATE SET symbol=EXCLUDED.symbol, alert_type=EXCLUDED.alert_type, meta=EXCLUDED.meta, detected_at=NOW()
+            """, mint, symbol, alert_type, json.dumps(meta))
 
-    async def was_notified_pre(self, mint: str) -> bool:
+    async def seen_recently(self, mint: str, minutes: int = 2) -> bool:
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT notified_pre_graduation FROM tokens WHERE mint = $1", mint)
-            return bool(row and row.get("notified_pre_graduation"))
+            r = await conn.fetchrow(
+                "SELECT 1 FROM seen_tokens WHERE mint=$1 AND last_seen >= NOW() - ($2::int || ' minutes')::interval",
+                mint, minutes
+            )
+            return bool(r)
 
-    async def mark_graduated(self, mint: str):
+    async def mark_seen(self, mint: str):
         async with self.pool.acquire() as conn:
-            await conn.execute("UPDATE tokens SET graduated = TRUE WHERE mint = $1", mint)
+            await conn.execute("""
+                INSERT INTO seen_tokens (mint, last_seen) VALUES ($1, NOW())
+                ON CONFLICT (mint) DO UPDATE SET last_seen = NOW()
+            """, mint)
 
-# ---------------- Helius RPC & utilities ----------------
-class HeliusRPC:
-    def __init__(self, rpc_url: str, session: aiohttp.ClientSession):
-        self.rpc_url = rpc_url
-        self.session = session
+    async def list_recent_notifications(self, limit: int = 10) -> List[Dict]:
+        """Devuelve los últimos N registros de pump_notifications"""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT mint, symbol, alert_type, detected_at, meta FROM pump_notifications ORDER BY detected_at DESC LIMIT $1",
+                limit
+            )
+            results = []
+            for r in rows:
+                results.append({
+                    "mint": r["mint"],
+                    "symbol": r["symbol"],
+                    "alert_type": r["alert_type"],
+                    "detected_at": r["detected_at"].isoformat() if r["detected_at"] else None,
+                    "meta": r["meta"]
+                })
+            return results
 
-    async def _rpc(self, method: str, params: list, timeout=10):
-        payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
-        try:
-            async with self.session.post(self.rpc_url, json=payload, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    log.debug(f"Helius RPC {method} returned {resp.status}")
-        except Exception as e:
-            log.debug(f"Helius RPC error {e}")
-        return None
+db = DB()
 
-    async def get_parsed_account_info(self, address: str):
-        # use "getAccountInfo" with jsonParsed
-        res = await self._rpc("getAccountInfo", [address, {"encoding":"jsonParsed","commitment":"confirmed"}])
-        if not res:
-            return None
-        return res.get("result")
+# ---------- TELEGRAM notifier ----------
+class Notifier:
+    def __init__(self, tg_app: Application):
+        self.app = tg_app
+        self.silent = False
 
-    async def get_token_supply(self, mint: str):
-        res = await self._rpc("getTokenSupply", [mint, {"commitment":"confirmed"}])
-        if not res:
-            return None
-        return res.get("result")
-
-    async def get_transaction(self, signature: str):
-        res = await self._rpc("getTransaction", [signature, "jsonParsed"])
-        if not res:
-            return None
-        return res.get("result")
-
-# ---------------- Moralis client (bonding) ----------------
-class MoralisClient:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
-        self.base = "https://solana-gateway.moralis.io"
-        self.headers = {"x-api-key": MORALIS_API_KEY}
-
-    async def get_bonding(self, mint: str) -> Optional[Dict[str,Any]]:
-        url = f"{self.base}/token/mainnet/exchange/pumpfun/{mint}/bonding"
-        try:
-            async with self.session.get(url, headers=self.headers, timeout=8) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    log.debug(f"Moralis bonding {resp.status} for {mint}")
-        except Exception as e:
-            log.debug(f"Moralis error: {e}")
-        return None
-
-# ---------------- Solscan client ----------------
-class SolscanClient:
-    def __init__(self, session: aiohttp.ClientSession, base: str = SOLSCAN_API_BASE):
-        self.s = session
-        self.base = base.rstrip("/")
-
-    async def token_meta(self, mint: str) -> Optional[Dict[str,Any]]:
-        url = f"{self.base}/token/meta?tokenAddress={mint}"
-        try:
-            async with self.s.get(url, timeout=8) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            log.debug(f"Solscan meta error: {e}")
-        return None
-
-    async def token_holders(self, mint: str) -> Optional[Dict[str,Any]]:
-        url = f"{self.base}/token/holders?tokenAddress={mint}&limit=20"
-        try:
-            async with self.s.get(url, timeout=8) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            log.debug(f"Solscan holders error: {e}")
-        return None
-
-# ---------------- Telegram notifier (simple) ----------------
-class TelegramNotifier:
-    def __init__(self, token: str, chat_id: str, session: aiohttp.ClientSession):
-        self.token = token
-        self.chat_id = chat_id
-        self.session = session
-
-    async def send(self, text: str, buttons: Optional[List[List[Dict[str,str]]]] = None):
-        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False
-        }
-        if buttons:
-            payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
-        try:
-            async with self.session.post(url, data=payload, timeout=10) as resp:
-                if resp.status != 200:
-                    log.warning(f"Telegram send returned {resp.status}")
-                else:
-                    return await resp.json()
-        except Exception as e:
-            log.error(f"Telegram send error: {e}")
-
-    async def alert_token(self, mint: str, symbol: str, market_cap: float, score: int, reasons: List[str], links: Dict[str,str]):
-        title = f"🚨 Pump.fun detection — {symbol} ({mint[:8]}...)"
-        body = (
-            f"<b>{symbol}</b>\n"
-            f"Mint: <code>{mint}</code>\n"
-            f"Market Cap: ${market_cap:,.0f}\n"
-            f"Score: {score}/100\n"
-            f"Reasons: {', '.join(reasons) if reasons else 'None'}\n\n"
-            f"Links below."
-        )
-        text = f"{title}\n\n{body}"
-        buttons = [
-            [{"text": "Open Pump.fun", "url": links["pumpfun"]}, {"text": "DexScreener", "url": links["dexscreener"]}],
-            [{"text": "RugCheck", "url": links["rugcheck"]}, {"text": "Solscan", "url": links["solscan"]}]
-        ]
-        await self.send(text, buttons=buttons)
-
-# ---------------- Scoring engine ----------------
-def compute_score_and_reasons(market_cap: float,
-                              holders_info: Optional[Dict[str,Any]],
-                              bonding_info: Optional[Dict[str,Any]]) -> (int, List[str]):
-    reasons = []
-    score = 50  # base
-    # market cap heuristics
-    if market_cap is None:
-        reasons.append("No market_cap")
-        score -= 20
-    else:
-        if market_cap < 1000:
-            score += 5
-        elif market_cap < 5000:
-            score += 2
-        elif market_cap < 20000:
-            score += 0
-        else:
-            # larger mcap -> risk of being expensive / already pumped
-            score -= 5
-
-    # holders heuristics
-    if holders_info and isinstance(holders_info, dict):
-        total = holders_info.get("total", 0) or 0
-        top_account = None
-        try:
-            rows = holders_info.get("data") or []
-            if rows:
-                top = rows[0]
-                top_balance = float(top.get("amount") or top.get("balance") or 0)
-                # if supply known we could compute percentage; approximate rule:
-                top_pct = float(top.get("percent") or 0)
-                if top_pct and top_pct > 40:
-                    reasons.append(f"Top holder {top_pct}%")
-                    score -= 20
-                elif top_pct and top_pct > 20:
-                    reasons.append(f"Top holder {top_pct}%")
-                    score -= 10
-                if total >= 50:
-                    score += 10
-                elif total >= 10:
-                    score += 3
-                else:
-                    reasons.append("Pocos holders")
-                    score -= 15
-        except Exception:
-            pass
-    else:
-        reasons.append("No holders data")
-        score -= 10
-
-    # bonding info heuristics
-    if bonding_info and isinstance(bonding_info, dict):
-        try:
-            mc = float(bonding_info.get("market_cap") or bonding_info.get("mcap") or 0)
-            # if bonding shows good backing -> safe-ish
-            if mc and mc > 1000:
-                score += 10
-            elif mc and mc < 500:
-                score -= 10
-        except Exception:
-            pass
-    else:
-        reasons.append("No bonding info")
-        score -= 5
-
-    # clamp
-    score = max(0, min(100, score))
-    return score, reasons
-
-# ---------------- Helius logs listener ----------------
-class HeliusListener:
-    def __init__(self, wss_url: str, program_id: str, on_detect):
-        self.wss = wss_url
-        self.program_id = program_id
-        self.on_detect = on_detect
-        self._running = False
-
-    async def _subscribe(self, ws):
-        msg = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "logsSubscribe",
-            "params": [
-                {"mentions": [self.program_id]},
-                {"commitment": "confirmed"}
-            ]
-        }
-        await ws.send(json.dumps(msg))
-
-    async def run(self):
-        if not self.wss:
-            log.warning("No HELIUS_WSS_URL configured - HeliusListener disabled")
+    async def send_sniper_alert(self, symbol: str, mint: str, meta: dict):
+        if self.silent:
+            logging.info("Silent on - skipping message")
             return
-        self._running = True
-        backoff = 1
-        while self._running:
-            try:
-                async with websockets.connect(self.wss, ping_interval=30, ping_timeout=10, max_size=None) as ws:
-                    log.info("Connected to Helius WebSocket")
-                    await self._subscribe(ws)
-                    async for raw in ws:
-                        try:
-                            payload = json.loads(raw)
-                        except Exception:
-                            continue
-                        # parse logs
-                        params = payload.get("params", {})
-                        result = params.get("result", {})
-                        logs = result.get("logs", []) or []
-                        signature = result.get("signature")
-                        for line in logs:
-                            # detect mints in logs heuristically
-                            m = MINT_PATTERN.search(line)
-                            if m:
-                                mint = m.group(0)
-                                # dispatch detection: include signature for extra enrichment
-                                await self.on_detect(mint=mint, source="helius_logs", signature=signature, raw_line=line)
-                    backoff = 1
-            except Exception as e:
-                log.warning(f"Helius WS error: {e}; reconnecting in {backoff}s")
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, 60)
-
-    async def stop(self):
-        self._running = False
-
-# ---------------- Orchestrator / Monitor ----------------
-class PumpFunDetector:
-    def __init__(self, db: Database, helius_rpc: HeliusRPC, moralis: MoralisClient, solscan: SolscanClient,
-                 notifier: TelegramNotifier):
-        self.db = db
-        self.helius_rpc = helius_rpc
-        self.moralis = moralis
-        self.solscan = solscan
-        self.notifier = notifier
-        self.tracked: Dict[str, Dict[str,Any]] = {}  # mint -> meta
-        self._poll_task = None
-        self._running = False
-
-    async def handle_detect(self, mint: str, source: str, signature: Optional[str]=None, raw_line: Optional[str]=None):
-        """
-        Called by HeliusListener when a potential mint is seen in logs.
-        We then enrich using RPC, Solscan and Moralis.
-        """
+        text = (
+            f"🚨 <b>PUMP.FUN → GRADUADO</b> 🚨\n\n"
+            f"<b>{symbol}</b>\n"
+            f"• Mint: <code>{mint}</code>\n"
+            f"• Detected: {meta.get('reason','graduated')}\n"
+            f"• Market Cap (if provided): ${meta.get('market_cap','N/A')}\n"
+            f"\nRevisa rápido con los botones:"
+        )
+        keyboard = [
+            [InlineKeyboardButton("⚡ Swap Jupiter", url=f"https://jup.ag/swap/{mint}-SOL")],
+            [InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/solana/{mint}")],
+            [InlineKeyboardButton("🛡️ RugCheck", url=f"https://rugcheck.xyz/tokens/{mint}")],
+            [InlineKeyboardButton("📈 Pump.fun", url=f"https://pump.fun/coin?mint={mint}")],
+            [InlineKeyboardButton("🌊 Raydium", url=f"https://raydium.io/pair/{mint}-SOL")]
+        ]
         try:
-            log.info(f"Detected candidate mint {mint} from {source} (sig={signature})")
-            # quick dedupe: if already tracked and seen recently, skip
-            if mint in self.tracked:
-                log.debug("Already tracked; updating timestamp")
-                self.tracked[mint]["last_seen"] = now_iso()
-                return
-
-            # Enrichment steps
-            async with aiohttp.ClientSession() as s:
-                # RPC parsed account info (token mint data)
-                rpc = self.helius_rpc
-                parsed = await rpc.get_parsed_account_info(mint)
-                # token supply
-                supply_info = await rpc.get_token_supply(mint)
-                # transaction details if signature present
-                tx_info = None
-                if signature:
-                    tx_info = await rpc.get_transaction(signature)
-
-                # solscan metadata and holders
-                sol_meta = await self.solscan.token_meta(mint)
-                sol_holders = await self.solscan.token_holders(mint)
-
-                # moralis bonding / market_cap
-                bonding = await self.moralis.get_bonding(mint)
-
-            # extract core fields
-            symbol = None
-            creator = None
-            market_cap = None
-            price = None
-            raw_payload = {
-                "parsed": parsed,
-                "supply": supply_info,
-                "tx": tx_info,
-                "sol_meta": sol_meta,
-                "sol_holders": sol_holders,
-                "bonding": bonding,
-                "raw_line": raw_line
-            }
-            # symbol extraction attempts
-            if sol_meta and isinstance(sol_meta, dict):
-                symbol = sol_meta.get("symbol") or sol_meta.get("data", {}).get("symbol")
-            elif parsed and isinstance(parsed, dict):
-                # parsed account info might contain token info under value.data.parsed.info
-                try:
-                    val = parsed.get("value", {})
-                    data = val.get("data", {})
-                    # sometimes token metadata not present; skip
-                except Exception:
-                    pass
-
-            # creator extract: transaction or parsed
-            if tx_info and isinstance(tx_info, dict):
-                # heuristics: find signer that created mint or first account
-                try:
-                    meta = tx_info.get("meta") or {}
-                    # sometimes preTokenBalances / postTokenBalances contain info
-                    creator = tx_info.get("transaction", {}).get("message", {}).get("accountKeys", [None])[0]
-                except Exception:
-                    pass
-
-            # market cap extraction
-            if bonding and isinstance(bonding, dict):
-                try:
-                    market_cap = float(bonding.get("market_cap") or bonding.get("mcap") or 0)
-                    price = float(bonding.get("price") or 0)
-                except Exception:
-                    pass
-
-            # compute score
-            score, reasons = compute_score_and_reasons(market_cap, sol_holders, bonding)
-
-            # upsert DB
-            await self.db.upsert_token(mint, {
-                "symbol": symbol,
-                "creator": creator,
-                "market_cap": market_cap,
-                "price": price,
-                "score": score,
-                "risk_reasons": reasons,
-                "raw": raw_payload
-            })
-
-            # record detection event
-            await self.db.record_event(mint, "detected", {"source": source, "signature": signature, "raw_line": raw_line})
-
-            # track for monitoring
-            self.tracked[mint] = {
-                "symbol": symbol or "UNKNOWN",
-                "creator": creator,
-                "market_cap": market_cap or 0,
-                "price": price or 0,
-                "score": score,
-                "reasons": reasons,
-                "last_seen": now_iso()
-            }
-
-            # alert policies:
-            # - early alert: if score >= 60 and market_cap > 1000 -> pump_early
-            # - pre-graduation alert: if market_cap >= UMBRAL_MCAP
-            if score >= 60 and (market_cap or 0) >= 1000 and not await self.db.was_notified_pre(mint):
-                links = generate_links(mint)
-                await self.notifier.alert_token(mint, self.tracked[mint]["symbol"], market_cap or 0, score, reasons, links)
-                await self.db.mark_notified_pre(mint)
-
+            await self.app.bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=text,
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                disable_web_page_preview=True
+            )
+            logging.info("✅ Telegram alert sent for %s", mint)
         except Exception as e:
-            log.exception(f"Error in handle_detect for {mint}: {e}")
+            logging.exception("Error sending telegram message: %s", e)
 
-    async def poll_tracked(self):
-        self._running = True
-        async with aiohttp.ClientSession() as s:
-            moralis_local = MoralisClient(s)
-            solscan_local = SolscanClient(s)
-            while self._running:
-                try:
-                    if not self.tracked:
-                        await asyncio.sleep(TOKEN_POLL_INTERVAL)
-                        continue
-                    for mint in list(self.tracked.keys()):
-                        try:
-                            bonding = await moralis_local.get_bonding(mint)
-                            sol_holders = await solscan_local.token_holders(mint)
-                            market_cap = None
-                            if bonding and isinstance(bonding, dict):
-                                market_cap = float(bonding.get("market_cap") or bonding.get("mcap") or 0)
-                            # update tracked data & DB
-                            score, reasons = compute_score_and_reasons(market_cap, sol_holders, bonding)
-                            self.tracked[mint].update({"market_cap": market_cap or 0, "score": score, "reasons": reasons, "last_seen": now_iso()})
-                            await self.db.upsert_token(mint, {
-                                "symbol": self.tracked[mint].get("symbol"),
-                                "creator": self.tracked[mint].get("creator"),
-                                "market_cap": market_cap,
-                                "price": self.tracked[mint].get("price"),
-                                "score": score,
-                                "risk_reasons": reasons,
-                                "raw": {"bonding": bonding, "holders": sol_holders}
-                            })
-                            # Pre-graduation alert
-                            if (market_cap or 0) >= UMBRAL_MCAP and not await self.db.was_notified_pre(mint):
-                                links = generate_links(mint)
-                                await self.notifier.alert_token(mint, self.tracked[mint]["symbol"], market_cap or 0, score, reasons, links)
-                                await self.db.mark_notified_pre(mint)
-                            # Graduation: mark and stop tracking
-                            if (market_cap or 0) >= GRADUATION_MC_TARGET:
-                                await self.db.mark_graduated(mint)
-                                log.info(f"Token {mint} reached graduation target; stopping tracking")
-                                self.tracked.pop(mint, None)
-                        except Exception as e:
-                            log.debug(f"Error polling individual mint {mint}: {e}")
-                    await asyncio.sleep(TOKEN_POLL_INTERVAL)
-                except Exception as e:
-                    log.error(f"Error in poll_tracked loop: {e}")
-                    await asyncio.sleep(TOKEN_POLL_INTERVAL)
+notifier: Optional[Notifier] = None
+
+# ---------- GraphQL helper (pump.fun) ----------
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://pump.fun",
+    "Referer": "https://pump.fun/",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
+    "Connection": "keep-alive",
+}
+
+GRAPHQL_CANDIDATES = [
+    ("""
+    query RecentCoins($limit:Int){ 
+      recent(limit:$limit) {
+        id
+        mint
+        name
+        symbol
+        bondingCurve { complete }
+        pool { id }
+        stats5m { priceChange }
+      }
+    }
+    """, {"limit": 50}),
+    ("""
+    query Recent($limit:Int){
+      recentCoins(limit:$limit){
+        id
+        mint
+        name
+        symbol
+        firstPool { createdAt }
+        bondingCurve { complete }
+        pool { id }
+        stats5m { priceChange, numTraders }
+      }
+    }
+    """, {"limit": 50}),
+    ("""
+    query Top($limit:Int){
+      coins(limit:$limit){
+        id
+        mint
+        name
+        symbol
+        bonded { complete }
+        pool { id }
+        stats5m { priceChange }
+      }
+    }
+    """, {"limit": 50}),
+    ("""
+    query CoinsRecent($limit:Int){
+      coinsRecent(limit:$limit){
+        id
+        mint
+        name
+        symbol
+        bondingCurve { complete }
+        pool { id }
+      }
+    }
+    """, {"limit": 50}),
+    ("""
+    query Search($query:String){
+      search(query:$query) {
+        id
+        mint
+        name
+        symbol
+        bondingCurve { complete }
+        pool { id }
+      }
+    }
+    """, {"query": ""})
+]
+
+async def post_graphql(session: aiohttp.ClientSession, query: str, variables: dict):
+    payload = {"query": query, "variables": variables}
+    try:
+        async with session.post(PUMP_FUN_GRAPHQL, json=payload, headers=DEFAULT_HEADERS, timeout=10) as resp:
+            text = await resp.text()
+            if resp.status != 200:
+                logging.warning("HTTP %s %s returned %s", PUMP_FUN_GRAPHQL, json.dumps(variables), resp.status)
+                return None
+            try:
+                return json.loads(text)
+            except Exception:
+                return None
+    except Exception as e:
+        logging.debug("GraphQL request error: %s", e)
+        return None
+
+def find_token_dicts(obj: Any) -> List[Dict]:
+    found = []
+    if isinstance(obj, dict):
+        if ("mint" in obj or "id" in obj) and (isinstance(obj.get("mint"), str) or isinstance(obj.get("id"), str)):
+            found.append(obj)
+        for v in obj.values():
+            found.extend(find_token_dicts(v))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(find_token_dicts(item))
+    return found
+
+def looks_graduated(token: Dict) -> Optional[str]:
+    try:
+        bc = token.get("bondingCurve") or token.get("bonded") or token.get("bonding")
+        if isinstance(bc, dict):
+            if bc.get("complete") is True or str(bc.get("complete")).lower() == "true":
+                return "bondingCurve.complete"
+        if token.get("pool"):
+            return "pool_exists"
+        for k in ("graduated", "isGraduated", "is_graduated", "status"):
+            if k in token:
+                v = token.get(k)
+                if v is True or (isinstance(v, str) and v.lower() == "graduated"):
+                    return k
+        stats5 = token.get("stats5m") or token.get("stats_5m")
+        if isinstance(stats5, dict):
+            price_change = stats5.get("priceChange") or stats5.get("price_change") or 0
+            try:
+                if abs(float(price_change)) > 30:
+                    return "big_5m_move"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+# ---------- PumpFun Sniper ----------
+class PumpFunSniper:
+    def __init__(self, db: DB, notifier: Notifier):
+        self.db = db
+        self.notifier = notifier
+        self.task: Optional[asyncio.Task] = None
+        self.running = False
+        self.session = None
+        self.backoff = 1
+
+    async def start(self):
+        if self.task and not self.task.done():
+            return
+        self.running = True
+        self.task = asyncio.create_task(self._run())
+        logging.info("✅ Pump.fun Sniper started")
 
     async def stop(self):
-        self._running = False
+        self.running = False
+        if self.task:
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        if self.session:
+            await self.session.close()
+        logging.info("⛔ Pump.fun Sniper stopped")
 
-# ---------------- Entrypoint ----------------
-async def main():
-    log.info("Starting Pump.fun detector (live)")
-    # DB
-    db = Database(DATABASE_URL)
-    await db.connect()
+    async def _run(self):
+        self.session = aiohttp.ClientSession()
+        try:
+            while self.running:
+                try:
+                    await self.scan_once()
+                    self.backoff = 1
+                    await asyncio.sleep(POLL_SECONDS)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logging.exception("Scan loop error: %s", e)
+                    await asyncio.sleep(self.backoff)
+                    self.backoff = min(self.backoff * 2, 60)
+        finally:
+            if self.session:
+                await self.session.close()
 
-    # shared HTTP session
-    session = aiohttp.ClientSession()
+    async def scan_once(self):
+        found_any = False
+        for query, vars_template in GRAPHQL_CANDIDATES:
+            vars_copy = dict(vars_template)
+            data = await post_graphql(self.session, query, vars_copy)
+            if not data:
+                continue
+            payload = data.get("data") or data
+            token_dicts = find_token_dicts(payload)
+            if not token_dicts:
+                continue
+            found_any = True
+            for t in token_dicts:
+                mint = t.get("mint") or t.get("id")
+                if not mint or not isinstance(mint, str):
+                    continue
+                if not (MINT_RE.search(mint) or mint.endswith(PUMP_SUFFIX)):
+                    m = MINT_RE.search(mint)
+                    if m:
+                        mint = m.group(0)
+                    else:
+                        continue
+                reason = looks_graduated(t)
+                if not reason:
+                    if mint.endswith(PUMP_SUFFIX) and (t.get("pool") or t.get("firstPool")):
+                        reason = "suffix_and_pool"
+                if not reason:
+                    continue
+                if await self.db.was_notified(mint):
+                    continue
+                symbol = t.get("symbol") or t.get("name") or mint[:8]
+                meta = {"reason": reason}
+                if "mcap" in t:
+                    meta["market_cap"] = t.get("mcap")
+                await self.db.mark_notified(mint, symbol, "graduated", meta)
+                await self.db.mark_seen(mint)
+                await self.notifier.send_sniper_alert(symbol, mint, meta)
+                logging.info("Detected graduated mint %s (%s) reason=%s", mint, symbol, reason)
+        if not found_any:
+            logging.debug("No usable GraphQL response on this iteration")
 
-    # low-level clients
-    helius_rpc = HeliusRPC(HELIUS_RPC_URL, session)
-    moralis = MoralisClient(session)
-    solscan = SolscanClient(session)
-    notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, session)
+# ---------- FastAPI + Telegram wiring ----------
+app = FastAPI(title="PumpFun Sniper Bot")
 
-    # detector
-    detector = PumpFunDetector(db, helius_rpc, moralis, solscan, notifier)
+telegram_app: Optional[Application] = None
+sniper: Optional[PumpFunSniper] = None
 
-    # Helius logs listener
-    helius_listener = HeliusListener(HELIUS_WSS_URL, PUMP_FUN_PROGRAM_ID, detector.handle_detect)
+def is_owner(update: Update) -> bool:
+    return update.effective_user and update.effective_user.id == OWNER_ID
 
-    # start listener and poller
-    listener_task = asyncio.create_task(helius_listener.run())
-    poll_task = asyncio.create_task(detector.poll_tracked())
+# Telegram commands
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    text = (
+        "🚀 Pump.fun Sniper Bot\n\n"
+        "Comandos:\n"
+        "/iniciar - comenzar a monitorear graduaciones (GraphQL)\n"
+        "/detener - detener monitoreo\n"
+        "/status - estado\n"
+        "/silent on|off - modo silencioso\n\n"
+        f"Polling cada {POLL_SECONDS} segundos. User-Agent: PC Chrome."
+    )
+    await update.message.reply_text(text)
 
-    # keep running until Ctrl+C
+async def cmd_iniciar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    await update.message.reply_text("✅ Iniciando sniper (Pump.fun GraphQL)...")
+    await sniper.start()
+    await update.message.reply_text("✅ Sniper iniciado")
+
+async def cmd_detener(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    await update.message.reply_text("⛔ Deteniendo sniper...")
+    await sniper.stop()
+    await update.message.reply_text("⛔ Sniper detenido")
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    running = sniper.running if sniper else False
+    s = "🟢 RUNNING" if running else "🔴 STOPPED"
+    await update.message.reply_text(f"Pump.fun Sniper status: {s}\nPolling every {POLL_SECONDS}s\nSilent: {notifier.silent}")
+
+async def cmd_silent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
+    args = ctx.args or []
+    if not args or args[0] not in ("on", "off"):
+        await update.message.reply_text("Uso: /silent on|off")
+        return
+    notifier.silent = (args[0] == "on")
+    await update.message.reply_text("Silent %s" % ("ON" if notifier.silent else "OFF"))
+
+# ========== NEW ENDPOINT: /last ==========
+@app.get("/last")
+async def last_notifications(limit: int = Query(10, ge=1, le=200)):
+    """
+    Devuelve los últimos N mints detectados en JSON.
+    ?limit=10  (por defecto 10, máximo 200)
+    """
+    if not db.pool:
+        raise HTTPException(status_code=503, detail="Database not connected")
     try:
-        await asyncio.gather(listener_task, poll_task)
-    except asyncio.CancelledError:
-        log.info("Cancelled, shutting down")
-    except KeyboardInterrupt:
-        log.info("Keyboard interrupt; shutting down")
-    finally:
-        await detector.stop()
-        await helius_listener.stop()
-        await db.close()
-        await session.close()
-        log.info("Shutdown complete")
+        rows = await db.list_recent_notifications(limit=limit)
+        return JSONResponse({"ok": True, "count": len(rows), "items": rows})
+    except Exception as e:
+        logging.exception("Error fetching last notifications: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/webhook/{token}")
+async def webhook(token: str, req: Request):
+    try:
+        if token != TELEGRAM_BOT_TOKEN:
+            raise HTTPException(status_code=403, detail="invalid token")
+        body = await req.json()
+        update = Update.de_json(body, telegram_app.bot)
+        if update.effective_user and not is_owner(update):
+            return JSONResponse({"ok": True, "note": "ignored - not owner"})
+        await telegram_app.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logging.exception("webhook err %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+# ---------- startup/shutdown ----------
+async def initialize():
+    global telegram_app, notifier, sniper
+    missing = [k for k in ("TELEGRAM_BOT_TOKEN","TELEGRAM_CHAT_ID","OWNER_ID","DATABASE_URL") if not os.getenv(k)]
+    if missing:
+        raise RuntimeError("Missing env vars: " + ", ".join(missing))
+    await db.connect()
+    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    telegram_app.add_handler(CommandHandler("start", cmd_start))
+    telegram_app.add_handler(CommandHandler("iniciar", cmd_iniciar))
+    telegram_app.add_handler(CommandHandler("detener", cmd_detener))
+    telegram_app.add_handler(CommandHandler("status", cmd_status))
+    telegram_app.add_handler(CommandHandler("silent", cmd_silent))
+    await telegram_app.initialize()
+    await telegram_app.start()
+    notifier = Notifier(telegram_app)
+    sniper = PumpFunSniper(db, notifier)
+    logging.info("App initialized")
+
+@app.on_event("startup")
+async def on_startup():
+    try:
+        await initialize()
+        logging.info("✅ App startup complete - Use /iniciar to start sniper")
+    except Exception as e:
+        logging.exception("Startup failed: %s", e)
+        raise
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logging.info("Shutting down...")
+    if sniper:
+        await sniper.stop()
+    if telegram_app:
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+    if db.pool:
+        await db.pool.close()
+    logging.info("Shutdown complete")
+
+# ---------- local run ----------
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    import uvicorn
+    uvicorn.run("telegram_bot_pumpfun_sniper:app", host="0.0.0.0", port=int(os.getenv("PORT","8080")), log_level="info")
