@@ -1,5 +1,5 @@
 # telegram_bot_final.py
-# PUMP.FUN GRADUATION SNIPER - HELIUS WSS + JUPITER API
+# VERSIÓN CORREGIDA - COMANDOS TELEGRAM FUNCIONANDO
 
 import os
 import re
@@ -16,7 +16,7 @@ import websockets
 from fastapi import FastAPI, Request, HTTPException
 from starlette.responses import JSONResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 # ========== CONFIGURACIÓN ==========
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -32,17 +32,13 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0"))
 DATABASE_URL = os.getenv("DATABASE_URL")
 DOMAIN_URL = os.getenv("DOMAIN_URL")
 
-# Helius WebSocket (REEMPLAZA QUICKNODE)
+# APIs
 HELIUS_WSS_URL = os.getenv("HELIUS_WSS_URL")
-
-# Jupiter API
 JUPITER_API_BASE = "https://api.jup.ag/tokens/v2"
 
-# Parámetros de trading
+# Parámetros
 GRADUATION_MC_TARGET = float(os.getenv("GRADUATION_MC_TARGET", "69000"))
 PUMP_MC_MIN = float(os.getenv("PUMP_MC_MIN", "50000"))
-CHECK_INTERVAL_SECS = int(os.getenv("CHECK_INTERVAL_SECS", "5"))
-
 PORT = int(os.getenv("PORT", "8080"))
 
 # Regex para direcciones de Solana
@@ -65,7 +61,6 @@ class Database:
     async def _create_tables(self):
         """Crear tablas necesarias"""
         async with self.pool.acquire() as conn:
-            # Tabla de notificaciones
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS graduation_alerts (
                     id SERIAL PRIMARY KEY,
@@ -84,7 +79,6 @@ class Database:
                 )
             """)
             
-            # Tabla de tokens vistos (cache)
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS seen_mints (
                     mint TEXT PRIMARY KEY,
@@ -150,52 +144,23 @@ class Database:
 class JupiterAPI:
     def __init__(self):
         self.base_url = JUPITER_API_BASE
-        self.session = None
-
-    async def get_session(self):
-        """Obtener sesión aiohttp"""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        return self.session
 
     async def search_token(self, mint: str) -> Optional[Dict]:
         """Buscar token por mint en Jupiter API"""
         try:
-            session = await self.get_session()
-            url = f"{self.base_url}/search"
-            params = {"query": mint}
-            
-            async with session.get(url, params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, list) and len(data) > 0:
-                        return data[0]  # Primer resultado
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.base_url}/search"
+                params = {"query": mint}
+                
+                async with session.get(url, params=params, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            return data[0]
         except Exception as e:
             logging.error(f"❌ Error buscando token {mint} en Jupiter: {str(e)}")
         
         return None
-
-    async def get_recent_tokens(self, limit: int = 50) -> List[Dict]:
-        """Obtener tokens recientes de Jupiter API"""
-        try:
-            session = await self.get_session()
-            url = f"{self.base_url}/recent"
-            params = {"limit": limit}
-            
-            async with session.get(url, params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    if isinstance(data, list):
-                        return data
-        except Exception as e:
-            logging.error(f"❌ Error obteniendo tokens recientes: {str(e)}")
-        
-        return []
-
-    async def close(self):
-        """Cerrar sesión"""
-        if self.session:
-            await self.session.close()
 
 # ========== NOTIFICADOR TELEGRAM ==========
 class TelegramNotifier:
@@ -206,18 +171,14 @@ class TelegramNotifier:
     async def send_graduation_alert(self, symbol: str, mint: str, data: Dict):
         """Enviar alerta de graduación inmediata"""
         if self.silent_mode:
-            logging.info(f"🔇 Silent mode - Skipping alert for {symbol}")
             return
 
         market_cap = data.get('market_cap', 0)
         price = data.get('price', 0)
         liquidity = data.get('liquidity', 0)
         dex_name = data.get('dex_name', 'Unknown DEX')
-        tx_signature = data.get('tx_signature', '')[:16] + '...' if data.get('tx_signature') else 'N/A'
-        organic_score = data.get('organic_score', 0)
         is_pump_token = data.get('is_pump_token', False)
 
-        # Emoji especial para tokens Pump.fun
         pump_emoji = "🎯" if is_pump_token else "🎓"
 
         message_lines = [
@@ -228,8 +189,6 @@ class TelegramNotifier:
             f"• Precio: <b>${price:.8f}</b>",
             f"• Liquidez: <b>${liquidity:,.0f}</b>",
             f"• DEX: <b>{dex_name.upper()}</b>",
-            f"• Organic Score: <b>{organic_score:.1f}</b>",
-            f"• TX: <code>{tx_signature}</code>",
             "",
             "⚡ <b>ACCIÓN INMEDIATA REQUERIDA</b>",
             "• Token recién graduado de Pump.fun" if is_pump_token else "• Token recién listado en DEX",
@@ -237,19 +196,15 @@ class TelegramNotifier:
             "• Oportunidad de entrada temprana",
             "",
             "<b>Mint Address:</b>",
-            f"<code>{mint}</code>",
-            "",
-            "🚀 <i>¡Bot activo con Helius WSS + Jupiter API!</i>"
+            f"<code>{mint}</code>"
         ]
 
         message = "\n".join(message_lines)
 
-        # Botones de acción rápida
         keyboard = [
             [InlineKeyboardButton("⚡ Comprar Jupiter", url=f"https://jup.ag/swap/{mint}-SOL")],
-            [InlineKeyboardButton("📊 Ver en DexScreener", url=f"https://dexscreener.com/solana/{mint}")],
-            [InlineKeyboardButton("🔍 Raydium Swap", url=f"https://raydium.io/swap/?inputCurrency=sol&outputCurrency={mint}")],
-            [InlineKeyboardButton("🛡️ Rug Check", url=f"https://rugcheck.xyz/tokens/{mint}")]
+            [InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/solana/{mint}")],
+            [InlineKeyboardButton("🔍 Raydium", url=f"https://raydium.io/swap/?inputCurrency=sol&outputCurrency={mint}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -261,9 +216,9 @@ class TelegramNotifier:
                 reply_markup=reply_markup,
                 disable_web_page_preview=True
             )
-            logging.info(f"✅ Alerta de graduación enviada: {symbol}")
+            logging.info(f"✅ Alerta enviada: {symbol}")
         except Exception as e:
-            logging.error(f"❌ Error enviando alerta Telegram: {str(e)}")
+            logging.error(f"❌ Error enviando alerta: {str(e)}")
 
 # ========== CLIENTE HELIUS WSS ==========
 class HeliusMonitor:
@@ -274,21 +229,7 @@ class HeliusMonitor:
         self.jupiter_api = JupiterAPI()
         self.websocket = None
         self.running = False
-        self.reconnect_delay = 1
         self.task = None
-
-        # Program IDs importantes
-        self.raydium_program_id = "RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr"
-        self.pump_fun_program_id = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-
-        # Patrones para detectar creación de pools
-        self.pool_creation_keywords = [
-            'initialize', 'create', 'new_pool', 'initialize2', 
-            'create_pool', 'initialize_pool', 'init_pool',
-            'add_liquidity', 'initialize_account', 'raydium',
-            'open_book', 'create_amm', 'initialize_amm',
-            'complete'  # Palabra clave de graduación en Pump.fun
-        ]
 
     async def connect(self):
         """Conectar a Helius WebSocket"""
@@ -296,29 +237,22 @@ class HeliusMonitor:
             self.websocket = await websockets.connect(
                 self.wss_url,
                 ping_interval=30,
-                ping_timeout=10,
-                close_timeout=10
+                ping_timeout=10
             )
             
-            # Suscribirse a logs de Raydium y Pump.fun
             subscribe_message = {
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "logsSubscribe",
                 "params": [
-                    {
-                        "mentions": [
-                            self.raydium_program_id,
-                            self.pump_fun_program_id
-                        ]
-                    },
+                    {"mentions": ["RVKd61ztZW9GUwhRbbLoYVRE5Xf1B2tVscKqwZqXgEr"]},
                     {"commitment": "confirmed"}
                 ]
             }
             
             await self.websocket.send(json.dumps(subscribe_message))
-            response = await self.websocket.recv()
-            logging.info("✅ Helius WebSocket conectado y suscrito a Raydium/Pump.fun")
+            await self.websocket.recv()
+            logging.info("✅ Helius WebSocket conectado")
             return True
             
         except Exception as e:
@@ -332,55 +266,42 @@ class HeliusMonitor:
         while self.running:
             try:
                 if not self.websocket:
-                    success = await self.connect()
-                    if not success:
-                        await asyncio.sleep(self.reconnect_delay)
-                        self.reconnect_delay = min(self.reconnect_delay * 2, 60)
+                    if not await self.connect():
+                        await asyncio.sleep(5)
                         continue
-                    self.reconnect_delay = 1
 
                 message = await asyncio.wait_for(self.websocket.recv(), timeout=30)
                 data = json.loads(message)
                 
-                await self.process_message(data)
+                if data.get('method') == 'logsNotification':
+                    params = data.get('params', {})
+                    result = params.get('result', {})
+                    logs = result.get('logs', [])
+                    signature = result.get('signature', '')
+                    
+                    await self.analyze_logs(logs, signature)
                 
             except asyncio.TimeoutError:
                 continue
             except websockets.exceptions.ConnectionClosed:
-                logging.warning(f"🔌 Conexión WebSocket cerrada, reconectando...")
+                logging.warning("🔌 Conexión WebSocket cerrada, reconectando...")
                 self.websocket = None
-                await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
+                await asyncio.sleep(5)
             except Exception as e:
                 logging.error(f"❌ Error en WebSocket: {str(e)}")
                 self.websocket = None
-                await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
-
-    async def process_message(self, data: Dict):
-        """Procesar mensaje del WebSocket"""
-        try:
-            if data.get('method') == 'logsNotification':
-                params = data.get('params', {})
-                result = params.get('result', {})
-                logs = result.get('logs', [])
-                signature = result.get('signature', '')
-                
-                await self.analyze_logs(logs, signature)
-                
-        except Exception as e:
-            logging.error(f"❌ Error procesando mensaje: {str(e)}")
+                await asyncio.sleep(5)
 
     async def analyze_logs(self, logs: List[str], signature: str):
         """Analizar logs en busca de creación de pools"""
         try:
             logs_text = ' '.join(logs).lower()
             
-            # Buscar patrones de creación de pool o graduación
-            pool_created = any(keyword in logs_text for keyword in self.pool_creation_keywords)
+            # Buscar patrones de creación de pool
+            pool_keywords = ['initialize', 'create', 'new_pool', 'create_pool', 'raydium']
+            pool_created = any(keyword in logs_text for keyword in pool_keywords)
             
             if pool_created:
-                # Extraer mints de los logs
                 mints_found = MINT_PATTERN.findall(' '.join(logs))
                 unique_mints = list(set(mints_found))
                 
@@ -395,11 +316,9 @@ class HeliusMonitor:
     async def process_graduation(self, mint: str, signature: str, logs_text: str):
         """Procesar graduación detectada"""
         try:
-            # Verificar si ya alertamos sobre este mint
             if await self.db.was_alerted(mint):
                 return
 
-            # Obtener datos del token desde Jupiter API
             token_data = await self.jupiter_api.search_token(mint)
             if not token_data:
                 return
@@ -408,47 +327,31 @@ class HeliusMonitor:
             market_cap = token_data.get('mcap', 0)
             price = token_data.get('usdPrice', 0)
             liquidity = token_data.get('liquidity', 0)
-            organic_score = token_data.get('organicScore', 0)
 
-            # DETECCIÓN MEJORADA DE TOKENS PUMP.FUN
+            # Detectar si es token de Pump.fun
             is_pump_token = await self.is_pump_fun_token(symbol, mint, token_data)
 
-            # Determinar DEX basado en logs
-            dex_name = "unknown"
-            if 'raydium' in logs_text.lower():
-                dex_name = "raydium"
-            elif 'orca' in logs_text.lower():
-                dex_name = "orca"
-            elif 'jupiter' in logs_text.lower():
-                dex_name = "jupiter"
-            elif 'pump' in logs_text.lower():
-                dex_name = "pump.fun"
+            dex_name = "raydium" if 'raydium' in logs_text.lower() else "unknown"
 
-            # Solo alertar si cumple criterios de graduación
-            if (market_cap >= GRADUATION_MC_TARGET and 
-                market_cap >= PUMP_MC_MIN and
-                is_pump_token):  # Solo tokens de Pump.fun
-                
-                # Enviar alerta
+            # Solo alertar si cumple criterios
+            if market_cap >= GRADUATION_MC_TARGET and market_cap >= PUMP_MC_MIN and is_pump_token:
                 alert_data = {
                     'market_cap': market_cap,
                     'price': price,
                     'liquidity': liquidity,
                     'dex_name': dex_name,
                     'tx_signature': signature,
-                    'organic_score': organic_score,
                     'is_pump_token': is_pump_token
                 }
                 
                 await self.notifier.send_graduation_alert(symbol, mint, alert_data)
                 
-                # Guardar en base de datos
                 await self.db.mark_alerted(
                     mint, symbol, market_cap, price, liquidity, 
-                    signature, dex_name, is_pump_token, organic_score
+                    signature, dex_name, is_pump_token, 0
                 )
                 
-                logging.info(f"🎓 Graduación detectada: {symbol} en {dex_name} - MC: ${market_cap:,.0f}")
+                logging.info(f"🎓 Graduación detectada: {symbol} - MC: ${market_cap:,.0f}")
 
         except Exception as e:
             logging.error(f"❌ Error procesando graduación {mint}: {str(e)}")
@@ -456,11 +359,11 @@ class HeliusMonitor:
     async def is_pump_fun_token(self, symbol: str, mint: str, token_data: Dict) -> bool:
         """Determinar si es un token de Pump.fun"""
         try:
-            # 1. Verificar símbolo contiene "pump" (case insensitive)
+            # Verificar símbolo contiene "pump"
             if 'pump' in symbol.lower():
                 return True
 
-            # 2. Verificar si es token reciente (primera pool en últimas 24h)
+            # Verificar si es token reciente
             first_pool = token_data.get('firstPool', {})
             if first_pool:
                 created_at = first_pool.get('createdAt')
@@ -469,20 +372,8 @@ class HeliusMonitor:
                     if datetime.now(pool_time.tzinfo) - pool_time < timedelta(hours=24):
                         return True
 
-            # 3. Verificar score orgánico (tokens Pump.fun suelen tener score bajo inicialmente)
-            organic_score = token_data.get('organicScore', 100)
-            if organic_score < 30:  # Score bajo indica token nuevo
-                return True
-
-            # 4. Verificar holder count (tokens Pump.fun tienen pocos holders inicialmente)
-            holder_count = token_data.get('holderCount', 0)
-            if holder_count < 1000:
-                return True
-
             return False
-
-        except Exception as e:
-            logging.error(f"❌ Error verificando token Pump.fun {mint}: {str(e)}")
+        except Exception:
             return False
 
     async def start(self):
@@ -504,11 +395,9 @@ class HeliusMonitor:
                 await self.task
             except asyncio.CancelledError:
                 pass
-        await self.jupiter_api.close()
         logging.info("⛔ Helius Monitor detenido")
 
-# ========== FASTAPI APP CON LIFESPAN ==========
-# Variables globales
+# ========== FASTAPI APP ==========
 db = Database()
 telegram_app: Optional[Application] = None
 notifier: Optional[TelegramNotifier] = None
@@ -517,19 +406,17 @@ helius_monitor: Optional[HeliusMonitor] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan manager para FastAPI"""
-    # Startup
     await startup()
     yield
-    # Shutdown
     await shutdown()
 
-app = FastAPI(title="Pump.fun Graduation Sniper - Helius", lifespan=lifespan)
+app = FastAPI(title="Pump.fun Graduation Sniper", lifespan=lifespan)
 
 def is_authorized(update: Update) -> bool:
     """Verificar si usuario está autorizado"""
     return update.effective_user and update.effective_user.id == OWNER_ID
 
-# ========== COMANDOS TELEGRAM ==========
+# ========== COMANDOS TELEGRAM - VERSIÓN SIMPLIFICADA ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Comando /start"""
     if not is_authorized(update):
@@ -537,33 +424,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     welcome_text = """
-🎯 <b>PUMP.FUN GRADUATION SNIPER BOT</b> ⚡
+🎯 <b>PUMP.FUN GRADUATION SNIPER</b>
 
-<b>Tecnología Mejorada:</b>
-• 🔗 Helius WebSocket (Tiempo real)
-• 📊 Jupiter API V2 (Datos precisos)
-• 🎯 Filtro exclusivo Pump.fun
-• ⚡ Detección inmediata
-
-<b>Detección Específica:</b>
-• Solo tokens de Pump.fun
-• Símbolos que contienen "pump"
-• Tokens recientes (<24h)
-• Market Cap > $69K
-
-<b>Comandos:</b>
-/iniciar - Activar monitor Helius
-/detener - Pausar monitor
+<b>Comandos disponibles:</b>
+/start - Mostrar este mensaje
+/iniciar - Activar monitor
+/detener - Detener monitor  
 /status - Estado del sistema
 /alertas - Últimas alertas
-/silent on|off - Modo silencioso
+/silent - Modo silencioso
 
-<code>Detección especializada en tokens Pump.fun</code>
+<code>Bot especializado en tokens Pump.fun</code>
     """
     await update.message.reply_text(welcome_text, parse_mode="HTML")
+    logging.info(f"📱 Comando /start recibido de: {update.effective_user.id}")
 
 async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /iniciar - Activar monitor"""
+    """Comando /iniciar"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
@@ -573,21 +450,21 @@ async def iniciar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await helius_monitor.start()
 
         await update.message.reply_text(
-            "✅ <b>MONITOR HELIUS ACTIVADO</b>\n\n"
-            "🔗 WebSocket: CONECTADO\n"
+            "✅ <b>MONITOR ACTIVADO</b>\n\n"
+            "🔗 Helius WebSocket: CONECTADO\n"
             "🎯 Objetivo: Tokens Pump.fun\n"
-            "⚡ Velocidad: TIEMPO REAL\n"
-            "📊 Fuente: Helius + Jupiter API\n\n"
-            "<i>Escaneando graduaciones de Pump.fun...</i>",
+            "⚡ Estado: ESCANEANDO\n\n"
+            "<i>Buscando graduaciones en tiempo real...</i>",
             parse_mode="HTML"
         )
-        logging.info(f"📱 Monitor activado por: {update.effective_user.id}")
+        logging.info(f"🚀 Monitor activado por: {update.effective_user.id}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error activando monitor: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        logging.error(f"❌ Error activando monitor: {str(e)}")
 
 async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /detener - Pausar monitor"""
+    """Comando /detener"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
@@ -597,17 +474,18 @@ async def detener_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await helius_monitor.stop()
 
         await update.message.reply_text(
-            "⛔ <b>MONITOR HELIUS DETENIDO</b>\n\n"
-            "La detección en tiempo real ha sido pausada.\n"
+            "⛔ <b>MONITOR DETENIDO</b>\n\n"
+            "La detección ha sido pausada.\n"
             "Usa /iniciar para reactivar.",
             parse_mode="HTML"
         )
+        logging.info(f"⛔ Monitor detenido por: {update.effective_user.id}")
         
     except Exception as e:
-        await update.message.reply_text(f"❌ Error deteniendo monitor: {str(e)}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /status - Estado del sistema"""
+    """Comando /status"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
@@ -615,147 +493,116 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     monitor_status = "🟢 ACTIVO" if helius_monitor and helius_monitor.running else "🔴 INACTIVO"
     silent_status = "🔇 ON" if notifier and notifier.silent_mode else "🔔 OFF"
     
-    # Obtener estadísticas
-    recent_alerts = await db.get_recent_alerts(5)
-    alerts_count = len(recent_alerts)
-    pump_tokens_count = sum(1 for alert in recent_alerts if alert.get('is_pump_token'))
+    alerts = await db.get_recent_alerts(5)
+    alerts_count = len(alerts)
 
     status_text = (
         "📊 <b>ESTADO DEL SISTEMA</b>\n\n"
-        f"🎯 Helius Monitor: {monitor_status}\n"
-        f"🔊 Modo Silencioso: {silent_status}\n"
-        f"📈 Alertas Recientes: <b>{alerts_count}</b>\n"
-        f"🎯 Tokens Pump.fun: <b>{pump_tokens_count}</b>\n\n"
-        
-        "<b>🔗 Conexiones:</b>\n"
-        f"• WebSocket: {'✅ CONECTADO' if helius_monitor and helius_monitor.websocket else '❌ DESCONECTADO'}\n"
-        f"• Jupiter API: {'✅ ACTIVA' if helius_monitor else '❌ INACTIVA'}\n"
-        f"• Base Datos: {'✅ CONECTADO' if db.pool else '❌ DESCONECTADO'}\n\n"
-        
-        "<b>⚙️ Configuración:</b>\n"
-        f"• MC Graduación: ${GRADUATION_MC_TARGET:,.0f}\n"
-        f"• MC Mínimo: ${PUMP_MC_MIN:,.0f}\n"
-        f"• Helius: {'✅ CONFIGURADO' if HELIUS_WSS_URL else '❌ NO CONFIGURADO'}\n"
+        f"🎯 Monitor: {monitor_status}\n"
+        f"🔊 Silencioso: {silent_status}\n"
+        f"📈 Alertas: {alerts_count}\n\n"
+        f"🔗 WebSocket: {'✅' if helius_monitor and helius_monitor.websocket else '❌'}\n"
+        f"🗄️ Base datos: {'✅' if db.pool else '❌'}\n"
     )
 
     await update.message.reply_text(status_text, parse_mode="HTML")
 
 async def alertas_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /alertas - Últimas alertas"""
+    """Comando /alertas"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
 
-    alerts = await db.get_recent_alerts(8)
+    alerts = await db.get_recent_alerts(5)
     if not alerts:
         await update.message.reply_text("No hay alertas recientes.")
         return
 
-    lines = ["<b>🎯 Últimas Graduaciones Pump.fun:</b>\n"]
+    lines = ["<b>Últimas alertas:</b>\n"]
     for alert in alerts:
         symbol = alert.get('symbol', 'UNKNOWN')
         market_cap = alert.get('market_cap', 0)
-        dex = alert.get('dex_name', 'unknown').upper()
-        is_pump = alert.get('is_pump_token', False)
-        detected_at = alert.get('detected_at')
-        
-        if isinstance(detected_at, datetime):
-            time_str = detected_at.strftime("%H:%M:%S")
-        else:
-            time_str = "reciente"
-        
-        pump_emoji = "🎯" if is_pump else "📌"
-        
-        lines.append(f"• {pump_emoji} <b>{symbol}</b>")
-        lines.append(f"  MC: ${float(market_cap):,.0f} | DEX: {dex}")
-        lines.append(f"  Hora: {time_str}")
-        lines.append("")
+        lines.append(f"• {symbol} - ${market_cap:,.0f}")
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 async def silent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Comando /silent - Modo silencioso"""
+    """Comando /silent"""
     if not is_authorized(update):
         await update.message.reply_text("❌ No autorizado")
         return
 
     args = context.args
-    if not args or args[0] not in ['on', 'off']:
+    if not args:
         await update.message.reply_text("Uso: /silent on|off")
         return
 
     if notifier:
-        notifier.silent_mode = (args[0] == 'on')
-        status = "🔇 ACTIVADO" if notifier.silent_mode else "🔔 DESACTIVADO"
+        notifier.silent_mode = (args[0].lower() == 'on')
+        status = "🔇 ON" if notifier.silent_mode else "🔔 OFF"
         await update.message.reply_text(f"Modo silencioso: {status}")
 
-# ========== ENDPOINTS WEB ==========
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, request: Request):
-    """Webhook para Telegram"""
-    if token != TELEGRAM_BOT_TOKEN:
-        raise HTTPException(status_code=403, detail="Token inválido")
-    
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manejar comandos desconocidos"""
+    await update.message.reply_text(
+        "❌ Comando no reconocido. Usa /start para ver los comandos disponibles."
+    )
+
+# ========== WEBHOOK CORREGIDO ==========
+@app.post("/webhook")
+async def telegram_webhook(request: Request):
+    """Webhook para Telegram - VERSIÓN CORREGIDA"""
     try:
-        data = await request.json()
+        # Leer el body directamente como bytes y luego parsear JSON
+        body_bytes = await request.body()
+        body_str = body_bytes.decode('utf-8')
+        data = json.loads(body_str)
+        
+        logging.info(f"📨 Webhook recibido: {data.keys()}")
+        
+        # Procesar la actualización
         update = Update.de_json(data, telegram_app.bot)
         
+        # Verificar autorización y procesar
         if update.effective_user and update.effective_user.id == OWNER_ID:
             await telegram_app.process_update(update)
+            logging.info(f"✅ Update procesado para user: {update.effective_user.id}")
+        else:
+            logging.warning(f"⚠️ Usuario no autorizado: {update.effective_user.id if update.effective_user else 'None'}")
             
         return JSONResponse({"status": "ok"})
+        
+    except json.JSONDecodeError as e:
+        logging.error(f"❌ Error decodificando JSON: {str(e)}")
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
     except Exception as e:
         logging.error(f"❌ Error en webhook: {str(e)}")
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
-@app.get("/last")
-async def get_last_alerts(limit: int = 20):
-    """Endpoint para últimas alertas"""
-    alerts = await db.get_recent_alerts(limit)
-    for alert in alerts:
-        if isinstance(alert.get('detected_at'), datetime):
-            alert['detected_at'] = alert['detected_at'].isoformat()
-    return JSONResponse({"alerts": alerts})
-
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
     return {
-        "status": "healthy",
+        "status": "healthy", 
         "timestamp": datetime.utcnow().isoformat(),
-        "services": {
-            "database": bool(db.pool),
-            "telegram_bot": bool(telegram_app),
-            "helius_monitor": helius_monitor.running if helius_monitor else False,
-            "websocket_connected": helius_monitor.websocket is not None if helius_monitor else False
-        },
-        "configuration": {
-            "pump_fun_detection": True,
-            "jupiter_api_integration": True,
-            "graduation_mc_target": GRADUATION_MC_TARGET
-        }
+        "telegram_bot": bool(telegram_app),
+        "helius_monitor": helius_monitor.running if helius_monitor else False
     }
 
 @app.get("/")
 async def root():
-    """Endpoint raíz"""
-    return {
-        "message": "Pump.fun Graduation Sniper Bot",
-        "status": "operational",
-        "technology": "Helius WSS + Jupiter API V2",
-        "focus": "pump_fun_tokens_only",
-        "version": "3.0"
-    }
+    return {"message": "Pump.fun Graduation Sniper Bot", "status": "running"}
 
-# ========== INICIALIZACIÓN ==========
+# ========== INICIALIZACIÓN CORREGIDA ==========
 async def startup():
-    """Inicialización de la aplicación"""
+    """Inicialización de la aplicación - VERSIÓN CORREGIDA"""
     global telegram_app, notifier, helius_monitor
 
-    # Verificar variables requeridas
+    logging.info("🚀 Iniciando aplicación...")
+
+    # Verificar variables críticas
     required_vars = {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
+        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID, 
         "OWNER_ID": OWNER_ID,
         "DATABASE_URL": DATABASE_URL,
         "HELIUS_WSS_URL": HELIUS_WSS_URL
@@ -763,43 +610,70 @@ async def startup():
     
     missing = [k for k, v in required_vars.items() if not v]
     if missing:
-        raise RuntimeError(f"❌ Faltan variables: {', '.join(missing)}")
+        error_msg = f"❌ Faltan variables: {', '.join(missing)}"
+        logging.error(error_msg)
+        raise RuntimeError(error_msg)
 
     # Conectar a base de datos
-    await db.connect()
+    try:
+        await db.connect()
+        logging.info("✅ Base de datos conectada")
+    except Exception as e:
+        logging.error(f"❌ Error conectando a BD: {str(e)}")
+        raise
 
     # Inicializar aplicación de Telegram
-    telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    try:
+        telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        logging.info("✅ Aplicación Telegram creada")
+    except Exception as e:
+        logging.error(f"❌ Error creando app Telegram: {str(e)}")
+        raise
 
-    # Registrar comandos
-    telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("iniciar", iniciar_command))
-    telegram_app.add_handler(CommandHandler("detener", detener_command))
-    telegram_app.add_handler(CommandHandler("status", status_command))
-    telegram_app.add_handler(CommandHandler("alertas", alertas_command))
-    telegram_app.add_handler(CommandHandler("silent", silent_command))
+    # REGISTRAR COMANDOS - ESTO ES CRÍTICO
+    try:
+        telegram_app.add_handler(CommandHandler("start", start_command))
+        telegram_app.add_handler(CommandHandler("iniciar", iniciar_command))
+        telegram_app.add_handler(CommandHandler("detener", detener_command))
+        telegram_app.add_handler(CommandHandler("status", status_command))
+        telegram_app.add_handler(CommandHandler("alertas", alertas_command))
+        telegram_app.add_handler(CommandHandler("silent", silent_command))
+        telegram_app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+        
+        logging.info("✅ Todos los comandos registrados")
+    except Exception as e:
+        logging.error(f"❌ Error registrando comandos: {str(e)}")
+        raise
 
     # Inicializar notificador y monitor
     notifier = TelegramNotifier(telegram_app)
     helius_monitor = HeliusMonitor(HELIUS_WSS_URL, db, notifier)
 
-    # Inicializar Telegram
-    await telegram_app.initialize()
-    
-    # Configurar webhook si hay DOMAIN_URL
-    if DOMAIN_URL:
-        webhook_url = f"{DOMAIN_URL.rstrip('/')}/webhook/{TELEGRAM_BOT_TOKEN}"
-        await telegram_app.bot.set_webhook(webhook_url)
-        logging.info(f"✅ Webhook configurado: {webhook_url}")
-    else:
-        await telegram_app.start()
-        logging.info("✅ Bot iniciado con polling")
+    # Inicializar Telegram (IMPORTANTE: sin webhook para Railway)
+    try:
+        await telegram_app.initialize()
+        
+        # EN RAILWAY USAMOS WEBHOOK MANUALMENTE
+        if DOMAIN_URL:
+            webhook_url = f"{DOMAIN_URL.rstrip('/')}/webhook"
+            await telegram_app.bot.set_webhook(webhook_url)
+            logging.info(f"✅ Webhook configurado: {webhook_url}")
+        else:
+            # Fallback a polling si no hay DOMAIN_URL
+            await telegram_app.start()
+            logging.info("✅ Bot iniciado con polling")
+            
+        logging.info("🤖 Bot de Telegram inicializado correctamente")
+        
+    except Exception as e:
+        logging.error(f"❌ Error inicializando Telegram: {str(e)}")
+        raise
 
-    logging.info("🚀 Bot de Graduación Pump.fun listo - Usa /iniciar para comenzar")
+    logging.info("🎉 Aplicación iniciada correctamente - Los comandos deberían funcionar")
 
 async def shutdown():
     """Apagado de la aplicación"""
-    logging.info("🛑 Apagando bot...")
+    logging.info("🛑 Apagando aplicación...")
     
     if helius_monitor:
         await helius_monitor.stop()
@@ -807,14 +681,14 @@ async def shutdown():
     if telegram_app:
         try:
             await telegram_app.bot.delete_webhook()
-        except Exception:
-            pass
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+            await telegram_app.stop()
+            await telegram_app.shutdown()
+        except Exception as e:
+            logging.error(f"❌ Error apagando Telegram: {str(e)}")
 
-    logging.info("✅ Bot apagado correctamente")
+    logging.info("✅ Aplicación apagada correctamente")
 
-# ========== EJECUCIÓN LOCAL ==========
+# ========== EJECUCIÓN ==========
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
