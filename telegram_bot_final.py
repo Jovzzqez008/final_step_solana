@@ -734,16 +734,16 @@ class PumpFunBot:
         self.is_running = False
         self.ws_task = None
         
-    def setup_logging(self):
-        """Configura el sistema de logging"""
-        logging.basicConfig(
-            level=getattr(logging, self.config.LOG_LEVEL.upper()),
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(sys.stdout),
-                logging.FileHandler('pump_bot.log', encoding='utf-8')
-            ]
-        )
+def setup_logging(self):
+    """Configura el sistema de logging (solo consola, compatible con Railway)"""
+    logging.basicConfig(
+        level=getattr(logging, self.config.LOG_LEVEL.upper(), logging.INFO),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+
         
     async def start(self):
         """Inicia el bot"""
