@@ -640,8 +640,6 @@ class WebSocketClient:
     async def connect(self):
         """Conecta al WebSocket de PumpPortal"""
         uri = self.config.PUMPPORTAL_WSS
-        if self.config.PUMPPORTAL_API_KEY:
-            uri = f"{uri}?api-key={self.config.PUMPPORTAL_API_KEY}"
             
         while True:
             try:
@@ -733,17 +731,16 @@ class PumpFunBot:
         self.telegram_app = None
         self.is_running = False
         self.ws_task = None
-        
-def setup_logging(self):
-    """Configura el sistema de logging (solo consola, compatible con Railway)"""
-    logging.basicConfig(
-        level=getattr(logging, self.config.LOG_LEVEL.upper(), logging.INFO),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout)
-        ]
-    )
 
+    def setup_logging(self):
+        """Configura el sistema de logging (solo consola, compatible con Railway)"""
+        logging.basicConfig(
+            level=getattr(logging, self.config.LOG_LEVEL.upper(), logging.INFO),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
         
     async def start(self):
         """Inicia el bot"""
