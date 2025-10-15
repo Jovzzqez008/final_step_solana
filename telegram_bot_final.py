@@ -1,624 +1,996 @@
 #!/usr/bin/env python3
-# telegram_bot_final.py
 """
-Pump.fun Alert Bot - telegram_bot_final.py
-- Manual start: /cazar
-- Manual stop: /parar
-- Reads config.json (advanced structure) + .env
-- Uses PumpPortal WS subscribeNewToken
-- Uses RPC primary/fallback (Helius / QuickNode)
-- Persists to Postgres via asyncpg (optional)
-- Sends Telegram alerts (one per token) when ROI condition met
+🤖 BOT PUMP.FUN - ALERTAS PROFESIONALES
+Arquitectura completa con QuickNode/Helius RPC + PostgreSQL + Parámetros dinámicos
 """
 
 import os
 import json
 import asyncio
 import logging
-from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List
-
-import httpx
-import websockets
+import signal
+import sys
+import aiohttp
 import asyncpg
-from dotenv import load_dotenv
+import websockets
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from decimal import Decimal
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
-# Load env
-load_dotenv()
-
-# -------------------- CONFIG LOAD --------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
-
-# default config
-DEFAULT_CONFIG = {
-    "telegram": {"chat_id": None, "parse_mode": "Markdown"},
-    "filters": {
-        "min_marketcap": 0,
-        "min_liquidity_sol": 0.5,
-        "min_holders": 0,
-        "roi_targets": [{"percent": 100, "minutes": 15}]
-    },
-    "rpc": {"primary": None, "fallback": None, "timeout_seconds": 5, "max_retries": 3},
-    "database": {"enabled": True, "table_name": "signals_history"},
-    "advanced": {"track_only_new_tokens": True, "max_concurrent_monitors": 50}
-}
-
-if os.path.exists(CONFIG_PATH):
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        try:
-            CONFIG = json.load(f)
-        except Exception:
-            CONFIG = DEFAULT_CONFIG
-else:
-    CONFIG = DEFAULT_CONFIG
-
-# -------------------- ENV and Combined CONFIG --------------------
 # Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ENV_TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-try:
-    TELEGRAM_CHAT_ID = int(ENV_TELEGRAM_CHAT_ID) if ENV_TELEGRAM_CHAT_ID else CONFIG.get("telegram", {}).get("chat_id")
-except Exception:
-    TELEGRAM_CHAT_ID = CONFIG.get("telegram", {}).get("chat_id")
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
 
-# RPC endpoints
-RPC_PRIMARY = os.getenv("RPC_PRIMARY") or CONFIG.get("rpc", {}).get("primary")
-RPC_FALLBACK = os.getenv("RPC_FALLBACK") or CONFIG.get("rpc", {}).get("fallback")
+# ===========================
+# CONFIGURACIÓN Y CONSTANTES
+# ===========================
 
-# PumpPortal
-PUMPPORTAL_WS = os.getenv("PUMPPORTAL_WS") or CONFIG.get("advanced", {}).get("pumpportal_ws") or "wss://pumpportal.fun/api/data"
-PUMPPORTAL_API_KEY = os.getenv("PUMPPORTAL_API_KEY") or ""
+class Config:
+    """Cargador de configuración desde config.json y variables de entorno"""
+    
+    def __init__(self):
+        self.config_path = os.path.join(os.path.dirname(__file__), 'config.json')
+        self.load_config()
+        
+    def load_config(self):
+        """Carga configuración desde archivo y variables de entorno"""
+        # Cargar config.json si existe
+        if os.path.exists(self.config_path):
+            with open(self.config_path, 'r') as f:
+                self.data = json.load(f)
+        else:
+            self.data = {}
+            
+        # Telegram
+        self.TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '')
+        self.TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', '')
+        
+        # Database
+        self.DATABASE_URL = os.getenv('DATABASE_URL', '')
+        
+        # RPC Endpoints
+        self.QUICKNODE_RPC_URL = os.getenv('QUICKNODE_RPC_URL', '')
+        self.HELIUS_RPC_URL = os.getenv('HELIUS_RPC_URL', '')
+        
+        # Pump.fun
+        self.PUMPPORTAL_WSS = os.getenv('PUMPPORTAL_WSS', 
+                                      self.data.get('websocket', {}).get('uri', 
+                                      'wss://pumpportal.fun/api/data'))
+        
+        # Parámetros del bot (env vars tienen prioridad sobre config.json)
+        self.ALERT_RULES = self.data.get('alert_rules', [
+            {
+                "name": "moon_shot",
+                "alert_percent": 500,
+                "time_window_min": 8,
+                "description": "500% en 8 minutos"
+            }
+        ])
+        
+        monitoring_config = self.data.get('monitoring', {})
+        self.MAX_MONITOR_TIME_MIN = float(os.getenv('MAX_MONITOR_TIME_MIN', 
+                                                  monitoring_config.get('max_monitor_time_min', 30)))
+        self.DUMP_THRESHOLD_PERCENT = float(os.getenv('DUMP_THRESHOLD_PERCENT', 
+                                                    monitoring_config.get('dump_threshold_percent', -50)))
+        self.PRICE_POLL_INTERVAL_SEC = float(os.getenv('PRICE_POLL_INTERVAL_SEC', 
+                                                     monitoring_config.get('price_poll_interval_sec', 5)))
+        
+        # Modo
+        self.MODE = os.getenv('MODE', 'PROD')
+        self.LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+        self.ENABLE_DB = os.getenv('ENABLE_DB', 'true').lower() == 'true'
+        self.ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'true').lower() == 'true'
 
-# DB
-DATABASE_URL = os.getenv("DATABASE_URL")
+# ===========================
+# MODELOS DE DATOS
+# ===========================
 
-# Behavioral environment overrides
-ENABLE_DB = str(os.getenv("ENABLE_DB") or str(CONFIG.get("database", {}).get("enabled", True))).lower() in ("1", "true", "yes")
-PRICE_POLL_INTERVAL_SEC = float(os.getenv("PRICE_POLL_INTERVAL_SEC") or 8)
-DUMP_THRESHOLD_PERCENT = float(os.getenv("DUMP_THRESHOLD_PERCENT") or -50)
-MAX_MONITOR_TIME_MIN = float(os.getenv("MAX_MONITOR_TIME_MIN") or 30)
-LOG_LEVEL = os.getenv("LOG_LEVEL") or "INFO"
-MODE = os.getenv("MODE") or "PROD"
+@dataclass
+class TokenData:
+    """Estructura para almacenar datos del token"""
+    mint: str
+    symbol: str
+    name: str
+    initial_price: float
+    initial_market_cap: float
+    max_price: float
+    start_time: datetime
+    status: str = "monitoring"
+    metadata: Dict = None
+    
+    def __post_init__(self):
+        if self.metadata is None:
+            self.metadata = {}
 
-# ROI targets: from config.json (list)
-ROI_TARGETS: List[Dict[str, Any]] = CONFIG.get("filters", {}).get("roi_targets") or [{"percent": 100, "minutes": 15}]
+@dataclass
+class AlertData:
+    """Estructura para datos de alerta"""
+    token_address: str
+    rule_name: str
+    gain_percent: float
+    time_elapsed_min: float
+    price_at_alert: float
+    market_cap_at_alert: float
+    extra_data: Dict = None
+    
+    def __post_init__(self):
+        if self.extra_data is None:
+            self.extra_data = {}
 
-# Limits
-MAX_CONCURRENT_MONITORS = int(CONFIG.get("advanced", {}).get("max_concurrent_monitors", 50))
+# ===========================
+# CLIENTE RPC (QUICKNODE/HELIUS)
+# ===========================
 
-# Derived
-ENABLE_TELEGRAM = True if TELEGRAM_BOT_TOKEN else False
-
-# -------------------- LOGGING --------------------
-numeric_level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
-logging.basicConfig(level=numeric_level,
-                    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-                    datefmt="%Y-%m-%d %H:%M:%S")
-logger = logging.getLogger("pumpfun_bot")
-
-# -------------------- GLOBALS --------------------
-monitored_tokens: Dict[str, Dict[str, Any]] = {}
-db_pool: Optional[asyncpg.pool.Pool] = None
-ws_task: Optional[asyncio.Task] = None
-ws_stop_event = asyncio.Event()
-application: Optional[Application] = None
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_MONITORS)
-
-# -------------------- UTIL --------------------
-def now_utc():
-    return datetime.now(timezone.utc)
-
-def choose_rpc_url() -> Optional[str]:
-    return RPC_PRIMARY or RPC_FALLBACK or "https://api.mainnet-beta.solana.com"
-
-# -------------------- DATABASE (asyncpg) --------------------
-CREATE_TABLE_QUERIES = [
-"""
-CREATE TABLE IF NOT EXISTS token_monitoring (
-  token_address TEXT PRIMARY KEY,
-  symbol TEXT,
-  name TEXT,
-  initial_price NUMERIC,
-  initial_market_cap NUMERIC,
-  max_price NUMERIC,
-  start_time TIMESTAMPTZ,
-  last_checked TIMESTAMPTZ,
-  status TEXT,
-  metadata JSONB
-);
-""",
-"""
-CREATE TABLE IF NOT EXISTS token_alerts (
-  id SERIAL PRIMARY KEY,
-  token_address TEXT NOT NULL,
-  gain_percent NUMERIC,
-  time_elapsed_min NUMERIC,
-  price_at_alert NUMERIC,
-  created_at TIMESTAMPTZ DEFAULT now(),
-  extra JSONB
-);
-""",
-"""
-CREATE TABLE IF NOT EXISTS token_price_history (
-  id SERIAL PRIMARY KEY,
-  token_address TEXT NOT NULL,
-  ts TIMESTAMPTZ DEFAULT now(),
-  price NUMERIC,
-  market_cap NUMERIC,
-  volume NUMERIC
-);
-"""
-]
-
-async def init_db():
-    global db_pool
-    if not ENABLE_DB:
-        logger.info("DB disabled in config.")
-        return
-    if not DATABASE_URL:
-        logger.warning("ENABLE_DB is true but DATABASE_URL not provided.")
-        return
-    try:
-        db_pool = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=6)
-        async with db_pool.acquire() as conn:
-            for q in CREATE_TABLE_QUERIES:
-                await conn.execute(q)
-        logger.info("Postgres pool initialized and tables ensured.")
-    except Exception as e:
-        logger.error("Error initializing DB: %s", e)
-        db_pool = None
-
-async def db_insert_monitored(mint: str, info: Dict[str, Any]):
-    if not db_pool: return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO token_monitoring (token_address, symbol, name, initial_price, initial_market_cap, max_price, start_time, last_checked, status, metadata)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$7,$8,$9)
-                ON CONFLICT (token_address) DO UPDATE SET last_checked = $7, status = $8, max_price = EXCLUDED.max_price, metadata = EXCLUDED.metadata
-            """, mint, info.get("symbol"), info.get("name"), info.get("initial_price"),
-                 info.get("initial_market_cap"), info.get("max_price"), now_utc(), info.get("status","monitoring"), json.dumps(info.get("metadata", {})))
-    except Exception as e:
-        logger.debug("db_insert_monitored error: %s", e)
-
-async def db_remove_monitored(mint: str):
-    if not db_pool: return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM token_monitoring WHERE token_address = $1", mint)
-    except Exception as e:
-        logger.debug("db_remove_monitored error: %s", e)
-
-async def db_record_alert(mint: str, gain_percent: float, elapsed_min: float, price_at_alert: float, extra: dict = None):
-    if not db_pool: return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO token_alerts (token_address, gain_percent, time_elapsed_min, price_at_alert, extra)
-                VALUES ($1,$2,$3,$4,$5)
-            """, mint, gain_percent, elapsed_min, price_at_alert, json.dumps(extra or {}))
-    except Exception as e:
-        logger.debug("db_record_alert error: %s", e)
-
-async def db_record_price(mint: str, price: float, market_cap: float, volume: float):
-    if not db_pool: return
-    try:
-        async with db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO token_price_history (token_address, price, market_cap, volume)
-                VALUES ($1,$2,$3,$4)
-            """, mint, price, market_cap, volume)
-    except Exception as e:
-        logger.debug("db_record_price error: %s", e)
-
-# -------------------- PUMPPORTAL WS LISTENER --------------------
-async def pumpportal_listener():
-    uri = PUMPPORTAL_WS
-    if PUMPPORTAL_API_KEY:
-        uri = uri + ("&" if "?" in uri else "?") + f"api-key={PUMPPORTAL_API_KEY}"
-    logger.info("Connecting to PumpPortal WS: %s", uri)
-    backoff = 1
-    while not ws_stop_event.is_set():
-        try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=20, max_size=None) as ws:
-                logger.info("Connected to PumpPortal WS")
-                # subscribe to new token births
-                await ws.send(json.dumps({"method":"subscribeNewToken"}))
-                logger.info("Sent subscribeNewToken")
-                async for raw in ws:
-                    if ws_stop_event.is_set():
-                        break
-                    try:
-                        payload = json.loads(raw)
-                        # dispatch non-blocking
-                        asyncio.create_task(handle_new_token(payload))
-                    except Exception as e:
-                        logger.debug("WS parse error: %s", e)
-                logger.warning("Websocket loop ended; reconnecting")
-        except Exception as e:
-            logger.error("PumpPortal WS error: %s", e)
-            await asyncio.sleep(backoff)
-            backoff = min(backoff * 2, 30)
-
-# -------------------- NEW TOKEN HANDLER --------------------
-async def handle_new_token(payload: Dict[str, Any]):
-    """
-    Extract mint/symbol/name. Start monitor task if not already monitored.
-    """
-    try:
-        # flexible extraction
-        mint = payload.get("mint") or payload.get("token") or (payload.get("data") or {}).get("mint")
-        if not mint:
-            logger.debug("Payload with no mint; skipping.")
-            return
-        symbol = payload.get("symbol") or (payload.get("data") or {}).get("symbol") or f"TKN_{mint[:6]}"
-        name = payload.get("name") or (payload.get("data") or {}).get("name") or symbol
-
-        # Optionally extract price/marketcap if pumpportal provides it
-        initial_price = 0.0
-        initial_marketcap = 0.0
-        pairs = payload.get("pairs") or (payload.get("data") or {}).get("pairs")
-        if isinstance(pairs, list) and pairs:
-            p = pairs[0]
-            try:
-                initial_price = float(p.get("priceUsd") or p.get("price") or 0)
-            except Exception:
-                initial_price = 0.0
-            try:
-                initial_marketcap = float(p.get("marketCap") or 0)
-            except Exception:
-                initial_marketcap = 0.0
-
-        # Avoid duplicates
-        if mint in monitored_tokens:
-            logger.debug("Mint %s already monitored.", mint)
-            return
-
-        # Basic filter if you want (min_marketcap / min_liquidity) - optional
-        min_mc = CONFIG.get("filters", {}).get("min_marketcap", 0)
-        if initial_marketcap and initial_marketcap < min_mc:
-            logger.debug("Mint %s marketcap < min_marketcap (%s) skip", mint, min_mc)
-            # still could monitor; here we skip only if configured
-            # return
-
-        # Create in-memory entry
-        entry = {
-            "symbol": symbol,
-            "name": name,
-            "initial_price": initial_price,
-            "initial_market_cap": initial_marketcap,
-            "start_time": now_utc(),
-            "max_price": initial_price or 0.0,
-            "monitoring_task": None,
-            "status": "monitoring",
-            "raw_payload": payload
+class RPCClient:
+    """Cliente para conexión RPC con QuickNode/Helius"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.current_provider = 'quicknode'
+        self.session = None
+        
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+            
+    def get_rpc_url(self):
+        """Obtiene la URL RPC activa"""
+        if self.current_provider == 'quicknode' and self.config.QUICKNODE_RPC_URL:
+            return self.config.QUICKNODE_RPC_URL
+        elif self.current_provider == 'helius' and self.config.HELIUS_RPC_URL:
+            return self.config.HELIUS_RPC_URL
+        else:
+            # Fallback a RPC público (no recomendado para producción)
+            return "https://api.mainnet-beta.solana.com"
+    
+    async def make_rpc_call(self, method: str, params: list) -> Optional[Dict]:
+        """Realiza llamada RPC con fallback automático entre proveedores"""
+        url = self.get_rpc_url()
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
         }
-        monitored_tokens[mint] = entry
-        await db_insert_monitored(mint, {
-            "symbol": symbol,
-            "name": name,
-            "initial_price": initial_price,
-            "initial_market_cap": initial_marketcap,
-            "max_price": entry["max_price"],
-            "status": "monitoring",
-            "metadata": {"payload": payload}
-        })
-        # respect concurrency limits
-        await semaphore.acquire()
+        
         try:
-            task = asyncio.create_task(monitor_single_token(mint))
-            monitored_tokens[mint]["monitoring_task"] = task
-            logger.info("Monitoring started for %s (%s)", mint, symbol)
-        finally:
-            semaphore.release()
-    except Exception as e:
-        logger.error("Error handling new token: %s", e)
+            async with self.session.post(url, json=payload, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get('result')
+                else:
+                    raise Exception(f"RPC error: {response.status}")
+        except Exception as e:
+            logging.warning(f"RPC call failed with {self.current_provider}: {e}")
+            # Switch provider
+            if self.current_provider == 'quicknode':
+                self.current_provider = 'helius'
+            else:
+                self.current_provider = 'quicknode'
+                
+            if self.get_rpc_url() != url:  # Si hay un proveedor alternativo
+                logging.info(f"Switching to {self.current_provider} RPC")
+                return await self.make_rpc_call(method, params)
+            else:
+                raise e
+    
+    async def get_token_price(self, mint: str) -> Optional[Dict[str, float]]:
+        """
+        Obtiene precio y market cap del token usando DexScreener API
+        como fallback rápido y confiable
+        """
+        try:
+            # Primero intentamos con DexScreener (más rápido para precio)
+            async with self.session.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}", 
+                timeout=5
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get('pairs') and len(data['pairs']) > 0:
+                        pair = data['pairs'][0]
+                        price = float(pair.get('priceUsd', 0))
+                        market_cap = float(pair.get('marketCap', 0))
+                        volume = float(pair.get('volume', {}).get('h24', 0))
+                        
+                        return {
+                            'price': price,
+                            'market_cap': market_cap,
+                            'volume_24h': volume,
+                            'source': 'dexscreener'
+                        }
+        except Exception as e:
+            logging.debug(f"DexScreener price fetch failed for {mint}: {e}")
+            
+        # Fallback: intentar con RPC para datos on-chain
+        try:
+            # Aquí podrías implementar lógica para obtener precio desde bonding curve
+            # usando getAccountInfo del programa de Pump.fun
+            pass
+        except Exception as e:
+            logging.debug(f"RPC price fetch failed for {mint}: {e}")
+            
+        return None
 
-# -------------------- MONITOR SINGLE TOKEN --------------------
-async def monitor_single_token(mint: str):
-    """
-    Monitors a single mint:
-    - polls price via get_price()
-    - calculates gain% from initial_price
-    - compares against ROI_TARGETS (list of {percent, minutes})
-    - deletes on dump (DUMP_THRESHOLD_PERCENT) or timeout (MAX_MONITOR_TIME_MIN)
-    - sends 1 alert and records it
-    """
-    try:
-        token = monitored_tokens.get(mint)
+# ===========================
+# BASE DE DATOS POSTGRESQL
+# ===========================
+
+class Database:
+    """Manejador de base de datos PostgreSQL"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.pool = None
+        
+    async def connect(self):
+        """Conecta a la base de datos y crea tablas si no existen"""
+        if not self.config.ENABLE_DB or not self.config.DATABASE_URL:
+            logging.info("Database disabled or DATABASE_URL not set")
+            return
+            
+        try:
+            self.pool = await asyncpg.create_pool(
+                self.config.DATABASE_URL,
+                min_size=1,
+                max_size=10,
+                command_timeout=60
+            )
+            
+            # Crear tablas si no existen
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS token_monitoring (
+                        token_address TEXT PRIMARY KEY,
+                        symbol TEXT,
+                        name TEXT,
+                        initial_price DECIMAL(30, 15),
+                        initial_market_cap DECIMAL(30, 2),
+                        max_price DECIMAL(30, 15),
+                        start_time TIMESTAMPTZ DEFAULT NOW(),
+                        last_checked TIMESTAMPTZ,
+                        status TEXT,
+                        metadata JSONB,
+                        created_at TIMESTAMPTZ DEFAULT NOW()
+                    )
+                ''')
+                
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS token_alerts (
+                        id SERIAL PRIMARY KEY,
+                        token_address TEXT NOT NULL,
+                        alert_rule_name TEXT,
+                        gain_percent DECIMAL(10, 2),
+                        time_elapsed_min DECIMAL(10, 2),
+                        price_at_alert DECIMAL(30, 15),
+                        market_cap_at_alert DECIMAL(30, 2),
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        extra_data JSONB
+                    )
+                ''')
+                
+                await conn.execute('''
+                    CREATE TABLE IF NOT EXISTS token_price_history (
+                        id SERIAL PRIMARY KEY,
+                        token_address TEXT NOT NULL,
+                        timestamp TIMESTAMPTZ DEFAULT NOW(),
+                        price DECIMAL(30, 15),
+                        market_cap DECIMAL(30, 2),
+                        volume_24h DECIMAL(30, 2)
+                    )
+                ''')
+                
+                # Crear índices
+                await conn.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_token_monitoring_status 
+                    ON token_monitoring(status)
+                ''')
+                
+                await conn.execute('''
+                    CREATE INDEX IF NOT EXISTS idx_token_alerts_created_at 
+                    ON token_alerts(created_at)
+                ''')
+                
+            logging.info("✅ Database connected and schema verified")
+            
+        except Exception as e:
+            logging.error(f"❌ Database connection failed: {e}")
+            self.pool = None
+    
+    async def disconnect(self):
+        """Cierra la conexión a la base de datos"""
+        if self.pool:
+            await self.pool.close()
+            logging.info("Database connection closed")
+    
+    async def add_monitored_token(self, token: TokenData):
+        """Añade token a la tabla de monitoreo"""
+        if not self.pool:
+            return
+            
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO token_monitoring 
+                    (token_address, symbol, name, initial_price, initial_market_cap, 
+                     max_price, start_time, status, metadata)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                    ON CONFLICT (token_address) 
+                    DO UPDATE SET 
+                        last_checked = NOW(),
+                        status = EXCLUDED.status,
+                        max_price = GREATEST(token_monitoring.max_price, EXCLUDED.max_price)
+                ''', token.mint, token.symbol, token.name, 
+                   Decimal(str(token.initial_price)), 
+                   Decimal(str(token.initial_market_cap)),
+                   Decimal(str(token.max_price)), 
+                   token.start_time, token.status,
+                   json.dumps(token.metadata))
+        except Exception as e:
+            logging.error(f"Error adding monitored token: {e}")
+    
+    async def record_alert(self, alert: AlertData):
+        """Registra una alerta en la base de datos"""
+        if not self.pool:
+            return
+            
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO token_alerts 
+                    (token_address, alert_rule_name, gain_percent, time_elapsed_min,
+                     price_at_alert, market_cap_at_alert, extra_data)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ''', alert.token_address, alert.rule_name,
+                   Decimal(str(alert.gain_percent)),
+                   Decimal(str(alert.time_elapsed_min)),
+                   Decimal(str(alert.price_at_alert)),
+                   Decimal(str(alert.market_cap_at_alert)),
+                   json.dumps(alert.extra_data))
+        except Exception as e:
+            logging.error(f"Error recording alert: {e}")
+    
+    async def record_price_history(self, token_address: str, price: float, 
+                                 market_cap: float, volume: float):
+        """Registra histórico de precios"""
+        if not self.pool:
+            return
+            
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute('''
+                    INSERT INTO token_price_history 
+                    (token_address, price, market_cap, volume_24h)
+                    VALUES ($1, $2, $3, $4)
+                ''', token_address, Decimal(str(price)), 
+                   Decimal(str(market_cap)), Decimal(str(volume)))
+        except Exception as e:
+            logging.debug(f"Error recording price history: {e}")
+
+# ===========================
+# MOTOR DE ALERTAS
+# ===========================
+
+class AlertEngine:
+    """Motor para evaluar reglas de alerta"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.alert_rules = config.ALERT_RULES
+        
+    async def evaluate_token(self, token: TokenData, current_price: float, 
+                           current_market_cap: float) -> List[AlertData]:
+        """Evalúa un token contra todas las reglas de alerta"""
+        if current_price <= 0:
+            return []
+            
+        # Calcular métricas
+        gain_percent = ((current_price - token.initial_price) / token.initial_price) * 100
+        elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60
+        
+        triggered_alerts = []
+        
+        for rule in self.alert_rules:
+            if self._check_rule(rule, gain_percent, elapsed_min):
+                alert = AlertData(
+                    token_address=token.mint,
+                    rule_name=rule['name'],
+                    gain_percent=gain_percent,
+                    time_elapsed_min=elapsed_min,
+                    price_at_alert=current_price,
+                    market_cap_at_alert=current_market_cap,
+                    extra_data={
+                        'initial_price': token.initial_price,
+                        'max_price': token.max_price,
+                        'symbol': token.symbol,
+                        'name': token.name
+                    }
+                )
+                triggered_alerts.append(alert)
+                
+        return triggered_alerts
+    
+    def _check_rule(self, rule: Dict, gain_percent: float, elapsed_min: float) -> bool:
+        """Verifica si se cumple una regla específica"""
+        required_gain = rule['alert_percent']
+        time_window = rule['time_window_min']
+        
+        return gain_percent >= required_gain and elapsed_min <= time_window
+
+# ===========================
+# GESTOR DE TOKENS
+# ===========================
+
+class TokenManager:
+    """Gestiona tokens en monitoreo y sus tareas"""
+    
+    def __init__(self, config: Config, database: Database, alert_engine: AlertEngine):
+        self.config = config
+        self.db = database
+        self.alert_engine = alert_engine
+        self.monitored_tokens: Dict[str, TokenData] = {}
+        self.monitor_tasks: Dict[str, asyncio.Task] = {}
+        self.rpc_client = None
+        
+    async def add_token(self, mint: str, symbol: str, name: str, 
+                       initial_price: float = 0, initial_market_cap: float = 0):
+        """Añade un nuevo token para monitoreo"""
+        if mint in self.monitored_tokens:
+            logging.debug(f"Token {mint} already being monitored")
+            return
+            
+        token = TokenData(
+            mint=mint,
+            symbol=symbol,
+            name=name,
+            initial_price=initial_price,
+            initial_market_cap=initial_market_cap,
+            max_price=initial_price,
+            start_time=datetime.now(timezone.utc)
+        )
+        
+        self.monitored_tokens[mint] = token
+        await self.db.add_monitored_token(token)
+        
+        # Iniciar tarea de monitoreo
+        task = asyncio.create_task(self._monitor_token(mint))
+        self.monitor_tasks[mint] = task
+        
+        logging.info(f"🔍 Started monitoring {symbol} ({mint[:8]}...)")
+    
+    async def _monitor_token(self, mint: str):
+        """Tarea asincrónica para monitorear un token específico"""
+        token = self.monitored_tokens.get(mint)
         if not token:
             return
-        start = token["start_time"]
-        initial_price = token.get("initial_price", 0.0)
-        max_price = token.get("max_price", initial_price or 0.0)
-        poll = max(1, PRICE_POLL_INTERVAL_SEC)
-
-        # If no initial price, attempt a quick fetch
-        if not initial_price:
-            fetched = await get_price_data(mint)
-            if fetched and fetched.get("price"):
-                initial_price = float(fetched["price"])
-                token["initial_price"] = initial_price
-                token["max_price"] = initial_price
-                await db_insert_monitored(mint, {"symbol": token['symbol'], "name": token['name'],
-                                                 "initial_price": initial_price, "initial_market_cap": fetched.get("market_cap", 0),
-                                                 "max_price": initial_price, "status": "monitoring", "metadata": {}})
-
-        while True:
-            if mint not in monitored_tokens:
-                return
-            elapsed_min = (now_utc() - start).total_seconds() / 60.0
-
-            # Timeout rule
-            if elapsed_min >= MAX_MONITOR_TIME_MIN:
-                logger.info("Mint %s reached timeout %.2f min -> removing", mint, elapsed_min)
-                await cleanup_token(mint, "timeout")
-                return
-
-            data = await get_price_data(mint)
-            if not data:
-                await asyncio.sleep(poll)
-                continue
-
-            price = float(data.get("price", 0) or 0)
-            market_cap = float(data.get("market_cap", 0) or 0)
-            volume = float(data.get("volume_24h", 0) or 0)
-
-            # update max
-            if price > max_price:
-                max_price = price
-                monitored_tokens[mint]["max_price"] = max_price
-
-            # persist history
-            await db_record_price(mint, price, market_cap, volume)
-
-            # calculate gain and drop
-            gain_pct = ((price - initial_price) / initial_price * 100.0) if initial_price and initial_price > 0 else 0.0
-            loss_from_max = ((price - max_price) / max_price * 100.0) if max_price and max_price > 0 else 0.0
-
-            logger.debug("%s price=%.8f gain=%.2f%% elapsed=%.2fmin loss_from_max=%.2f%%",
-                         mint, price, gain_pct, elapsed_min, loss_from_max)
-
-            # Dump detection
-            if loss_from_max <= DUMP_THRESHOLD_PERCENT:
-                logger.info("%s dumped %.2f%% from max -> cleaning", mint, loss_from_max)
-                await cleanup_token(mint, "dumped")
-                return
-
-            # Check ROI targets array - if any matches, trigger alert
-            for target in ROI_TARGETS:
-                try:
-                    target_pct = float(target.get("percent", 100))
-                    target_min = float(target.get("minutes", 15))
-                except Exception:
-                    continue
-                if gain_pct >= target_pct and elapsed_min <= target_min:
-                    logger.info("%s matched ROI target %s%% in %s min (gain %.2f%%)", mint, target_pct, target_min, gain_pct)
-                    extra = {"initial_price": initial_price, "price_at_alert": price, "market_cap": market_cap, "volume": volume, "matched_target": target}
-                    await send_alert(mint, token, gain_pct, elapsed_min, extra)
-                    await db_record_alert(mint, gain_pct, elapsed_min, price, extra)
-                    monitored_tokens[mint]["status"] = "alert_sent"
-                    await cleanup_token(mint, "alert_sent")
-                    return
-
-            await asyncio.sleep(poll)
-    except asyncio.CancelledError:
-        logger.info("Monitor cancelled for %s", mint)
-    except Exception as e:
-        logger.error("Error in monitor_single_token(%s): %s", mint, e)
-        await cleanup_token(mint, "error")
-
-# -------------------- CLEANUP --------------------
-async def cleanup_token(mint: str, reason: str):
-    try:
-        entry = monitored_tokens.get(mint)
-        if not entry:
+            
+        try:
+            async with RPCClient(self.config) as rpc_client:
+                self.rpc_client = rpc_client
+                
+                while mint in self.monitored_tokens:
+                    # Verificar timeout
+                    elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60
+                    if elapsed_min >= self.config.MAX_MONITOR_TIME_MIN:
+                        logging.info(f"⏰ Token {token.symbol} timeout after {elapsed_min:.1f}min")
+                        await self._remove_token(mint, "timeout")
+                        break
+                    
+                    # Obtener precio actual
+                    price_data = await self.rpc_client.get_token_price(mint)
+                    if not price_data:
+                        await asyncio.sleep(self.config.PRICE_POLL_INTERVAL_SEC)
+                        continue
+                    
+                    current_price = price_data['price']
+                    current_market_cap = price_data['market_cap']
+                    
+                    # Actualizar precio máximo
+                    if current_price > token.max_price:
+                        token.max_price = current_price
+                        await self.db.add_monitored_token(token)
+                    
+                    # Registrar histórico
+                    await self.db.record_price_history(
+                        mint, current_price, current_market_cap, 
+                        price_data.get('volume_24h', 0)
+                    )
+                    
+                    # Verificar dump
+                    if token.max_price > 0:
+                        loss_from_max = ((current_price - token.max_price) / token.max_price) * 100
+                        if loss_from_max <= self.config.DUMP_THRESHOLD_PERCENT:
+                            logging.info(f"📉 Token {token.symbol} dumped {loss_from_max:.1f}%")
+                            await self._remove_token(mint, "dumped")
+                            break
+                    
+                    # Evaluar alertas
+                    alerts = await self.alert_engine.evaluate_token(
+                        token, current_price, current_market_cap
+                    )
+                    
+                    for alert in alerts:
+                        logging.info(f"🚨 ALERT: {token.symbol} +{alert.gain_percent:.1f}% in {alert.time_elapsed_min:.1f}min")
+                        await self.db.record_alert(alert)
+                        await self._send_telegram_alert(token, alert)
+                        await self._remove_token(mint, "alert_sent")
+                        break  # Solo una alerta por token
+                    
+                    await asyncio.sleep(self.config.PRICE_POLL_INTERVAL_SEC)
+                    
+        except asyncio.CancelledError:
+            logging.info(f"Monitoring task for {mint} cancelled")
+        except Exception as e:
+            logging.error(f"Error monitoring {mint}: {e}")
+            await self._remove_token(mint, "error")
+    
+    async def _remove_token(self, mint: str, reason: str):
+        """Remueve token del monitoreo"""
+        if mint in self.monitored_tokens:
+            token = self.monitored_tokens[mint]
+            token.status = reason
+            await self.db.add_monitored_token(token)
+            del self.monitored_tokens[mint]
+            
+        if mint in self.monitor_tasks:
+            task = self.monitor_tasks[mint]
+            task.cancel()
+            del self.monitor_tasks[mint]
+            
+        logging.info(f"Removed token {mint}: {reason}")
+    
+    async def _send_telegram_alert(self, token: TokenData, alert: AlertData):
+        """Envía alerta por Telegram"""
+        if not self.config.ENABLE_TELEGRAM or not self.config.TELEGRAM_BOT_TOKEN:
             return
-        task = entry.get("monitoring_task")
-        if task:
+            
+        try:
+            message = self._format_telegram_message(token, alert)
+            keyboard = self._format_telegram_keyboard(token.mint)
+            
+            from telegram import Bot
+            bot = Bot(token=self.config.TELEGRAM_BOT_TOKEN)
+            
+            await bot.send_message(
+                chat_id=self.config.TELEGRAM_CHAT_ID,
+                text=message,
+                parse_mode='Markdown',
+                reply_markup=keyboard,
+                disable_web_page_preview=True
+            )
+            
+            logging.info(f"📨 Telegram alert sent for {token.symbol}")
+            
+        except Exception as e:
+            logging.error(f"Error sending Telegram alert: {e}")
+    
+    def _format_telegram_message(self, token: TokenData, alert: AlertData) -> str:
+        """Formatea mensaje de Telegram"""
+        return f"""
+🚀 **ALERTA DE PUMP DETECTADA** 🚀
+
+**Token:** {token.name} ({token.symbol})
+**Ganancia:** +{alert.gain_percent:.1f}% en {alert.time_elapsed_min:.1f}min
+**Regla Activada:** {alert.rule_name}
+
+📊 **Métricas:**
+• Precio Actual: {alert.price_at_alert:.8f} SOL
+• Market Cap: ${alert.market_cap_at_alert:,.0f}
+• Precio Inicial: {token.initial_price:.8f} SOL
+• Máximo Alcanzado: {token.max_price:.8f} SOL
+
+🔗 **Enlaces Rápidos:**
+• [Pump.fun](https://pump.fun/{token.mint})
+• [DexScreener](https://dexscreener.com/solana/{token.mint}) 
+• [RugCheck](https://rugcheck.xyz/tokens/{token.mint})
+• [Birdeye](https://birdeye.so/token/{token.mint}?chain=solana)
+
+📈 **ROI Potencial:** {alert.gain_percent:.1f}%
+
+🕒 **Tiempo desde creación:** {alert.time_elapsed_min:.1f} minutos
+"""
+    
+    def _format_telegram_keyboard(self, mint: str) -> InlineKeyboardMarkup:
+        """Crea teclado inline para Telegram"""
+        keyboard = [
+            [
+                InlineKeyboardButton("🎯 Pump.fun", url=f"https://pump.fun/{mint}"),
+                InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/solana/{mint}")
+            ],
+            [
+                InlineKeyboardButton("🛡️ RugCheck", url=f"https://rugcheck.xyz/tokens/{mint}"),
+                InlineKeyboardButton("👁️ Birdeye", url=f"https://birdeye.so/token/{mint}?chain=solana")
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    async def stop_all_monitoring(self):
+        """Detiene todo el monitoreo"""
+        for mint in list(self.monitored_tokens.keys()):
+            await self._remove_token(mint, "shutdown")
+    
+    def get_status(self) -> Dict:
+        """Obtiene estado actual del gestor"""
+        return {
+            'monitored_tokens': len(self.monitored_tokens),
+            'active_tasks': len(self.monitor_tasks),
+            'tokens': list(self.monitored_tokens.keys())
+        }
+
+# ===========================
+# CLIENTE WEBSOCKET
+# ===========================
+
+class WebSocketClient:
+    """Cliente WebSocket para PumpPortal"""
+    
+    def __init__(self, config: Config, token_manager: TokenManager):
+        self.config = config
+        self.token_manager = token_manager
+        self.websocket = None
+        self.is_connected = False
+        self.reconnect_delay = 5
+        self.max_reconnect_delay = 60
+        
+    async def connect(self):
+        """Conecta al WebSocket de PumpPortal"""
+        uri = self.config.PUMPPORTAL_WSS
+        if self.config.PUMPPORTAL_API_KEY:
+            uri = f"{uri}?api-key={self.config.PUMPPORTAL_API_KEY}"
+            
+        while True:
             try:
-                task.cancel()
-            except Exception:
-                pass
-        monitored_tokens.pop(mint, None)
-        await db_remove_monitored(mint)
-        logger.info("Cleaned %s -> %s", mint, reason)
-    except Exception as e:
-        logger.debug("cleanup_token error: %s", e)
+                logging.info(f"Connecting to WebSocket: {uri}")
+                self.websocket = await websockets.connect(uri, ping_interval=20, ping_timeout=10)
+                self.is_connected = True
+                self.reconnect_delay = 5
+                
+                # Suscribirse a nuevos tokens
+                subscribe_msg = {"method": "subscribeNewToken"}
+                await self.websocket.send(json.dumps(subscribe_msg))
+                logging.info("Subscribed to new tokens")
+                
+                # Escuchar mensajes
+                await self._listen()
+                
+            except Exception as e:
+                logging.error(f"WebSocket connection failed: {e}")
+                self.is_connected = False
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+    
+    async def _listen(self):
+        """Escucha mensajes del WebSocket"""
+        async for message in self.websocket:
+            try:
+                data = json.loads(message)
+                await self._handle_message(data)
+            except json.JSONDecodeError:
+                logging.error(f"Invalid JSON message: {message}")
+            except Exception as e:
+                logging.error(f"Error handling message: {e}")
+    
+    async def _handle_message(self, data: Dict):
+        """Maneja mensajes recibidos del WebSocket"""
+        try:
+            # Extraer datos del token
+            mint = data.get('mint') or (data.get('data') or {}).get('mint')
+            symbol = data.get('symbol') or (data.get('data') or {}).get('symbol', 'UNKNOWN')
+            name = data.get('name') or (data.get('data') or {}).get('name', symbol)
+            
+            if not mint:
+                logging.debug("Message without mint, skipping")
+                return
+                
+            # Intentar obtener precio inicial si está disponible
+            initial_price = 0
+            initial_market_cap = 0
+            
+            if isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
+                pair = data['pairs'][0]
+                initial_price = float(pair.get('priceUsd', pair.get('price', 0)))
+                initial_market_cap = float(pair.get('marketCap', 0))
+            
+            # Añadir token para monitoreo
+            await self.token_manager.add_token(
+                mint=mint,
+                symbol=symbol,
+                name=name,
+                initial_price=initial_price,
+                initial_market_cap=initial_market_cap
+            )
+            
+        except Exception as e:
+            logging.error(f"Error processing token data: {e}")
+    
+    async def disconnect(self):
+        """Desconecta del WebSocket"""
+        self.is_connected = False
+        if self.websocket:
+            await self.websocket.close()
 
-# -------------------- GET PRICE DATA --------------------
-async def get_price_data(mint: str) -> Optional[Dict[str, Any]]:
-    """
-    Strategy:
-    1) Try DexScreener public endpoint for token price and market cap
-    2) Optionally: try RPC (placeholder) - specialized parsing required for bonding curve
-    """
-    # DexScreener
-    try:
-        ds_url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-        async with httpx.AsyncClient(timeout=8.0) as client:
-            r = await client.get(ds_url)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("pairs") and len(data["pairs"]) > 0:
-                    pair = data["pairs"][0]
-                    price = float(pair.get("priceUsd") or pair.get("price") or 0)
-                    market_cap = float(pair.get("marketCap") or 0)
-                    try:
-                        vol = float(pair.get("volume", {}).get("h24", 0) or 0)
-                    except Exception:
-                        vol = 0
-                    return {"price": price, "market_cap": market_cap, "volume_24h": vol}
-    except Exception as e:
-        logger.debug("DexScreener error: %s", e)
+# ===========================
+# BOT PRINCIPAL
+# ===========================
 
-    # RPC fallback (placeholder) - can be implemented to parse bonding curve account
-    rpc = choose_rpc_url()
-    if not rpc:
-        return None
-    try:
-        payload = {"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[mint, {"encoding":"base64"}]}
-        async with httpx.AsyncClient(timeout=6.0) as client:
-            resp = await client.post(rpc, json=payload)
-            if resp.status_code == 200:
-                # Real on-chain price derivation for bonding curve requires decoding the program state.
-                # Placeholder: return None to let monitor wait and re-try or rely on DexScreener.
-                return None
-    except Exception as e:
-        logger.debug("RPC price fallback error: %s", e)
-    return None
-
-# -------------------- TELEGRAM ALERTS --------------------
-async def send_alert(mint: str, token_info: Dict[str, Any], gain_percent: float, elapsed_min: float, extra: Dict[str, Any]):
-    if not ENABLE_TELEGRAM:
-        logger.info("Telegram disabled; skipping alert for %s", mint)
-        return
-    if not application:
-        logger.warning("Telegram application not initialised.")
-        return
-
-    chat_id = TELEGRAM_CHAT_ID or CONFIG.get("telegram", {}).get("chat_id")
-    if not chat_id:
-        logger.warning("No TELEGRAM_CHAT_ID configured; cannot send alert.")
-        return
-
-    name = token_info.get("name", mint)
-    symbol = token_info.get("symbol", "")
-
-    market_cap = extra.get("market_cap") or extra.get("market_cap", 0) or 0
-    price = extra.get("price_at_alert") or extra.get("initial_price") or 0.0
-
-    message = (
-        f"🚀 *ALERTA DE PUMP DETECTADA* 🚀\n\n"
-        f"*Token:* {name} ({symbol})\n"
-        f"*Ganancia:* +{gain_percent:.1f}%\n"
-        f"*Tiempo desde mint:* {elapsed_min:.1f} min\n"
-        f"*Market Cap:* ${market_cap:,.0f}\n"
-        f"*Precio Actual:* {price:.8f} SOL\n\n"
-        f"*Mint Address:* `{mint}`\n\n"
-        f"🔗 Enlaces rápidos:"
-    )
-
-    keyboard = [
-        [InlineKeyboardButton("🎯 Pump.fun", url=f"https://pump.fun/{mint}")],
-        [InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/solana/{mint}")],
-        [InlineKeyboardButton("🛡️ RugCheck", url=f"https://rugcheck.xyz/tokens/{mint}")]
-    ]
-
-    try:
-        await application.bot.send_message(chat_id=chat_id,
-                                           text=message,
-                                           parse_mode=CONFIG.get("telegram", {}).get("parse_mode", "Markdown"),
-                                           reply_markup=InlineKeyboardMarkup(keyboard),
-                                           disable_web_page_preview=True)
-        logger.info("Alert sent for %s", mint)
-    except Exception as e:
-        logger.error("Failed to send telegram alert for %s: %s", mint, e)
-
-# -------------------- TELEGRAM COMMANDS --------------------
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global TELEGRAM_CHAT_ID
-    TELEGRAM_CHAT_ID = update.message.chat_id
-    await update.message.reply_text(
-        "🚀 *Bot Pump.fun - Alerta de Pumps*\n\n"
-        "Usa /cazar para iniciar monitoreo. /parar para detener.\n"
-        "*/cazar* - Iniciar monitoreo\n"
-        "*/parar* - Detener monitoreo\n"
-        "*/status* - Estado actual\n"
-        "*/tokens* - Tokens siendo monitoreados",
-        parse_mode=CONFIG.get("telegram", {}).get("parse_mode", "Markdown")
-    )
-
-async def cazar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ws_task
-    if ws_task and not ws_task.done():
-        await update.message.reply_text("🤔 Ya está monitoreando Pump.fun")
-        return
-    await update.message.reply_text("🏹 *Iniciando Monitor Pump.fun...*", parse_mode=CONFIG.get("telegram", {}).get("parse_mode", "Markdown"))
-    # init DB
-    await init_db()
-    ws_stop_event.clear()
-    ws_task = asyncio.create_task(pumpportal_listener())
-    await update.message.reply_text("✅ Monitor iniciado", parse_mode=CONFIG.get("telegram", {}).get("parse_mode", "Markdown"))
-
-async def parar_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ws_task
-    if not ws_task or ws_task.done():
-        await update.message.reply_text("🤔 No está monitoreando")
-        return
-    ws_stop_event.set()
-    # cancel token monitors
-    for mint in list(monitored_tokens.keys()):
-        await cleanup_token(mint, "monitor_stopped")
-    await update.message.reply_text("🛑 Monitor detenido")
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status_msg = "🛑 Monitor detenido"
-    if ws_task and not ws_task.done():
-        status_msg = (
-            f"✅ *Monitor Pump.fun Activo*\n\n"
-            f"🔍 *Tokens Monitoreados:* {len(monitored_tokens)}\n"
-            f"🎯 *Targets:* {ROI_TARGETS}\n"
-            f"🛑 *Dump threshold:* {DUMP_THRESHOLD_PERCENT}%\n"
-            f"⏰ *Duración Máxima:* {MAX_MONITOR_TIME_MIN}min\n\n"
-            f"📡 *Conectado a PumpPortal WebSocket*"
+class PumpFunBot:
+    """Bot principal de Pump.fun"""
+    
+    def __init__(self):
+        self.config = Config()
+        self.setup_logging()
+        
+        self.db = Database(self.config)
+        self.alert_engine = AlertEngine(self.config)
+        self.token_manager = TokenManager(self.config, self.db, self.alert_engine)
+        self.ws_client = WebSocketClient(self.config, self.token_manager)
+        
+        self.telegram_app = None
+        self.is_running = False
+        self.ws_task = None
+        
+    def setup_logging(self):
+        """Configura el sistema de logging"""
+        logging.basicConfig(
+            level=getattr(logging, self.config.LOG_LEVEL.upper()),
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.StreamHandler(sys.stdout),
+                logging.FileHandler('pump_bot.log', encoding='utf-8')
+            ]
         )
-    await update.message.reply_text(status_msg, parse_mode=CONFIG.get("telegram", {}).get("parse_mode", "Markdown"))
+        
+    async def start(self):
+        """Inicia el bot"""
+        self.is_running = True
+        
+        # Configurar manejo de señales
+        self.setup_signal_handlers()
+        
+        # Conectar a base de datos
+        await self.db.connect()
+        
+        # Iniciar bot de Telegram si está habilitado
+        if self.config.ENABLE_TELEGRAM and self.config.TELEGRAM_BOT_TOKEN:
+            await self.start_telegram_bot()
+        
+        # Iniciar WebSocket en una tarea separada
+        self.ws_task = asyncio.create_task(self.ws_client.connect())
+        
+        logging.info("🤖 Pump.fun Bot started successfully")
+        logging.info(f"🔧 Mode: {self.config.MODE}")
+        logging.info(f"📊 Alert rules: {len(self.config.ALERT_RULES)}")
+        logging.info(f"💾 Database: {'Enabled' if self.config.ENABLE_DB else 'Disabled'}")
+        logging.info(f"📱 Telegram: {'Enabled' if self.config.ENABLE_TELEGRAM else 'Disabled'}")
+        
+        # Mantener el bot corriendo
+        try:
+            while self.is_running:
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            await self.stop()
+    
+    async def stop(self):
+        """Detiene el bot gracefulmente"""
+        self.is_running = False
+        logging.info("🛑 Stopping Pump.fun Bot...")
+        
+        if self.ws_client:
+            await self.ws_client.disconnect()
+            
+        if self.token_manager:
+            await self.token_manager.stop_all_monitoring()
+            
+        if self.telegram_app:
+            await self.telegram_app.stop()
+            
+        await self.db.disconnect()
+        
+        if self.ws_task:
+            self.ws_task.cancel()
+            
+        logging.info("✅ Pump.fun Bot stopped successfully")
+    
+    def setup_signal_handlers(self):
+        """Configura manejo de señales para shutdown graceful"""
+        def signal_handler(signum, frame):
+            logging.info(f"Received signal {signum}, shutting down...")
+            asyncio.create_task(self.stop())
+            
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    
+    async def start_telegram_bot(self):
+        """Inicia el bot de Telegram"""
+        try:
+            self.telegram_app = Application.builder()\
+                .token(self.config.TELEGRAM_BOT_TOKEN)\
+                .build()
+            
+            # Añadir comandos
+            self.telegram_app.add_handler(CommandHandler("start", self.telegram_start))
+            self.telegram_app.add_handler(CommandHandler("status", self.telegram_status))
+            self.telegram_app.add_handler(CommandHandler("stats", self.telegram_stats))
+            self.telegram_app.add_handler(CommandHandler("rules", self.telegram_rules))
+            self.telegram_app.add_handler(CommandHandler("tokens", self.telegram_tokens))
+            self.telegram_app.add_handler(CommandHandler("pause", self.telegram_pause))
+            self.telegram_app.add_handler(CommandHandler("resume", self.telegram_resume))
+            
+            # Iniciar polling en segundo plano
+            asyncio.create_task(self.telegram_app.run_polling())
+            
+            logging.info("✅ Telegram bot started")
+            
+        except Exception as e:
+            logging.error(f"❌ Failed to start Telegram bot: {e}")
+    
+    # ===========================
+    # COMANDOS TELEGRAM
+    # ===========================
+    
+    async def telegram_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /start"""
+        welcome_text = """
+🤖 *BOT PUMP.FUN - ALERTAS PROFESIONALES*
 
-async def tokens_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not monitored_tokens:
-        await update.message.reply_text("🔍 No hay tokens siendo monitoreados")
-        return
-    message = f"🔍 *Tokens en Monitoreo ({len(monitored_tokens)}):*\n\n"
-    for i, (mint, data) in enumerate(monitored_tokens.items(), 1):
-        elapsed = (now_utc() - data['start_time']).total_seconds() / 60.0
-        message += f"{i}. `{mint}`\n   📛 {data.get('symbol')} | ⏰ {elapsed:.1f}min\n"
-    await update.message.reply_text(message, parse_mode=CONFIG.get("telegram", {}).get("parse_mode", "Markdown"))
+*Comandos disponibles:*
+/start - Muestra este mensaje
+/status - Estado del sistema
+/stats - Estadísticas de performance
+/rules - Reglas de alerta activas
+/tokens - Tokens en monitoreo
+/pause - Pausar monitoreo
+/resume - Reanudar monitoreo
 
-# -------------------- SHUTDOWN --------------------
-def _shutdown():
-    logger.info("Shutdown initiated. Cancelling tasks...")
-    ws_stop_event.set()
-    for mint, d in list(monitored_tokens.items()):
-        task = d.get("monitoring_task")
-        if task:
-            try:
-                task.cancel()
-            except Exception:
-                pass
+*Configuración:*
+• RPC: QuickNode/Helius
+• Database: PostgreSQL
+• Alertas: Parámetros dinámicos
+"""
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    async def telegram_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /status"""
+        status = self.token_manager.get_status()
+        
+        status_text = f"""
+📊 *ESTADO DEL SISTEMA*
 
-async def _on_shutdown(app: Application):
-    logger.info("Telegram app shutting down.")
-    _shutdown()
-    global db_pool
-    if db_pool:
-        await db_pool.close()
-        logger.info("DB pool closed.")
+*Monitoreo:*
+• Tokens activos: {status['monitored_tokens']}
+• Tareas: {status['active_tasks']}
+• WebSocket: {'✅ Conectado' if self.ws_client.is_connected else '❌ Desconectado'}
 
-# -------------------- MAIN --------------------
-def main():
-    global application
-    if not TELEGRAM_BOT_TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not configured. Exiting.")
-        return
+*Configuración:*
+• Reglas: {len(self.config.ALERT_RULES)}
+• Poll interval: {self.config.PRICE_POLL_INTERVAL_SEC}s
+• Max monitor: {self.config.MAX_MONITOR_TIME_MIN}min
+• Dump threshold: {self.config.DUMP_THRESHOLD_PERCENT}%
+"""
+        await update.message.reply_text(status_text, parse_mode='Markdown')
+    
+    async def telegram_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /stats - Estadísticas de performance"""
+        if not self.db.pool:
+            await update.message.reply_text("❌ Database no disponible")
+            return
+            
+        try:
+            async with self.db.pool.acquire() as conn:
+                # Estadísticas básicas
+                result = await conn.fetchrow('''
+                    SELECT 
+                        COUNT(*) as total_alerts,
+                        AVG(gain_percent) as avg_gain,
+                        AVG(time_elapsed_min) as avg_time
+                    FROM token_alerts 
+                    WHERE created_at >= NOW() - INTERVAL '24 hours'
+                ''')
+                
+                stats_text = f"""
+📈 *ESTADÍSTICAS (24h)*
 
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    # register handlers
-    application.add_handler(CommandHandler("start", start_cmd))
-    application.add_handler(CommandHandler("cazar", cazar_cmd))
-    application.add_handler(CommandHandler("parar", parar_cmd))
-    application.add_handler(CommandHandler("status", status_cmd))
-    application.add_handler(CommandHandler("tokens", tokens_cmd))
+• Alertas totales: {result['total_alerts']}
+• Ganancia promedio: {float(result['avg_gain'] or 0):.1f}%
+• Tiempo promedio: {float(result['avg_time'] or 0):.1f}min
 
-    application.post_init(lambda app: logger.info("Telegram app initialized. Waiting for commands."))
-    application.post_shutdown(_on_shutdown)
+*Reglas más efectivas:*
+"""
+                
+                # Estadísticas por regla
+                rules_result = await conn.fetch('''
+                    SELECT 
+                        alert_rule_name,
+                        COUNT(*) as count,
+                        AVG(gain_percent) as avg_gain
+                    FROM token_alerts 
+                    WHERE created_at >= NOW() - INTERVAL '24 hours'
+                    GROUP BY alert_rule_name
+                    ORDER BY count DESC
+                ''')
+                
+                for rule in rules_result:
+                    stats_text += f"• {rule['alert_rule_name']}: {rule['count']} alerts, avg {float(rule['avg_gain'] or 0):.1f}%\n"
+                
+                await update.message.reply_text(stats_text, parse_mode='Markdown')
+                
+        except Exception as e:
+            logging.error(f"Error getting stats: {e}")
+            await update.message.reply_text("❌ Error obteniendo estadísticas")
+    
+    async def telegram_rules(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /rules - Muestra reglas activas"""
+        rules_text = "🎯 *REGLAS DE ALERTA ACTIVAS*\n\n"
+        
+        for rule in self.config.ALERT_RULES:
+            rules_text += f"• *{rule['name']}*: +{rule['alert_percent']}% en {rule['time_window_min']}min\n"
+            rules_text += f"  _{rule['description']}_\n\n"
+            
+        await update.message.reply_text(rules_text, parse_mode='Markdown')
+    
+    async def telegram_tokens(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /tokens - Tokens en monitoreo"""
+        status = self.token_manager.get_status()
+        
+        if not status['monitored_tokens']:
+            await update.message.reply_text("🔍 No hay tokens en monitoreo")
+            return
+            
+        tokens_text = f"🔍 *TOKENS EN MONITOREO ({status['monitored_tokens']})*\n\n"
+        
+        for i, mint in enumerate(status['tokens'][:10], 1):  # Máximo 10 tokens
+            token = self.token_manager.monitored_tokens[mint]
+            elapsed = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60
+            tokens_text += f"{i}. *{token.symbol}* - {elapsed:.1f}min\n"
+            tokens_text += f"   `{mint[:16]}...`\n"
+            
+        if status['monitored_tokens'] > 10:
+            tokens_text += f"\n... y {status['monitored_tokens'] - 10} más"
+            
+        await update.message.reply_text(tokens_text, parse_mode='Markdown')
+    
+    async def telegram_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /pause - Pausar monitoreo"""
+        await self.ws_client.disconnect()
+        await self.token_manager.stop_all_monitoring()
+        await update.message.reply_text("⏸️ Monitoreo pausado")
+    
+    async def telegram_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Comando /resume - Reanudar monitoreo"""
+        asyncio.create_task(self.ws_client.connect())
+        await update.message.reply_text("▶️ Monitoreo reanudado")
 
-    logger.info("--- Bot Pump.fun - Ready. Use /cazar to start monitoring ---")
-    application.run_polling()
+# ===========================
+# EJECUCIÓN PRINCIPAL
+# ===========================
+
+async def main():
+    """Función principal"""
+    bot = PumpFunBot()
+    
+    try:
+        await bot.start()
+    except KeyboardInterrupt:
+        logging.info("Received keyboard interrupt")
+    except Exception as e:
+        logging.error(f"Bot crashed: {e}")
+    finally:
+        await bot.stop()
 
 if __name__ == "__main__":
-    main()
+    # Verificar variables de entorno críticas
+    if not os.getenv('TELEGRAM_BOT_TOKEN'):
+        print("❌ TELEGRAM_BOT_TOKEN no configurado")
+        sys.exit(1)
+        
+    if not os.getenv('DATABASE_URL'):
+        print("❌ DATABASE_URL no configurado")
+        sys.exit(1)
+    
+    # Ejecutar bot
+    asyncio.run(main())
