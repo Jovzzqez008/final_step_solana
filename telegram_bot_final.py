@@ -20,7 +20,7 @@ from decimal import Decimal
 
 # Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackContext
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ===========================
 # CONFIGURACIÓN Y CONSTANTES
@@ -731,6 +731,7 @@ class PumpFunBot:
         self.telegram_app = None
         self.is_running = False
         self.ws_task = None
+        self.telegram_polling_task = None
 
     def setup_logging(self):
         """Configura el sistema de logging (solo consola, compatible con Railway)"""
@@ -783,13 +784,24 @@ class PumpFunBot:
         if self.token_manager:
             await self.token_manager.stop_all_monitoring()
             
+        # Detener Telegram de manera segura
         if self.telegram_app:
             await self.telegram_app.stop()
+            if self.telegram_polling_task:
+                self.telegram_polling_task.cancel()
+                try:
+                    await self.telegram_polling_task
+                except asyncio.CancelledError:
+                    pass
             
         await self.db.disconnect()
         
         if self.ws_task:
             self.ws_task.cancel()
+            try:
+                await self.ws_task
+            except asyncio.CancelledError:
+                pass
             
         logging.info("✅ Pump.fun Bot stopped successfully")
     
@@ -803,7 +815,7 @@ class PumpFunBot:
         signal.signal(signal.SIGTERM, signal_handler)
     
     async def start_telegram_bot(self):
-        """Inicia el bot de Telegram"""
+        """Inicia el bot de Telegram de manera segura"""
         try:
             self.telegram_app = Application.builder()\
                 .token(self.config.TELEGRAM_BOT_TOKEN)\
@@ -818,10 +830,15 @@ class PumpFunBot:
             self.telegram_app.add_handler(CommandHandler("pause", self.telegram_pause))
             self.telegram_app.add_handler(CommandHandler("resume", self.telegram_resume))
             
-            # Iniciar polling en segundo plano
-            asyncio.create_task(self.telegram_app.run_polling())
+            # Inicializar sin iniciar polling inmediatamente
+            await self.telegram_app.initialize()
             
-            logging.info("✅ Telegram bot started")
+            # Iniciar polling en una tarea separada
+            self.telegram_polling_task = asyncio.create_task(
+                self.telegram_app.start()
+            )
+            
+            logging.info("✅ Telegram bot started successfully")
             
         except Exception as e:
             logging.error(f"❌ Failed to start Telegram bot: {e}")
