@@ -1,0 +1,35 @@
+{
+  "telegram": {
+    "chat_id": "TU_CHAT_ID",
+    "parse_mode": "Markdown"
+  },
+  "filters": {
+    "min_marketcap": 0,              
+    "min_liquidity_sol": 0.5,        
+    "min_holders": 50,               
+    "roi_targets": [
+      {
+        "percent": 120,
+        "minutes": 10
+      },
+      {
+        "percent": 300,
+        "minutes": 8
+      }
+    ]
+  },
+  "rpc": {
+    "primary": "https://mainnet.helius-rpc.com/?api-key=ac3de0dc-4108-489d-a8f8-96ab2f0ce341",
+    "fallback": "https://light-summer-forest.solana-mainnet.quiknode.pro/1a07604f8866ea5c98ae2179369a2ed3100b7d00/",
+    "timeout_seconds": 5,
+    "max_retries": 3
+  },
+  "database": {
+    "enabled": true,
+    "table_name": "signals_history"
+  },
+  "advanced": {
+    "track_only_new_tokens": true,
+    "max_concurrent_monitors": 10
+  }
+}
