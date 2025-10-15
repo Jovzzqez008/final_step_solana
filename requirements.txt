@@ -4,3 +4,4 @@ aiohttp==3.9.1
 asyncpg==0.29.0
 python-dotenv==1.0.0
 solana==0.30.0
+httpx==0.24.1
