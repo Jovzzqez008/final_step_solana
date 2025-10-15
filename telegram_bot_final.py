@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 🤖 BOT PUMP.FUN - ALERTAS PROFESIONALES
-Arquitectura completa con QuickNode/Helius RPC + PostgreSQL + Parámetros dinámicos
+Versión corregida: Telegram funcionando + Precios iniciales robustos
 """
 
 import os
@@ -62,9 +62,9 @@ class Config:
         self.ALERT_RULES = self.data.get('alert_rules', [
             {
                 "name": "moon_shot",
-                "alert_percent": 500,
+                "alert_percent": 120,
                 "time_window_min": 8,
-                "description": "500% en 8 minutos"
+                "description": "120% en 8 minutos"
             }
         ])
         
@@ -707,28 +707,24 @@ class WebSocketClient:
                 logging.debug("Message without mint, skipping")
                 return
                 
-            # Intentar obtener precio inicial si está disponible
+            # Intentar obtener precio inicial con reintentos
             initial_price = 0
             initial_market_cap = 0
             
-            # Primero intentar obtener precio de DexScreener para mayor precisión
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5) as response:
-                        if response.status == 200:
-                            dex_data = await response.json()
-                            if dex_data.get('pairs') and len(dex_data['pairs']) > 0:
-                                pair = dex_data['pairs'][0]
-                                initial_price = float(pair.get('priceUsd', 0))
-                                initial_market_cap = float(pair.get('marketCap', 0))
-            except Exception as e:
-                logging.debug(f"Failed to get initial price from DexScreener for {mint}: {e}")
-            
-            # Si no se pudo obtener de DexScreener, usar datos del WebSocket
-            if initial_price <= 0 and isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
+            # Estrategia: usar datos del WebSocket primero, luego DexScreener como fallback
+            if isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
                 pair = data['pairs'][0]
                 initial_price = float(pair.get('priceUsd', pair.get('price', 0)))
                 initial_market_cap = float(pair.get('marketCap', 0))
+            
+            # Si el precio del WebSocket es 0, intentar con DexScreener
+            if initial_price <= 0:
+                initial_price, initial_market_cap = await self._get_price_from_dexscreener(mint)
+            
+            # Si aún no tenemos precio, intentar una vez más después de un delay
+            if initial_price <= 0:
+                await asyncio.sleep(2)  # Pequeño delay
+                initial_price, initial_market_cap = await self._get_price_from_dexscreener(mint)
             
             # Solo monitorear si tenemos un precio válido
             if initial_price > 0:
@@ -740,11 +736,29 @@ class WebSocketClient:
                     initial_price=initial_price,
                     initial_market_cap=initial_market_cap
                 )
+                logging.info(f"✅ Token {symbol} added with price: ${initial_price:.8f}")
             else:
-                logging.warning(f"Skipping token {mint} with invalid price: {initial_price}")
+                logging.warning(f"❌ Skipping token {mint} - couldn't get valid price after retries")
             
         except Exception as e:
             logging.error(f"Error processing token data: {e}")
+    
+    async def _get_price_from_dexscreener(self, mint: str) -> tuple[float, float]:
+        """Obtiene precio desde DexScreener con manejo de errores"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5) as response:
+                    if response.status == 200:
+                        dex_data = await response.json()
+                        if dex_data.get('pairs') and len(dex_data['pairs']) > 0:
+                            pair = dex_data['pairs'][0]
+                            price = float(pair.get('priceUsd', 0))
+                            market_cap = float(pair.get('marketCap', 0))
+                            return price, market_cap
+        except Exception as e:
+            logging.debug(f"DexScreener fetch failed for {mint}: {e}")
+        
+        return 0, 0
     
     async def disconnect(self):
         """Desconecta del WebSocket"""
@@ -771,7 +785,7 @@ class PumpFunBot:
         self.telegram_app = None
         self.is_running = False
         self.ws_task = None
-        self.telegram_polling_task = None
+        self.telegram_task = None
 
     def setup_logging(self):
         """Configura el sistema de logging (solo consola, compatible con Railway)"""
@@ -827,12 +841,7 @@ class PumpFunBot:
         # Detener Telegram de manera segura
         if self.telegram_app:
             await self.telegram_app.stop()
-            if self.telegram_polling_task:
-                self.telegram_polling_task.cancel()
-                try:
-                    await self.telegram_polling_task
-                except asyncio.CancelledError:
-                    pass
+            await self.telegram_app.shutdown()
             
         await self.db.disconnect()
         
@@ -870,15 +879,15 @@ class PumpFunBot:
             self.telegram_app.add_handler(CommandHandler("pause", self.telegram_pause))
             self.telegram_app.add_handler(CommandHandler("resume", self.telegram_resume))
             
-            # Inicializar sin iniciar polling inmediatamente
-            await self.telegram_app.initialize()
-            
-            # Iniciar polling en una tarea separada
-            self.telegram_polling_task = asyncio.create_task(
-                self.telegram_app.start()
+            # Iniciar polling en una tarea separada usando run_polling
+            self.telegram_task = asyncio.create_task(
+                self.telegram_app.run_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=Update.ALL_TYPES
+                )
             )
             
-            logging.info("✅ Telegram bot started successfully")
+            logging.info("✅ Telegram bot polling started successfully")
             
         except Exception as e:
             logging.error(f"❌ Failed to start Telegram bot: {e}")
@@ -907,6 +916,7 @@ class PumpFunBot:
 • Alertas: Parámetros dinámicos
 """
         await update.message.reply_text(welcome_text, parse_mode='Markdown')
+        logging.info(f"📱 Comando /start recibido de {update.effective_user.id}")
     
     async def telegram_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Comando /status"""
