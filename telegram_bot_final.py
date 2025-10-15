@@ -207,14 +207,6 @@ class RPCClient:
         except Exception as e:
             logging.debug(f"DexScreener price fetch failed for {mint}: {e}")
             
-        # Fallback: intentar con RPC para datos on-chain
-        try:
-            # Aquí podrías implementar lógica para obtener precio desde bonding curve
-            # usando getAccountInfo del programa de Pump.fun
-            pass
-        except Exception as e:
-            logging.debug(f"RPC price fetch failed for {mint}: {e}")
-            
         return None
 
 # ===========================
@@ -386,41 +378,54 @@ class AlertEngine:
     async def evaluate_token(self, token: TokenData, current_price: float, 
                            current_market_cap: float) -> List[AlertData]:
         """Evalúa un token contra todas las reglas de alerta"""
-        if current_price <= 0:
+        # Validación robusta de precios
+        if current_price <= 0 or token.initial_price <= 0:
             return []
             
-        # Calcular métricas
-        gain_percent = ((current_price - token.initial_price) / token.initial_price) * 100
-        elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60
-        
-        triggered_alerts = []
-        
-        for rule in self.alert_rules:
-            if self._check_rule(rule, gain_percent, elapsed_min):
-                alert = AlertData(
-                    token_address=token.mint,
-                    rule_name=rule['name'],
-                    gain_percent=gain_percent,
-                    time_elapsed_min=elapsed_min,
-                    price_at_alert=current_price,
-                    market_cap_at_alert=current_market_cap,
-                    extra_data={
-                        'initial_price': token.initial_price,
-                        'max_price': token.max_price,
-                        'symbol': token.symbol,
-                        'name': token.name
-                    }
-                )
-                triggered_alerts.append(alert)
-                
-        return triggered_alerts
+        try:
+            # Calcular métricas con protección contra división por cero
+            gain_percent = ((current_price - token.initial_price) / token.initial_price) * 100
+            elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60
+            
+            triggered_alerts = []
+            
+            for rule in self.alert_rules:
+                if self._check_rule(rule, gain_percent, elapsed_min):
+                    alert = AlertData(
+                        token_address=token.mint,
+                        rule_name=rule['name'],
+                        gain_percent=gain_percent,
+                        time_elapsed_min=elapsed_min,
+                        price_at_alert=current_price,
+                        market_cap_at_alert=current_market_cap,
+                        extra_data={
+                            'initial_price': token.initial_price,
+                            'max_price': token.max_price,
+                            'symbol': token.symbol,
+                            'name': token.name
+                        }
+                    )
+                    triggered_alerts.append(alert)
+                    
+            return triggered_alerts
+            
+        except ZeroDivisionError:
+            logging.warning(f"Division by zero for token {token.mint}, initial_price: {token.initial_price}")
+            return []
+        except Exception as e:
+            logging.error(f"Error evaluating token {token.mint}: {e}")
+            return []
     
     def _check_rule(self, rule: Dict, gain_percent: float, elapsed_min: float) -> bool:
         """Verifica si se cumple una regla específica"""
-        required_gain = rule['alert_percent']
-        time_window = rule['time_window_min']
-        
-        return gain_percent >= required_gain and elapsed_min <= time_window
+        try:
+            required_gain = rule['alert_percent']
+            time_window = rule['time_window_min']
+            
+            return gain_percent >= required_gain and elapsed_min <= time_window
+        except Exception as e:
+            logging.error(f"Error checking rule: {e}")
+            return False
 
 # ===========================
 # GESTOR DE TOKENS
@@ -443,6 +448,11 @@ class TokenManager:
         if mint in self.monitored_tokens:
             logging.debug(f"Token {mint} already being monitored")
             return
+        
+        # Validar que el precio inicial sea válido
+        if initial_price <= 0:
+            logging.warning(f"Token {mint} has invalid initial price: {initial_price}, skipping")
+            return
             
         token = TokenData(
             mint=mint,
@@ -461,7 +471,7 @@ class TokenManager:
         task = asyncio.create_task(self._monitor_token(mint))
         self.monitor_tasks[mint] = task
         
-        logging.info(f"🔍 Started monitoring {symbol} ({mint[:8]}...)")
+        logging.info(f"🔍 Started monitoring {symbol} ({mint[:8]}...) - Initial: ${initial_price:.8f}")
     
     async def _monitor_token(self, mint: str):
         """Tarea asincrónica para monitorear un token específico"""
@@ -490,6 +500,11 @@ class TokenManager:
                     current_price = price_data['price']
                     current_market_cap = price_data['market_cap']
                     
+                    # Validar precio actual
+                    if current_price <= 0:
+                        await asyncio.sleep(self.config.PRICE_POLL_INTERVAL_SEC)
+                        continue
+                    
                     # Actualizar precio máximo
                     if current_price > token.max_price:
                         token.max_price = current_price
@@ -503,11 +518,14 @@ class TokenManager:
                     
                     # Verificar dump
                     if token.max_price > 0:
-                        loss_from_max = ((current_price - token.max_price) / token.max_price) * 100
-                        if loss_from_max <= self.config.DUMP_THRESHOLD_PERCENT:
-                            logging.info(f"📉 Token {token.symbol} dumped {loss_from_max:.1f}%")
-                            await self._remove_token(mint, "dumped")
-                            break
+                        try:
+                            loss_from_max = ((current_price - token.max_price) / token.max_price) * 100
+                            if loss_from_max <= self.config.DUMP_THRESHOLD_PERCENT:
+                                logging.info(f"📉 Token {token.symbol} dumped {loss_from_max:.1f}%")
+                                await self._remove_token(mint, "dumped")
+                                break
+                        except ZeroDivisionError:
+                            pass  # max_price no debería ser 0, pero por seguridad
                     
                     # Evaluar alertas
                     alerts = await self.alert_engine.evaluate_token(
@@ -540,6 +558,10 @@ class TokenManager:
         if mint in self.monitor_tasks:
             task = self.monitor_tasks[mint]
             task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
             del self.monitor_tasks[mint]
             
         logging.info(f"Removed token {mint}: {reason}")
@@ -579,10 +601,10 @@ class TokenManager:
 **Regla Activada:** {alert.rule_name}
 
 📊 **Métricas:**
-• Precio Actual: {alert.price_at_alert:.8f} SOL
+• Precio Actual: ${alert.price_at_alert:.8f}
 • Market Cap: ${alert.market_cap_at_alert:,.0f}
-• Precio Inicial: {token.initial_price:.8f} SOL
-• Máximo Alcanzado: {token.max_price:.8f} SOL
+• Precio Inicial: ${token.initial_price:.8f}
+• Máximo Alcanzado: ${token.max_price:.8f}
 
 🔗 **Enlaces Rápidos:**
 • [Pump.fun](https://pump.fun/{token.mint})
@@ -689,19 +711,37 @@ class WebSocketClient:
             initial_price = 0
             initial_market_cap = 0
             
-            if isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
+            # Primero intentar obtener precio de DexScreener para mayor precisión
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}", timeout=5) as response:
+                        if response.status == 200:
+                            dex_data = await response.json()
+                            if dex_data.get('pairs') and len(dex_data['pairs']) > 0:
+                                pair = dex_data['pairs'][0]
+                                initial_price = float(pair.get('priceUsd', 0))
+                                initial_market_cap = float(pair.get('marketCap', 0))
+            except Exception as e:
+                logging.debug(f"Failed to get initial price from DexScreener for {mint}: {e}")
+            
+            # Si no se pudo obtener de DexScreener, usar datos del WebSocket
+            if initial_price <= 0 and isinstance(data.get('pairs'), list) and len(data['pairs']) > 0:
                 pair = data['pairs'][0]
                 initial_price = float(pair.get('priceUsd', pair.get('price', 0)))
                 initial_market_cap = float(pair.get('marketCap', 0))
             
-            # Añadir token para monitoreo
-            await self.token_manager.add_token(
-                mint=mint,
-                symbol=symbol,
-                name=name,
-                initial_price=initial_price,
-                initial_market_cap=initial_market_cap
-            )
+            # Solo monitorear si tenemos un precio válido
+            if initial_price > 0:
+                # Añadir token para monitoreo
+                await self.token_manager.add_token(
+                    mint=mint,
+                    symbol=symbol,
+                    name=name,
+                    initial_price=initial_price,
+                    initial_market_cap=initial_market_cap
+                )
+            else:
+                logging.warning(f"Skipping token {mint} with invalid price: {initial_price}")
             
         except Exception as e:
             logging.error(f"Error processing token data: {e}")
