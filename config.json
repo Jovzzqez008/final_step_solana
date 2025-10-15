@@ -1,11 +1,14 @@
 {
-  "websocket": {
-    "uri": "wss://pumpportal.fun/api/data"
-  },
+  "telegram_bot_token": "",
+  "telegram_chat_id": "",
+  "database_url": "",
+  "quicknode_rpc_url": "",
+  "helius_rpc_url": "",
+  "pumpportal_wss": "wss://pumpportal.fun/api/data",
   "alert_rules": [
     {
       "name": "momentum_300_15",
-      "alert_percent": 300,
+      "alert_percent": 300.0,
       "time_window_min": 15,
       "description": "300% en 15 minutos"
     }
@@ -13,6 +16,9 @@
   "monitoring": {
     "max_monitor_time_min": 30,
     "dump_threshold_percent": -50,
-    "price_poll_interval_sec": 5
-  }
+    "price_poll_interval_sec": 5,
+    "max_concurrent_monitors": 40
+  },
+  "log_level": "INFO",
+  "health_port": 8080
 }
