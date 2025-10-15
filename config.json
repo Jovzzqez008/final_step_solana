@@ -1,0 +1,45 @@
+{
+  "alert_rules": [
+    {
+      "name": "moon_shot",
+      "alert_percent": 500,
+      "time_window_min": 8,
+      "description": "500% en 8 minutos"
+    },
+    {
+      "name": "quick_pump",
+      "alert_percent": 300,
+      "time_window_min": 15,
+      "description": "300% en 15 minutos"
+    },
+    {
+      "name": "steady_gainer", 
+      "alert_percent": 200,
+      "time_window_min": 25,
+      "description": "200% en 25 minutos"
+    }
+  ],
+  "monitoring": {
+    "max_monitor_time_min": 30,
+    "dump_threshold_percent": -50,
+    "price_poll_interval_sec": 5,
+    "max_concurrent_tokens": 50
+  },
+  "websocket": {
+    "uri": "wss://pumpportal.fun/api/data",
+    "subscribe_method": "subscribeNewToken",
+    "reconnect_delay_sec": 5,
+    "max_reconnect_attempts": 10
+  },
+  "rpc": {
+    "preferred_provider": "quicknode",
+    "fallback_provider": "helius",
+    "timeout_sec": 10,
+    "retry_attempts": 3
+  },
+  "database": {
+    "enable_history": true,
+    "log_all_prices": false,
+    "cleanup_interval_hours": 24
+  }
+}
