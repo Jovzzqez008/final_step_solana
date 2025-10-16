@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     g++ \
     && rm -rf /var/lib/apt/lists/*
 
-# Copiar requirements primero
+# Copiar requirements primero (para cache de Docker)
 COPY requirements.txt .
 
 # Instalar dependencias Python
@@ -17,9 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copiar el resto de archivos
 COPY . .
 
-# Usuario no-root para seguridad
-RUN useradd -m -u 1000 worker
-USER worker
+# Puerto expuesto
+EXPOSE 8080
 
-# Comando de ejecución
+# Comando de inicio
 CMD ["python", "telegram_bot_final.py"]
