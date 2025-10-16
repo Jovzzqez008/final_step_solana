@@ -4,13 +4,14 @@
   "database_url": "",
   "quicknode_rpc_url": "",
   "helius_rpc_url": "",
+  "quicknode_wss": "",
   "pumpportal_wss": "wss://pumpportal.fun/api/data",
   "alert_rules": [
     {
-      "name": "momentum_300_15",
-      "alert_percent": 300.0,
+      "name": "momentum_120_15",
+      "alert_percent": 120.0,
       "time_window_min": 15,
-      "description": "300% en 15 minutos"
+      "description": "120% en 15 minutos"
     }
   ],
   "monitoring": {
