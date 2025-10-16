@@ -1,122 +1,84 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 telegram_bot_final.py
-Bot de monitorización Pump.fun (sin compras automáticas).
-- Detecta nuevos mints (Pump.fun) desde PumpPortal WSS / RPC
-- Monitorea bonding curve on-chain via getAccountInfo y decodifica campos
-- Envía alertas a Telegram si se cumple patrón de momentum
-- Persistencia opcional en PostgreSQL
-- Health / metrics con FastAPI
-- Logging a stdout (Railway-compatible)
+Bot de monitorización Pump.fun — Detecta mints, monitorea bonding curve on-chain,
+aplica regla de momentum (+120% en 15min), notifica por Telegram, guarda histórico en Postgres,
+exposición health/metrics vía FastAPI para Railway.
+No hace compras automáticas.
 """
 
 import os
 import sys
 import json
 import base64
+import time
 import asyncio
 import logging
 import signal
 import struct
-import time
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
-from datetime import datetime, timezone, timedelta
 
 import aiohttp
 import asyncpg
 import websockets
-
-from fastapi import FastAPI
-import uvicorn
-
-# Telegram
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
+from fastapi import FastAPI, Request, BackgroundTasks
+from prometheus_client import Counter, Gauge, generate_latest, CONTENT_TYPE_LATEST
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# -----------------------
-# IDL (pump.fun) embedded
-# -----------------------
-# You provided the IDL in the prompt; we embed the minimal relevant portion here.
-PUMP_FUN_IDL = {
-  "version": "0.1.0",
-  "name": "pump",
-  "accounts": [
-    {
-      "name": "BondingCurve",
-      "type": {
-        "kind": "struct",
-        "fields": [
-          { "name": "virtualTokenReserves", "type": "u64" },
-          { "name": "virtualSolReserves", "type": "u64" },
-          { "name": "realTokenReserves", "type": "u64" },
-          { "name": "realSolReserves", "type": "u64" },
-          { "name": "tokenTotalSupply", "type": "u64" },
-          { "name": "complete", "type": "bool" }
-        ]
-      }
-    }
-  ],
-  "metadata": {
-    "address": "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-  }
-}
+# --------------------------
+# CONFIG (env first, fallback to config.json)
+# --------------------------
 
-# -----------------------
-# CONFIG
-# -----------------------
 class Config:
-    def __init__(self, config_path: str = "config.json"):
-        self.config_path = os.path.join(os.path.dirname(__file__), config_path)
-        self._load()
-    def _load(self):
-        data = {}
-        if os.path.exists(self.config_path):
+    def __init__(self, path: str = None):
+        self.path = path or os.path.join(os.path.dirname(__file__), 'config.json')
+        self.load()
+
+    def load(self):
+        cfg = {}
+        if os.path.exists(self.path):
             try:
-                with open(self.config_path, 'r') as f:
-                    data = json.load(f)
+                with open(self.path, 'r') as f:
+                    cfg = json.load(f)
             except Exception:
-                data = {}
-        # Environment variables take precedence
-        self.TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', data.get('telegram_bot_token', ''))
-        self.TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', data.get('telegram_chat_id', ''))
-        self.DATABASE_URL = os.getenv('DATABASE_URL', data.get('database_url', ''))
-        self.QUICKNODE_RPC_URL = os.getenv('QUICKNODE_RPC_URL', data.get('quicknode_rpc_url', ''))
-        self.HELIUS_RPC_URL = os.getenv('HELIUS_RPC_URL', data.get('helius_rpc_url', ''))
-        self.PUMPPORTAL_WSS = os.getenv('PUMPPORTAL_WSS', data.get('pumpportal_wss', 'wss://pumpportal.fun/api/data'))
-        # Monitoring params
-        self.ALERT_RULES = data.get('alert_rules', [{
-            "name": "momentum_300_15",
-            "alert_percent": 300.0,
-            "time_window_min": 15,
-            "description": "300% en 15 minutos"
-        }])
-        monitoring = data.get('monitoring', {})
+                cfg = {}
+        # ENV override
+        self.TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', cfg.get('telegram_bot_token', ''))
+        self.TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', cfg.get('telegram_chat_id', ''))
+        self.DATABASE_URL = os.getenv('DATABASE_URL', cfg.get('database_url', ''))
+        self.QUICKNODE_RPC_URL = os.getenv('QUICKNODE_RPC_URL', cfg.get('quicknode_rpc_url', ''))
+        self.HELIUS_RPC_URL = os.getenv('HELIUS_RPC_URL', cfg.get('helius_rpc_url', ''))
+        self.PUMPPORTAL_WSS = os.getenv('PUMPPORTAL_WSS', cfg.get('pumpportal_wss', 'wss://pumpportal.fun/api/data'))
+        self.LOG_LEVEL = os.getenv('LOG_LEVEL', cfg.get('log_level', 'INFO'))
+        # alert rules
+        self.ALERT_RULES = cfg.get('alert_rules', [
+            {"name": "momentum_120_15", "alert_percent": 120.0, "time_window_min": 15, "description": "120% en 15 minutos"}
+        ])
+        monitoring = cfg.get('monitoring', {})
         self.MAX_MONITOR_TIME_MIN = float(os.getenv('MAX_MONITOR_TIME_MIN', monitoring.get('max_monitor_time_min', 30)))
         self.DUMP_THRESHOLD_PERCENT = float(os.getenv('DUMP_THRESHOLD_PERCENT', monitoring.get('dump_threshold_percent', -50)))
         self.PRICE_POLL_INTERVAL_SEC = float(os.getenv('PRICE_POLL_INTERVAL_SEC', monitoring.get('price_poll_interval_sec', 5)))
         self.MAX_CONCURRENT_MONITORS = int(os.getenv('MAX_CONCURRENT_MONITORS', monitoring.get('max_concurrent_monitors', 40)))
-        # Other
-        self.LOG_LEVEL = os.getenv('LOG_LEVEL', data.get('log_level', 'INFO'))
-        self.HEALTH_PORT = int(os.getenv('HEALTH_PORT', data.get('health_port', 8080)))
-        self.ENABLE_DB = os.getenv('ENABLE_DB', str(data.get('enable_db', 'true'))).lower() == 'true'
-        self.ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', str(data.get('enable_telegram', 'true'))).lower() == 'true'
-        self.MODE = os.getenv('MODE', data.get('mode', 'PROD'))
+        self.HEALTH_PORT = int(os.getenv('HEALTH_PORT', cfg.get('health_port', 8080)))
 
-# -----------------------
-# Logging setup function (Railway-friendly)
-# -----------------------
-def setup_logging(config: Config):
+# --------------------------
+# Logging (Railway-friendly: stdout only)
+# --------------------------
+
+def setup_logging(level: str = "INFO"):
     logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL.upper(), logging.INFO),
+        level=getattr(logging, level.upper(), logging.INFO),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
-# -----------------------
-# Data models
-# -----------------------
+# --------------------------
+# DATA MODELS
+# --------------------------
+
 @dataclass
 class TokenData:
     mint: str
@@ -127,8 +89,6 @@ class TokenData:
     max_price: float
     start_time: datetime
     status: str = "monitoring"
-    bonding_curve: Optional[str] = None
-    last_checked: Optional[datetime] = None
     metadata: Dict = None
 
     def __post_init__(self):
@@ -149,641 +109,620 @@ class AlertData:
         if self.extra_data is None:
             self.extra_data = {}
 
-# -----------------------
-# RPC Client
-# -----------------------
+# --------------------------
+# Metrics
+# --------------------------
+
+MET_TOKENS_MONITORED = Gauge("pump_bot_tokens_monitored", "Number of tokens currently monitored")
+MET_ALERTS = Counter("pump_bot_alerts_total", "Total alerts sent")
+
+# --------------------------
+# IDL excerpt (pump.fun) — you provided earlier; embed address & BondingCurve layout
+# --------------------------
+PUMP_IDL = {
+  "version":"0.1.0",
+  "name":"pump",
+  "metadata":{"address":"6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"},
+  # ... instructions/events/accounts truncated for brevity in runtime use
+}
+
+PUMP_PROGRAM_ID = PUMP_IDL["metadata"]["address"]
+
+# BondingCurve layout per IDL:
+# virtualTokenReserves: u64
+# virtualSolReserves: u64
+# realTokenReserves: u64
+# realSolReserves: u64
+# tokenTotalSupply: u64
+# complete: bool
+# Anchor accounts have 8-byte discriminator at start; fields follow little-endian.
+BONDING_CURVE_STRUCT_FMT = "<QQQQQ?"  # 5 x u64 + bool (note: '?' may map to 1 byte)
+
+# --------------------------
+# RPC Client (QuickNode/Helius fallback), plus getAccountInfo decode
+# --------------------------
+
 class RPCClient:
     def __init__(self, config: Config):
         self.config = config
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.current_provider = 'quicknode' if self.config.QUICKNODE_RPC_URL else 'helius'
-        # providers order
-        self.providers = []
-        if self.config.QUICKNODE_RPC_URL:
-            self.providers.append(('quicknode', self.config.QUICKNODE_RPC_URL))
-        if self.config.HELIUS_RPC_URL:
-            self.providers.append(('helius', self.config.HELIUS_RPC_URL))
-        # fallback public
+        self.providers = [p for p in [config.QUICKNODE_RPC_URL, config.HELIUS_RPC_URL] if p]
         if not self.providers:
-            self.providers.append(('public', "https://api.mainnet-beta.solana.com"))
-        self.provider_idx = 0
+            # fallback public
+            self.providers = ["https://api.mainnet-beta.solana.com"]
+        self.idx = 0
+        self.session = aiohttp.ClientSession()
 
-    async def __aenter__(self):
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        return self
+    def _current(self):
+        return self.providers[self.idx % len(self.providers)]
 
-    async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
-
-    def _current_url(self):
-        return self.providers[self.provider_idx][1]
-
-    async def _rotate_provider(self):
-        self.provider_idx = (self.provider_idx + 1) % len(self.providers)
-        logging.info(f"Switched RPC provider to {self.providers[self.provider_idx][0]}")
-
-    async def make_rpc_call(self, method: str, params: list, timeout: int = 10) -> Any:
-        url = self._current_url()
-        payload = {"jsonrpc": "2.0", "id": int(time.time()), "method": method, "params": params}
+    async def call(self, method: str, params: list, timeout: int = 10) -> Any:
+        url = self._current()
+        payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
         try:
             async with self.session.post(url, json=payload, timeout=timeout) as resp:
-                if resp.status != 200:
-                    raise Exception(f"RPC status {resp.status}")
-                data = await resp.json()
-                if 'error' in data:
-                    raise Exception(f"RPC error: {data['error']}")
-                return data.get('result')
-        except Exception as e:
-            logging.warning(f"RPC call failed to {url}: {e}")
-            # try rotate and retry once
-            await self._rotate_provider()
-            url2 = self._current_url()
-            try:
-                async with self.session.post(url2, json=payload, timeout=timeout) as resp:
-                    data = await resp.json()
-                    if 'error' in data:
-                        raise Exception(f"RPC error: {data['error']}")
-                    return data.get('result')
-            except Exception as e2:
-                logging.error(f"RPC retry failed: {e2}")
-                raise
-
-    async def get_account_info_base64(self, address: str) -> Optional[Dict]:
-        """getAccountInfo with base64 data"""
-        try:
-            res = await self.make_rpc_call("getAccountInfo", [address, {"encoding": "base64"}])
-            return res
-        except Exception as e:
-            logging.debug(f"get_account_info failed for {address}: {e}")
-            return None
-
-    async def get_token_price_from_dexscreener(self, mint: str) -> Optional[Dict]:
-        """Try DexScreener first (fast)"""
-        try:
-            url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
-            async with self.session.get(url, timeout=6) as resp:
                 if resp.status == 200:
-                    js = await resp.json()
-                    if js.get('pairs'):
-                        pair = js['pairs'][0]
-                        price = float(pair.get('priceUsd', 0))
-                        market_cap = float(pair.get('marketCap', 0))
-                        volume = float(pair.get('volume', {}).get('h24', 0))
-                        return {'price': price, 'market_cap': market_cap, 'volume_24h': volume, 'source': 'dexscreener'}
+                    data = await resp.json()
+                    if "error" in data:
+                        raise Exception(data["error"])
+                    return data.get("result")
+                else:
+                    text = await resp.text()
+                    raise Exception(f"RPC status {resp.status}: {text[:200]}")
         except Exception as e:
-            logging.debug(f"Dexscreener fetch failed for {mint}: {e}")
-        return None
+            logging.warning(f"RPC call {method} failed on {url}: {e}")
+            # rotate provider and retry once
+            self.idx += 1
+            if self.idx < len(self.providers) * 3:
+                await asyncio.sleep(0.3)
+                return await self.call(method, params, timeout)
+            raise
 
-    async def fetch_price_onchain_bonding_curve(self, bonding_curve_address: str) -> Optional[Dict]:
-        """
-        Fetch bonding curve account via getAccountInfo and decode fields:
-        Anchor discriminator (8 bytes) + struct of BondingCurve:
-        u64 x5 + bool (we expect little-endian)
-        """
+    async def get_account_info_base64(self, addr: str) -> Optional[bytes]:
+        # getAccountInfo expects pubkey and encoding param in some RPC providers (for solana core).
+        # Using generic form that most providers accept:
         try:
-            account = await self.get_account_info_base64(bonding_curve_address)
-            if not account or not account.get('value') or not account['value'].get('data'):
-                return None
-            b64data = account['value']['data'][0]
-            raw = base64.b64decode(b64data)
-            # Anchor accounts typically start with 8 byte discriminator
-            if len(raw) < 8 + (8*5 + 1):
-                logging.debug("Bonding curve account too small to decode")
-                return None
-            # skip 8 bytes
-            offset = 8
-            # unpack u64 x5 and a bool (we assume little-endian)
-            try:
-                virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, tokenTotalSupply = struct.unpack_from("<QQQQQ", raw, offset)
-                offset += 8*5
-                # bool is one byte
-                complete = struct.unpack_from("<?", raw, offset)[0]
-            except struct.error:
-                logging.debug("Struct unpack failed for bonding curve account")
-                return None
-            # Derive approximate price: price = realSolReserves / realTokenReserves (guard)
-            price = 0.0
-            market_cap = 0.0
-            if realTokenReserves and realSolReserves:
-                try:
-                    price = float(realSolReserves) / float(realTokenReserves)
-                except Exception:
-                    price = 0.0
-            # market cap approx = tokenTotalSupply * price
-            try:
-                market_cap = float(tokenTotalSupply) * price
-            except Exception:
-                market_cap = 0.0
-            return {
-                'price': price,
-                'market_cap': market_cap,
-                'complete': bool(complete),
-                'virtualTokenReserves': virtualTokenReserves,
-                'virtualSolReserves': virtualSolReserves,
-                'realTokenReserves': realTokenReserves,
-                'realSolReserves': realSolReserves,
-                'tokenTotalSupply': tokenTotalSupply
-            }
+            res = await self.call("getAccountInfo", [addr, {"encoding":"base64"}])
+            if res and res.get("value") and res["value"].get("data"):
+                b64 = res["value"]["data"][0]
+                raw = base64.b64decode(b64)
+                return raw
+            return None
         except Exception as e:
-            logging.debug(f"Error fetching bonding curve {bonding_curve_address}: {e}")
+            logging.debug(f"getAccountInfo failed for {addr}: {e}")
             return None
 
-# -----------------------
-# Database handler
-# -----------------------
+    async def close(self):
+        await self.session.close()
+
+# --------------------------
+# Bonding curve parser (simple, robust)
+# --------------------------
+
+def parse_bonding_curve_account(raw: bytes) -> Optional[Dict[str, Any]]:
+    """
+    Parse the bonding curve account bytes according to the IDL layout.
+    Skip the 8-byte Anchor discriminator if present.
+    """
+    try:
+        if not raw or len(raw) < 8:
+            return None
+        # Heuristic: if length >= 8 + size of struct
+        struct_size = struct.calcsize(BONDING_CURVE_STRUCT_FMT)
+        # Try with discriminator skip
+        start = 8
+        if len(raw) >= start + struct_size:
+            fields = struct.unpack_from(BONDING_CURVE_STRUCT_FMT, raw, start)
+            return {
+                "virtualTokenReserves": int(fields[0]),
+                "virtualSolReserves": int(fields[1]),
+                "realTokenReserves": int(fields[2]),
+                "realSolReserves": int(fields[3]),
+                "tokenTotalSupply": int(fields[4]),
+                "complete": bool(fields[5])
+            }
+        # fallback: try from 0
+        if len(raw) >= struct_size:
+            fields = struct.unpack_from(BONDING_CURVE_STRUCT_FMT, raw, 0)
+            return {
+                "virtualTokenReserves": int(fields[0]),
+                "virtualSolReserves": int(fields[1]),
+                "realTokenReserves": int(fields[2]),
+                "realSolReserves": int(fields[3]),
+                "tokenTotalSupply": int(fields[4]),
+                "complete": bool(fields[5])
+            }
+    except Exception as e:
+        logging.debug(f"Error parsing bonding curve bytes: {e}")
+    return None
+
+# Price extraction helper: estimate price from bonding curve reserves (approx)
+def compute_price_from_curve(curve: Dict[str, Any]) -> Optional[float]:
+    try:
+        # Simplified: price = realSolReserves / realTokenReserves (guard against 0)
+        rsol = curve.get("realSolReserves", 0)
+        rtok = curve.get("realTokenReserves", 0)
+        if rtok and rsol:
+            return float(rsol) / float(rtok)
+    except Exception as e:
+        logging.debug(f"Error computing price from curve: {e}")
+    return None
+
+# --------------------------
+# Database helper
+# --------------------------
+
 class Database:
     def __init__(self, config: Config):
         self.config = config
         self.pool: Optional[asyncpg.pool.Pool] = None
 
     async def connect(self):
-        if not self.config.ENABLE_DB or not self.config.DATABASE_URL:
-            logging.info("Database disabled or DATABASE_URL not set")
+        if not self.config.DATABASE_URL or not self.config.DATABASE_URL.strip():
+            logging.info("Database disabled (DATABASE_URL not set)")
             return
         try:
             self.pool = await asyncpg.create_pool(self.config.DATABASE_URL, min_size=1, max_size=10)
             async with self.pool.acquire() as conn:
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS token_monitoring (
-                        token_address TEXT PRIMARY KEY,
-                        symbol TEXT,
-                        name TEXT,
-                        bonding_curve TEXT,
-                        initial_price NUMERIC,
-                        initial_market_cap NUMERIC,
-                        max_price NUMERIC,
-                        start_time TIMESTAMPTZ,
-                        last_checked TIMESTAMPTZ,
-                        status TEXT,
-                        metadata JSONB,
-                        created_at TIMESTAMPTZ DEFAULT NOW()
-                    )
-                ''')
-                await conn.execute('''
-                    CREATE TABLE IF NOT EXISTS token_alerts (
-                        id SERIAL PRIMARY KEY,
-                        token_address TEXT NOT NULL,
-                        alert_rule_name TEXT,
-                        gain_percent NUMERIC,
-                        time_elapsed_min NUMERIC,
-                        price_at_alert NUMERIC,
-                        market_cap_at_alert NUMERIC,
-                        created_at TIMESTAMPTZ DEFAULT NOW(),
-                        extra_data JSONB
-                    )
-                ''')
+                # create tables if not exists
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS token_monitoring (
+                    token_address TEXT PRIMARY KEY,
+                    symbol TEXT,
+                    name TEXT,
+                    initial_price NUMERIC,
+                    initial_market_cap NUMERIC,
+                    max_price NUMERIC,
+                    start_time TIMESTAMPTZ,
+                    last_checked TIMESTAMPTZ,
+                    status TEXT,
+                    metadata JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )""")
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS token_alerts (
+                    id SERIAL PRIMARY KEY,
+                    token_address TEXT,
+                    alert_rule_name TEXT,
+                    gain_percent NUMERIC,
+                    time_elapsed_min NUMERIC,
+                    price_at_alert NUMERIC,
+                    market_cap_at_alert NUMERIC,
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    extra_data JSONB
+                )""")
+                await conn.execute("""
+                CREATE TABLE IF NOT EXISTS token_price_history (
+                    id SERIAL PRIMARY KEY,
+                    token_address TEXT,
+                    timestamp TIMESTAMPTZ DEFAULT NOW(),
+                    price NUMERIC,
+                    market_cap NUMERIC,
+                    volume_24h NUMERIC
+                )""")
             logging.info("Database connected and schema ensured")
         except Exception as e:
             logging.error(f"Database connection failed: {e}")
             self.pool = None
 
-    async def disconnect(self):
+    async def close(self):
         if self.pool:
             await self.pool.close()
+            self.pool = None
 
     async def add_or_update_token(self, token: TokenData):
         if not self.pool:
             return
         try:
             async with self.pool.acquire() as conn:
-                await conn.execute('''
-                    INSERT INTO token_monitoring (token_address, symbol, name, bonding_curve, initial_price, initial_market_cap, max_price, start_time, last_checked, status, metadata)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-                    ON CONFLICT (token_address) DO UPDATE SET
-                        symbol = EXCLUDED.symbol,
-                        name = EXCLUDED.name,
-                        bonding_curve = EXCLUDED.bonding_curve,
-                        initial_price = EXCLUDED.initial_price,
-                        initial_market_cap = EXCLUDED.initial_market_cap,
-                        max_price = GREATEST(token_monitoring.max_price, EXCLUDED.max_price),
-                        last_checked = EXCLUDED.last_checked,
-                        status = EXCLUDED.status,
-                        metadata = EXCLUDED.metadata
-                ''',
-                token.mint,
-                token.symbol,
-                token.name,
-                token.bonding_curve,
-                token.initial_price,
-                token.initial_market_cap,
-                token.max_price,
-                token.start_time,
-                token.last_checked,
-                token.status,
-                json.dumps(token.metadata)
-                )
+                await conn.execute("""
+                INSERT INTO token_monitoring (token_address, symbol, name, initial_price, initial_market_cap, max_price, start_time, last_checked, status, metadata)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,NOW(),$8,$9)
+                ON CONFLICT (token_address) DO UPDATE SET
+                  last_checked = NOW(),
+                  max_price = GREATEST(token_monitoring.max_price, EXCLUDED.max_price),
+                  status = EXCLUDED.status
+                """,
+                token.mint, token.symbol, token.name,
+                token.initial_price, token.initial_market_cap, token.max_price, token.start_time, token.status, json.dumps(token.metadata))
         except Exception as e:
-            logging.debug(f"DB add/update token failed: {e}")
+            logging.debug(f"DB add/update token error: {e}")
+
+    async def record_price(self, token_address: str, price: float, market_cap: float, volume: float):
+        if not self.pool:
+            return
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute("""
+                INSERT INTO token_price_history (token_address, price, market_cap, volume_24h) VALUES ($1,$2,$3,$4)
+                """, token_address, price, market_cap, volume)
+        except Exception as e:
+            logging.debug(f"DB price history error: {e}")
 
     async def record_alert(self, alert: AlertData):
         if not self.pool:
             return
         try:
             async with self.pool.acquire() as conn:
-                await conn.execute('''
-                    INSERT INTO token_alerts (token_address, alert_rule_name, gain_percent, time_elapsed_min, price_at_alert, market_cap_at_alert, extra_data)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7)
-                ''', alert.token_address, alert.rule_name, alert.gain_percent, alert.time_elapsed_min, alert.price_at_alert, alert.market_cap_at_alert, json.dumps(alert.extra_data))
+                await conn.execute("""
+                INSERT INTO token_alerts (token_address, alert_rule_name, gain_percent, time_elapsed_min, price_at_alert, market_cap_at_alert, extra_data)
+                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                """,
+                alert.token_address, alert.rule_name, alert.gain_percent, alert.time_elapsed_min, alert.price_at_alert, alert.market_cap_at_alert, json.dumps(alert.extra_data))
         except Exception as e:
-            logging.debug(f"DB record_alert failed: {e}")
+            logging.debug(f"DB record alert error: {e}")
 
-# -----------------------
+# --------------------------
 # Alert Engine
-# -----------------------
+# --------------------------
+
 class AlertEngine:
     def __init__(self, config: Config):
         self.config = config
         self.alert_rules = config.ALERT_RULES
 
-    def check_rules(self, token: TokenData, current_price: float, elapsed_min: float) -> List[AlertData]:
-        if current_price <= 0:
+    async def evaluate(self, token: TokenData, current_price: float) -> List[AlertData]:
+        if current_price <= 0 or token.initial_price <= 0:
             return []
-        gain_percent = ((current_price - token.initial_price) / token.initial_price) * 100 if token.initial_price > 0 else 0.0
+        gain_percent = ((current_price - token.initial_price) / token.initial_price) * 100.0
+        elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
         triggered = []
         for rule in self.alert_rules:
-            if gain_percent >= float(rule['alert_percent']) and elapsed_min <= float(rule['time_window_min']):
+            if gain_percent >= float(rule["alert_percent"]) and elapsed_min <= float(rule["time_window_min"]):
                 triggered.append(AlertData(
                     token_address=token.mint,
-                    rule_name=rule['name'],
+                    rule_name=rule["name"],
                     gain_percent=gain_percent,
                     time_elapsed_min=elapsed_min,
                     price_at_alert=current_price,
                     market_cap_at_alert=0.0,
-                    extra_data={'symbol': token.symbol, 'name': token.name, 'initial_price': token.initial_price, 'max_price': token.max_price}
+                    extra_data={"symbol": token.symbol, "name": token.name, "initial_price": token.initial_price, "max_price": token.max_price}
                 ))
         return triggered
 
-# -----------------------
+# --------------------------
 # Token Manager
-# -----------------------
+# --------------------------
+
 class TokenManager:
-    def __init__(self, config: Config, db: Database, rpc_client: RPCClient, alert_engine: AlertEngine):
+    def __init__(self, config: Config, db: Database, rpc: RPCClient, alert_engine: AlertEngine, telegram_notify):
         self.config = config
         self.db = db
-        self.rpc = rpc_client
+        self.rpc = rpc
         self.alert_engine = alert_engine
+        self.telegram_notify = telegram_notify
+
         self.monitored: Dict[str, TokenData] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
-        self.alerted: set = set()
         self.semaphore = asyncio.Semaphore(self.config.MAX_CONCURRENT_MONITORS)
+        self.sent_alerts = set()  # dedupe
 
-    async def add_token(self, mint: str, symbol: str = "UNKNOWN", name: str = "UNKNOWN", bonding_curve: Optional[str] = None, initial_price: float = 0.0, initial_market_cap: float = 0.0):
+    async def add_token(self, mint: str, symbol: str, name: str, initial_price: float = 0.0, initial_market_cap: float = 0.0):
         if mint in self.monitored:
-            logging.debug(f"{mint} already monitored")
+            logging.debug(f"Already monitoring {mint}")
             return
         token = TokenData(
-            mint=mint,
-            symbol=symbol,
-            name=name,
-            initial_price=initial_price,
-            initial_market_cap=initial_market_cap,
+            mint=mint, symbol=symbol, name=name,
+            initial_price=initial_price, initial_market_cap=initial_market_cap,
             max_price=initial_price,
-            start_time=datetime.now(timezone.utc),
-            bonding_curve=bonding_curve
+            start_time=datetime.now(timezone.utc)
         )
         self.monitored[mint] = token
-        token.last_checked = datetime.now(timezone.utc)
         await self.db.add_or_update_token(token)
-        # create monitoring task
-        task = asyncio.create_task(self._monitor_token(mint))
+        task = asyncio.create_task(self._monitor(mint))
         self.tasks[mint] = task
+        MET_TOKENS_MONITORED.set(len(self.monitored))
         logging.info(f"Started monitoring {symbol} ({mint[:8]}...)")
 
-    async def _monitor_token(self, mint: str):
-        async with self.semaphore:
-            token = self.monitored.get(mint)
-            if not token:
-                return
-            try:
-                start_time = token.start_time
+    async def _monitor(self, mint: str):
+        token = self.monitored.get(mint)
+        if not token:
+            return
+        try:
+            async with self.semaphore:
                 while mint in self.monitored:
-                    elapsed_min = (datetime.now(timezone.utc) - start_time).total_seconds() / 60.0
-                    # timeout
+                    # timeout enforcement
+                    elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
                     if elapsed_min >= self.config.MAX_MONITOR_TIME_MIN:
-                        logging.info(f"Token {token.symbol} {mint} expired after {elapsed_min:.1f}min")
-                        await self._remove_token(mint, "timeout")
-                        return
-                    # attempt price fetch: DexScreener -> bonding curve (on-chain)
-                    price_data = None
-                    # ensure RPC session
-                    if not self.rpc.session:
-                        await self.rpc.__aenter__()
-                    try:
-                        price_data = await self.rpc.get_token_price_from_dexscreener(mint)
-                    except Exception:
-                        price_data = None
-                    # fallback on-chain via bonding curve if available or try to infer from associated bonding curve
-                    if not price_data and token.bonding_curve:
-                        try:
-                            bc = await self.rpc.fetch_price_onchain_bonding_curve(token.bonding_curve)
-                            if bc:
-                                price_data = {'price': bc['price'], 'market_cap': bc['market_cap'], 'source': 'bonding_curve'}
-                        except Exception:
-                            price_data = None
-                    # if still no price and boxing via getAccountInfo on possible bonding_curve address not set, try to locate? (skip advanced heuristics)
-                    if not price_data:
-                        # wait and try again
+                        logging.info(f"Timeout: removing {mint} after {elapsed_min:.1f} min")
+                        await self._remove(mint, "timeout")
+                        break
+
+                    # get bonding curve account info - attempt to find bondingCurve from metadata stored?
+                    # For PumpPortal messages we expect to receive bondingCurve in payload; here we will try to resolve via RPC if needed.
+                    # We'll call getAccountInfo on associated bonding curve if present in metadata
+                    bonding_curve_addr = token.metadata.get("bondingCurve") if token.metadata else None
+                    raw = None
+                    if bonding_curve_addr:
+                        raw = await self.rpc.get_account_info_base64(bonding_curve_addr)
+                    # fallback: if no bonding curve, attempt to query DexScreener (not implemented here). We'll try on-chain only.
+                    curve_state = parse_bonding_curve_account(raw) if raw else None
+                    current_price = None
+                    if curve_state:
+                        current_price = compute_price_from_curve(curve_state)
+                    # if could not fetch price on-chain, skip and wait
+                    if current_price is None:
                         await asyncio.sleep(self.config.PRICE_POLL_INTERVAL_SEC)
                         continue
-                    current_price = float(price_data.get('price', 0.0))
-                    current_market_cap = float(price_data.get('market_cap', 0.0) or 0.0)
-                    token.last_checked = datetime.now(timezone.utc)
+
                     # update max price
                     if current_price > token.max_price:
                         token.max_price = current_price
-                    # record history in DB (non-blocking)
-                    await self.db.add_or_update_token(token)
-                    # detect dump from max
+                        await self.db.add_or_update_token(token)
+
+                    # record history
+                    await self.db.record_price(mint, current_price, 0.0, 0.0)
+
+                    # check dump from max
                     if token.max_price > 0:
-                        loss_from_max = ((current_price - token.max_price) / token.max_price) * 100
+                        loss_from_max = ((current_price - token.max_price) / token.max_price) * 100.0
                         if loss_from_max <= self.config.DUMP_THRESHOLD_PERCENT:
                             logging.info(f"Dump detected for {token.symbol} {mint}: {loss_from_max:.1f}% -> removing")
-                            await self._remove_token(mint, "dumped")
-                            return
-                    # evaluate alerts
-                    alerts = self.alert_engine.check_rules(token, current_price, elapsed_min)
-                    for alert in alerts:
-                        # deduplicate
-                        if mint in self.alerted:
-                            continue
-                        # attach market_cap
-                        alert.market_cap_at_alert = current_market_cap
-                        await self.db.record_alert(alert)
-                        self.alerted.add(mint)
-                        # send telegram message
-                        await Notification.send_token_alert(token, alert)
-                        # after alert, optionally stop monitoring this token
-                        await self._remove_token(mint, "alert_sent")
-                        return
-                    await asyncio.sleep(self.config.PRICE_POLL_INTERVAL_SEC)
-            except asyncio.CancelledError:
-                logging.info(f"Monitor task cancelled for {mint}")
-            except Exception as e:
-                logging.error(f"Error monitoring {mint}: {e}")
-                await self._remove_token(mint, "error")
+                            await self._remove(mint, "dumped")
+                            break
 
-    async def _remove_token(self, mint: str, reason: str):
-        token = self.monitored.get(mint)
+                    # evaluate alert rules
+                    alerts = await self.alert_engine.evaluate(token, current_price)
+                    for alert in alerts:
+                        # dedupe: key by mint + rule
+                        dedupe_key = f"{mint}:{alert.rule_name}"
+                        if dedupe_key in self.sent_alerts:
+                            continue
+                        # store alert and notify
+                        await self.db.record_alert(alert)
+                        await self.telegram_notify(token, alert)
+                        MET_ALERTS.inc()
+                        self.sent_alerts.add(dedupe_key)
+                        await self._remove(mint, "alert_sent")
+                        break
+
+                    await asyncio.sleep(self.config.PRICE_POLL_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            logging.info(f"Monitor task cancelled for {mint}")
+        except Exception as e:
+            logging.error(f"Error in monitor for {mint}: {e}")
+            await self._remove(mint, "error")
+
+    async def _remove(self, mint: str, reason: str):
+        token = self.monitored.pop(mint, None)
+        if mint in self.tasks:
+            t = self.tasks.pop(mint)
+            t.cancel()
+        MET_TOKENS_MONITORED.set(len(self.monitored))
+        logging.info(f"Removed token {mint}: {reason}")
         if token:
             token.status = reason
-            token.last_checked = datetime.now(timezone.utc)
-            try:
-                await self.db.add_or_update_token(token)
-            except Exception:
-                pass
-            del self.monitored[mint]
-        if mint in self.tasks:
-            t = self.tasks[mint]
-            t.cancel()
-            del self.tasks[mint]
-        logging.info(f"Removed token {mint}: {reason}")
+            await self.db.add_or_update_token(token)
 
-# -----------------------
-# Notification / Telegram
-# -----------------------
-class Notification:
-    bot: Optional[Bot] = None
-    config: Optional[Config] = None
+    async def stop_all(self):
+        for mint in list(self.monitored.keys()):
+            await self._remove(mint, "shutdown")
 
-    @classmethod
-    def init(cls, config: Config):
-        cls.config = config
-        if config.ENABLE_TELEGRAM and config.TELEGRAM_BOT_TOKEN:
-            cls.bot = Bot(token=config.TELEGRAM_BOT_TOKEN)
+# --------------------------
+# Telegram notifier and bot commands
+# --------------------------
 
-    @classmethod
-    async def send_token_alert(cls, token: TokenData, alert: AlertData):
-        if not cls.bot or not cls.config or not cls.config.TELEGRAM_CHAT_ID:
-            logging.info(f"Alert (no telegram): {token.symbol} {alert.gain_percent:.1f}%")
+class TelegramBridge:
+    def __init__(self, config: Config, token_manager: TokenManager):
+        self.config = config
+        self.token_manager = token_manager
+        self.app: Optional[Application] = None
+
+    async def start(self):
+        if not self.config.TELEGRAM_BOT_TOKEN:
+            logging.info("Telegram disabled (TELEGRAM_BOT_TOKEN not set)")
+            return
+        self.app = Application.builder().token(self.config.TELEGRAM_BOT_TOKEN).build()
+        # register handlers
+        self.app.add_handler(CommandHandler("start", self.cmd_start))
+        self.app.add_handler(CommandHandler("status", self.cmd_status))
+        self.app.add_handler(CommandHandler("tokens", self.cmd_tokens))
+        # run background polling
+        asyncio.create_task(self.app.run_polling())
+
+    async def stop(self):
+        if self.app:
+            await self.app.stop()
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        welcome = ("🤖 Pump.fun Monitor\n"
+                   "/status - estado\n"
+                   "/tokens - tokens en monitoreo\n")
+        await update.message.reply_text(welcome)
+
+    async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        status = self.token_manager.monitored
+        text = (f"Monitored tokens: {len(status)}\n"
+                f"Alert rules: {len(self.config.ALERT_RULES)}\n"
+                f"Poll interval: {self.config.PRICE_POLL_INTERVAL_SEC}s\n"
+                f"Max monitor time: {self.config.MAX_MONITOR_TIME_MIN} min\n")
+        await update.message.reply_text(text)
+
+    async def cmd_tokens(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        items = list(self.token_manager.monitored.values())[:20]
+        if not items:
+            await update.message.reply_text("No tokens monitored")
+            return
+        txt = "Tokens:\n"
+        for t in items:
+            elapsed = (datetime.now(timezone.utc) - t.start_time).total_seconds() / 60.0
+            txt += f"- {t.symbol} {t.mint[:16]}... {elapsed:.1f}min\n"
+        await update.message.reply_text(txt)
+
+    async def notify(self, token: TokenData, alert: AlertData):
+        """Send Telegram notification to configured chat with direct links"""
+        chat_id = self.config.TELEGRAM_CHAT_ID
+        if not chat_id:
+            logging.info("TELEGRAM_CHAT_ID not set; skipping notify")
             return
         try:
-            message = cls._format_message(token, alert)
-            keyboard = cls._make_keyboard(token.mint)
-            await cls.bot.send_message(chat_id=cls.config.TELEGRAM_CHAT_ID, text=message, parse_mode='Markdown', reply_markup=keyboard, disable_web_page_preview=True)
-            logging.info(f"Telegram alert sent for {token.symbol} {token.mint}")
+            msg = self.format_message(token, alert)
+            keyboard = [
+                [InlineKeyboardButton("Pump.fun", url=f"https://pump.fun/{token.mint}"),
+                 InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/solana/{token.mint}")],
+                [InlineKeyboardButton("RugCheck", url=f"https://rugcheck.xyz/tokens/{token.mint}"),
+                 InlineKeyboardButton("Birdeye", url=f"https://birdeye.so/token/{token.mint}?chain=solana")]
+            ]
+            from telegram import Bot
+            bot = Bot(token=self.config.TELEGRAM_BOT_TOKEN)
+            await bot.send_message(chat_id=chat_id, text=msg, parse_mode='Markdown', reply_markup=InlineKeyboardMarkup(keyboard), disable_web_page_preview=True)
+            logging.info(f"Telegram alert sent for {token.symbol}")
         except Exception as e:
-            logging.error(f"Telegram send failed: {e}")
+            logging.error(f"Error sending Telegram message: {e}")
 
-    @staticmethod
-    def _format_message(token: TokenData, alert: AlertData) -> str:
-        mint = token.mint
+    def format_message(self, token: TokenData, alert: AlertData) -> str:
         return (
-            f"🚀 *ALERTA DE MOMENTUM* 🚀\n\n"
+            f"🚨 *ALERTA PUMP* 🚨\n\n"
             f"*Token:* {token.name} ({token.symbol})\n"
-            f"*Mint:* `{mint}`\n"
-            f"*Ganancia:* +{alert.gain_percent:.1f}% en {alert.time_elapsed_min:.1f} min\n"
-            f"*Precio al alert:* {alert.price_at_alert:.8f} (unit)\n"
-            f"*Market Cap aprox:* ${alert.market_cap_at_alert:,.0f}\n\n"
-            f"🔗 *Enlaces rápidos*\n"
-            f"• Pump.fun: https://pump.fun/{mint}\n"
-            f"• DexScreener: https://dexscreener.com/solana/{mint}\n"
-            f"• RugCheck: https://rugcheck.xyz/tokens/{mint}\n"
-            f"• Birdeye: https://birdeye.so/token/{mint}?chain=solana\n\n"
-            f"🕒 Tiempo desde creación: {alert.time_elapsed_min:.1f} minutos\n"
+            f"*Mint:* `{token.mint}`\n"
+            f"*Ganancia:* +{alert.gain_percent:.1f}% en {alert.time_elapsed_min:.1f}min\n"
+            f"*Precio en alerta:* {alert.price_at_alert:.9f} (unidad chain)\n\n"
+            f"Links:\n"
+            f"• Pump.fun: https://pump.fun/{token.mint}\n"
+            f"• DexScreener: https://dexscreener.com/solana/{token.mint}\n"
+            f"• RugCheck: https://rugcheck.xyz/tokens/{token.mint}\n"
+            f"• Birdeye: https://birdeye.so/token/{token.mint}?chain=solana\n"
         )
 
-    @staticmethod
-    def _make_keyboard(mint: str) -> InlineKeyboardMarkup:
-        kb = [
-            [InlineKeyboardButton("Pump.fun", url=f"https://pump.fun/{mint}"),
-             InlineKeyboardButton("DexScreener", url=f"https://dexscreener.com/solana/{mint}")],
-            [InlineKeyboardButton("RugCheck", url=f"https://rugcheck.xyz/tokens/{mint}"),
-             InlineKeyboardButton("Birdeye", url=f"https://birdeye.so/token/{mint}?chain=solana")]
-        ]
-        return InlineKeyboardMarkup(kb)
+# --------------------------
+# WebSocket listener: PumpPortal (third-party stream) or fallback to logsSubscribe via RPC
+# The example assumes PumpPortal WSS sends messages containing mint, symbol, name, bondingCurve.
+# --------------------------
 
-
-# -----------------------
-# WebSocket client for PumpPortal
-# -----------------------
-class PumpPortalClient:
+class WebSocketListener:
     def __init__(self, config: Config, token_manager: TokenManager):
         self.config = config
         self.token_manager = token_manager
         self.ws = None
-        self.is_connected = False
-        self.reconnect_delay = 5
-        self.max_reconnect = 60
-        self.running = False
+        self.should_run = True
+        self.reconnect_delay = 2
 
-    async def connect(self):
+    async def run(self):
         uri = self.config.PUMPPORTAL_WSS
-        self.running = True
-        while self.running:
+        logging.info(f"Connecting to PumpPortal WSS: {uri}")
+        while self.should_run:
             try:
-                logging.info(f"Connecting to PumpPortal WSS: {uri}")
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                    self.ws = websocket
-                    self.is_connected = True
-                    self.reconnect_delay = 5
-                    # subscribe, if PumpPortal needs subscription message
+                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
+                    self.ws = ws
+                    # attempt subscribe if API required
                     try:
-                        await websocket.send(json.dumps({"method":"subscribeNewToken"}))
+                        await ws.send(json.dumps({"method":"subscribeNewToken"}))
                     except Exception:
                         pass
-                    async for raw in websocket:
+                    async for msg in ws:
                         try:
-                            data = json.loads(raw)
-                            await self._handle_message(data)
-                        except json.JSONDecodeError:
-                            logging.debug("Invalid JSON from WSS")
-                        except Exception as e:
-                            logging.error(f"Error handling websocket message: {e}")
+                            data = json.loads(msg)
+                        except Exception:
+                            logging.debug("Non-json message from websocket")
+                            continue
+                        await self._handle_message(data)
             except Exception as e:
                 logging.error(f"WSS connection error: {e}")
-                self.is_connected = False
                 await asyncio.sleep(self.reconnect_delay)
-                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect)
-            finally:
-                self.is_connected = False
+                self.reconnect_delay = min(self.reconnect_delay * 2, 60)
 
-    async def _handle_message(self, data: Dict):
-        """
-        Expected structures vary. Normalize:
-         - top-level fields 'mint', 'symbol', 'name', maybe 'bondingCurve' or 'pairs'
-         - some payloads embed data under 'data' key
-        """
+    async def _handle_message(self, data: dict):
+        # Robust parsing: payload may come nested
         try:
-            payload = data
-            if 'data' in data and isinstance(data['data'], dict):
-                payload = data['data']
-            mint = payload.get('mint') or payload.get('token') or None
-            symbol = payload.get('symbol') or payload.get('tokenSymbol') or 'UNKNOWN'
-            name = payload.get('name') or payload.get('tokenName') or symbol
-            bonding_curve = payload.get('bondingCurve') or payload.get('bonding_curve') or None
-            # try pairs/dex data for initial price
+            payload = data.get("data") if isinstance(data.get("data"), dict) else data
+            mint = payload.get("mint") or payload.get("mintAddress") or payload.get("tokenMint")
+            symbol = payload.get("symbol") or payload.get("tokenSymbol") or payload.get("name") or "UNKNOWN"
+            name = payload.get("name") or symbol
+            bonding_curve = payload.get("bondingCurve") or payload.get("bonding_curve") or payload.get("associatedBondingCurve")
+            # initial price if present (e.g., dexscreener pairs)
             initial_price = 0.0
             initial_mcap = 0.0
-            if isinstance(payload.get('pairs'), list) and payload.get('pairs'):
-                p = payload['pairs'][0]
-                try:
-                    initial_price = float(p.get('priceUsd', p.get('price', 0)))
-                except:
-                    initial_price = 0.0
-                try:
-                    initial_mcap = float(p.get('marketCap', 0))
-                except:
-                    initial_mcap = 0.0
-            if not mint:
-                logging.debug("WSS message without mint")
-                return
-            # ensure format
-            mint = str(mint)
-            await self.token_manager.add_token(mint=mint, symbol=symbol, name=name, bonding_curve=bonding_curve, initial_price=initial_price, initial_market_cap=initial_mcap)
+            # store bondingCurve in metadata for later on-chain reads
+            metadata = {}
+            if bonding_curve:
+                metadata["bondingCurve"] = bonding_curve
+            if mint:
+                await self.token_manager.add_token(mint, symbol, name, initial_price, initial_mcap)
+                # attach metadata (safer via DB update)
+                if mint in self.token_manager.monitored:
+                    self.token_manager.monitored[mint].metadata.update(metadata)
+                    await self.token_manager.db.add_or_update_token(self.token_manager.monitored[mint])
         except Exception as e:
-            logging.error(f"Error in _handle_message: {e}")
+            logging.debug(f"Error processing incoming ws message: {e}")
 
     async def stop(self):
-        self.running = False
+        self.should_run = False
         if self.ws:
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
+            await self.ws.close()
 
-# -----------------------
-# FastAPI health/metrics server
-# -----------------------
-def create_fastapi_app(bot_ref):
-    app = FastAPI()
-    @app.get("/health")
-    async def health():
-        return {"status": "ok", "monitored_tokens": len(bot_ref.token_manager.monitored), "is_ws_connected": bot_ref.portal_client.is_connected}
-    @app.get("/metrics")
-    async def metrics():
-        return {
-            "monitored_tokens": len(bot_ref.token_manager.monitored),
-            "active_tasks": len(bot_ref.token_manager.tasks)
-        }
-    return app
+# --------------------------
+# FastAPI app (health + metrics + optional webhook endpoint)
+# --------------------------
 
-# -----------------------
-# Main PumpFun Bot
-# -----------------------
-class PumpFunBot:
-    def __init__(self):
-        self.config = Config()
-        setup_logging(self.config)
-        self.db = Database(self.config)
-        self.rpc_client = RPCClient(self.config)
-        self.alert_engine = AlertEngine(self.config)
-        self.token_manager = TokenManager(self.config, self.db, self.rpc_client, self.alert_engine)
-        self.portal_client = PumpPortalClient(self.config, self.token_manager)
-        Notification.init(self.config)
-        self.fastapi_app = create_fastapi_app(self)
-        self.http_server_task: Optional[asyncio.Task] = None
-        self.ws_task: Optional[asyncio.Task] = None
-        self.is_running = False
+app = FastAPI()
+CONFIG = Config()
+setup_logging(CONFIG.LOG_LEVEL)
+LOG = logging.getLogger("pumpfun")
+LOG.info("Starting PumpFunBot...")
 
-    async def start(self):
-        logging.info("Starting PumpFunBot...")
-        self.is_running = True
-        # DB connect
-        await self.db.connect()
-        # start fastapi server in background
-        self.http_server_task = asyncio.create_task(self._run_http())
-        # start websocket pumpportal
-        self.ws_task = asyncio.create_task(self.portal_client.connect())
-        logging.info("PumpFunBot started")
+# Create global instances (will be initialised in main startup)
+DB = Database(CONFIG)
+RPC = RPCClient(CONFIG)
+ALERT_ENGINE = AlertEngine(CONFIG)
+TOKEN_MANAGER: Optional[TokenManager] = None
+TELEGRAM_BRIDGE: Optional[TelegramBridge] = None
+WS_LISTENER: Optional[WebSocketListener] = None
 
-    async def stop(self):
-        logging.info("Stopping PumpFunBot...")
-        self.is_running = False
-        try:
-            await self.portal_client.stop()
-        except Exception:
-            pass
-        if self.ws_task:
-            self.ws_task.cancel()
-        if self.http_server_task:
-            self.http_server_task.cancel()
-        await self.db.disconnect()
-        logging.info("PumpFunBot stopped")
+@app.on_event("startup")
+async def startup_event():
+    global DB, RPC, ALERT_ENGINE, TOKEN_MANAGER, TELEGRAM_BRIDGE, WS_LISTENER
+    await DB.connect()
+    ALERT_ENGINE = AlertEngine(CONFIG)
+    TOKEN_MANAGER = TokenManager(CONFIG, DB, RPC, ALERT_ENGINE, lambda t,a: TELEGRAM_BRIDGE.notify(t,a) if TELEGRAM_BRIDGE else None)
+    TELEGRAM_BRIDGE = TelegramBridge(CONFIG, TOKEN_MANAGER)
+    await TELEGRAM_BRIDGE.start()
+    WS_LISTENER = WebSocketListener(CONFIG, TOKEN_MANAGER)
+    # start websocket listener task
+    asyncio.create_task(WS_LISTENER.run())
+    LOG.info("PumpFunBot started")
 
-    async def _run_http(self):
-        # run uvicorn programmatically
-        config = self.config
-        port = config.HEALTH_PORT
-        uv_cfg = uvicorn.Config(self.fastapi_app, host="0.0.0.0", port=port, log_level="info")
-        server = uvicorn.Server(uv_cfg)
-        await server.serve()
+@app.on_event("shutdown")
+async def shutdown_event():
+    if WS_LISTENER:
+        await WS_LISTENER.stop()
+    if TOKEN_MANAGER:
+        await TOKEN_MANAGER.stop_all()
+    if TELEGRAM_BRIDGE:
+        await TELEGRAM_BRIDGE.stop()
+    await RPC.close()
+    await DB.close()
+    LOG.info("PumpFunBot stopped")
 
-    def setup_signal_handlers(self):
-        loop = asyncio.get_event_loop()
-        def _handler(sig, frame):
-            logging.info(f"Signal {sig} received: shutting down")
-            asyncio.create_task(self.stop())
-        signal.signal(signal.SIGTERM, _handler)
-        signal.signal(signal.SIGINT, _handler)
+@app.get("/health")
+async def health():
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
-# -----------------------
-# Entrypoint
-# -----------------------
-async def main():
-    bot = PumpFunBot()
-    bot.setup_signal_handlers()
-    await bot.start()
-    # run until cancelled
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except asyncio.CancelledError:
-        logging.info("Main cancelled")
-    finally:
-        await bot.stop()
+@app.get("/metrics")
+async def metrics():
+    data = generate_latest()
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)  # type: ignore
+
+# Optional webhook endpoint (if you prefer webhook POST from Telegram)
+@app.post("/telegram")
+async def telegram_webhook(request: Request):
+    """If you want to use Telegram webhooks instead of polling, configure webhook to /telegram."""
+    body = await request.json()
+    # If you want to process updates via python-telegram-bot Application, you'd need to pass updates to it.
+    # For simplicity, we'll just acknowledge. (We run polling by default.)
+    return {"status": "ok"}
+
+# --------------------------
+# ENTRYPOINT
+# --------------------------
+
+async def main_loop():
+    # keep alive
+    while True:
+        await asyncio.sleep(3600)
+
+def run():
+    # run uvicorn via Procfile; but when imported by uvicorn, FastAPI lifecycle runs.
+    pass
 
 if __name__ == "__main__":
-    # Validate critical envs if you want (DB optional)
-    # TELEGRAM optional but recommended to send alerts
-    c = Config()
-    # Allow running even without DB or Telegram; warn if missing
-    if not c.TELEGRAM_BOT_TOKEN or not c.TELEGRAM_CHAT_ID:
-        logging.warning("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set. Alerts will not be sent via Telegram.")
-    if not c.QUICKNODE_RPC_URL and not c.HELIUS_RPC_URL:
-        logging.warning("No QUICKNODE_RPC_URL or HELIUS_RPC_URL set - falling back to public RPC which may be rate-limited.")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logging.info("Interrupted by user")
+    import uvicorn
+    uvicorn.run("telegram_bot_final:app", host="0.0.0.0", port=int(os.getenv("PORT", CONFIG.HEALTH_PORT)), log_level="info")
