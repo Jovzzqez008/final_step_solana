@@ -1,1 +1,1 @@
-web: gunicorn -k uvicorn.workers.UvicornWorker telegram_bot_final:app_instance.health_app --bind 0.0.0.0:$PORT
+web: uvicorn pumpfun_bot:app --host 0.0.0.0 --port $PORT
