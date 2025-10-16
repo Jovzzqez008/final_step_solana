@@ -1,1 +1,1 @@
-worker: python telegram_bot_final.py
+web: uvicorn telegram_bot_final:app --host 0.0.0.0 --port $PORT
