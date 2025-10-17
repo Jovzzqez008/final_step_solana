@@ -22,5 +22,5 @@ websockets==12.0
 uvicorn==0.30.1
 fastapi==0.110.0
 gunicorn==21.2.0
-anchorpy==0.18.1
+anchorpy==0.19.1
 redis==5.1.1
