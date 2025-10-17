@@ -792,7 +792,7 @@ def create_app(bot_instance):
                     text=msg,
                     parse_mode="Markdown"
                 )
-                return {"ok": True"}
+                return {"ok": True}
 
         # also handle callback_query style updates (Telegram sends them under 'callback_query')
         if "callback_query" in data:
