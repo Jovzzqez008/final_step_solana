@@ -7,7 +7,7 @@ Bot de monitorización Pump.fun (sin compras automáticas).
 - Redis para dedupe + TTL
 - PostgreSQL opcional para persistencia
 - Bonding curve on-chain parsing (getAccountInfo base64 + struct) + Anchor IDL support
-- PDA / associated bonding curve computation (best-effort)
+- PDA / associated bonding curve computation (FIXED)
 - DexScreener fallback for price
 - Alert rules: momentum % + time window (default 120% / 15min)
 """
@@ -21,6 +21,7 @@ import logging
 import signal
 import struct
 import time
+import base58
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
@@ -40,8 +41,10 @@ from solana.rpc.async_api import AsyncClient as SolanaAsyncClient
 # CORREGIDO: Importación actualizada para PublicKey
 try:
     from solders.pubkey import Pubkey as PublicKey
+    USING_SOLDERS = True
 except ImportError:
     from solana.publickey import PublicKey
+    USING_SOLDERS = False
 
 # Anchorpy (optional decoding / program usage if available)
 try:
@@ -381,25 +384,47 @@ class Notification:
         return InlineKeyboardMarkup(kb)
 
 # -----------------------
-# Compute bonding curve PDA from mint (MEJORADA)
+# ✅ FIXED: Compute bonding curve PDA from mint
 # -----------------------
 def compute_bonding_curve_pda(mint: str) -> Optional[str]:
     """
-    Calcula la bonding curve PDA directamente desde el mint address
-    Basado en la implementación común de pump.fun
+    Calcula la bonding curve PDA directamente desde el mint address.
+    CORREGIDO: Usa base58 decode para obtener los 32 bytes correctos.
     """
     try:
-        PROGRAM_PUBKEY = PublicKey(PUMP_FUN_IDL['metadata']['address'])
-        mint_pubkey = PublicKey(mint)
+        program_id_str = PUMP_FUN_IDL['metadata']['address']
         
-        # Método más común: seeds = [b"bonding_curve", mint_bytes]
-        seeds = [b"bonding_curve", bytes(mint_pubkey)]
-        pda, bump = PublicKey.find_program_address(seeds, PROGRAM_PUBKEY)
+        # ✅ FIX: Decodificar de base58 a bytes (32 bytes)
+        mint_bytes = base58.b58decode(mint)
+        program_bytes = base58.b58decode(program_id_str)
         
-        logging.info(f"✅ Calculated bonding curve PDA for {mint[:8]}...: {pda}")
-        return str(pda)
+        # Validar longitud
+        if len(mint_bytes) != 32:
+            logging.error(f"Invalid mint length: {len(mint_bytes)} bytes")
+            return None
+        if len(program_bytes) != 32:
+            logging.error(f"Invalid program ID length: {len(program_bytes)} bytes")
+            return None
+        
+        # Crear PublicKey desde bytes
+        if USING_SOLDERS:
+            from solders.pubkey import Pubkey
+            program_pubkey = Pubkey(program_bytes)
+            seeds = [b"bonding_curve", mint_bytes]
+            pda, bump = Pubkey.find_program_address(seeds, program_pubkey)
+        else:
+            program_pubkey = PublicKey(program_bytes)
+            seeds = [b"bonding_curve", mint_bytes]
+            pda, bump = PublicKey.find_program_address(seeds, program_pubkey)
+        
+        result = str(pda)
+        logging.info(f"✅ Calculated bonding curve PDA for {mint[:8]}...: {result[:16]}...")
+        return result
+        
     except Exception as e:
         logging.error(f"❌ Failed to compute bonding curve PDA for {mint}: {e}")
+        import traceback
+        logging.debug(traceback.format_exc())
         return None
 
 # -----------------------
