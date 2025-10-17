@@ -35,7 +35,7 @@ from fastapi import FastAPI, Request, Response, BackgroundTasks
 import redis.asyncio as aioredis
 
 # Solana / Anchor
-from solders.pubkey import Pubkey  # en lugar de solana.publickey.PublicKey
+from solana.publickey import PublicKey
 from solana.rpc.async_api import AsyncClient as SolanaAsyncClient
 
 # Anchorpy (optional decoding / program usage if available)
