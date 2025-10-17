@@ -4,7 +4,7 @@ aiohttp==3.9.0
 certifi==2025.8.3
 charset-normalizer==3.4.3
 construct==2.10.67
-construct-typing==0.5.1
+construct-typing==0.6.2
 h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
