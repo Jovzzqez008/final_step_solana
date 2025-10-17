@@ -381,34 +381,26 @@ class Notification:
         return InlineKeyboardMarkup(kb)
 
 # -----------------------
-# Compute associated bonding curve PDA (best-effort)
+# Compute bonding curve PDA from mint (NUEVA FUNCIÓN MEJORADA)
 # -----------------------
-def compute_associated_bonding_curve_pda(bonding_curve_pubkey: PublicKey, mint_pubkey: PublicKey) -> PublicKey:
+def compute_bonding_curve_pda(mint: str) -> Optional[str]:
     """
-    Best-effort: Many have used seeds [bonding_curve, token_program_id, mint] and associated token program.
-    We try several common PDA derivations used by pump.fun ecosystem.
+    Calcula la bonding curve PDA directamente desde el mint address
+    Basado en la implementación común de pump.fun
     """
-    # CORREGIDO: Usar constructor directo en lugar de from_string
-    PROGRAM_PUBKEY = PublicKey(PUMP_FUN_IDL['metadata']['address'])
-    tokenprog = PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-    atoken_program = PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
-
-    # Try 1: associated bonding curve (bondingCurve + tokenprog + mint) with atoken program
-    seeds1 = [bytes(bonding_curve_pubkey), bytes(tokenprog), bytes(mint_pubkey)]
     try:
-        pda1, bump1 = PublicKey.find_program_address(seeds1, atoken_program)
-        return pda1
-    except Exception:
-        pass
-    # Try 2: seeds with program id
-    seeds2 = [b"bonding_curve", bytes(bonding_curve_pubkey)]
-    try:
-        pda2, bump2 = PublicKey.find_program_address(seeds2, PROGRAM_PUBKEY)
-        return pda2
-    except Exception:
-        pass
-    # Fallback: return bonding_curve_pubkey itself (caller must handle)
-    return bonding_curve_pubkey
+        PROGRAM_PUBKEY = PublicKey(PUMP_FUN_IDL['metadata']['address'])
+        mint_pubkey = PublicKey(mint)
+        
+        # Método más común: seeds = [b"bonding_curve", mint_bytes]
+        seeds = [b"bonding_curve", bytes(mint_pubkey)]
+        pda, bump = PublicKey.find_program_address(seeds, PROGRAM_PUBKEY)
+        
+        logging.debug(f"Calculated bonding curve PDA for {mint[:8]}...: {pda}")
+        return str(pda)
+    except Exception as e:
+        logging.debug(f"Failed to compute bonding curve PDA for {mint}: {e}")
+        return None
 
 # -----------------------
 # Parse bonding curve account (on-chain) via getAccountInfo base64
@@ -451,7 +443,7 @@ def parse_bonding_curve_account_b64(b64data: str) -> Optional[Dict]:
         return None
 
 # -----------------------
-# Token Manager
+# Token Manager (MEJORADO con bonding curve detection)
 # -----------------------
 class TokenManager:
     def __init__(self, cfg: Config, db: Database, rpc: RPCClient, redis_client):
@@ -468,6 +460,13 @@ class TokenManager:
     async def add_token(self, mint: str, symbol: str="UNKNOWN", name: str="UNKNOWN", bonding_curve: Optional[str]=None, initial_price: float=0.0, initial_market_cap: float=0.0):
         if mint in self.monitored:
             return
+        
+        # Si no tenemos bonding_curve, intentar calcularla
+        if not bonding_curve:
+            bonding_curve = compute_bonding_curve_pda(mint)
+            if bonding_curve:
+                logging.info(f"Calculated bonding curve PDA for {symbol}: {bonding_curve[:16]}...")
+        
         token = TokenData(mint=mint, symbol=symbol, name=name,
                           initial_price=initial_price,
                           initial_market_cap=initial_market_cap,
@@ -478,7 +477,7 @@ class TokenManager:
         token.last_checked = datetime.now(timezone.utc)
         await self.db.upsert_token(token)
         self.tasks[mint] = asyncio.create_task(self._monitor(mint))
-        logging.info(f"Started monitoring {symbol} ({mint[:8]}...)")
+        logging.info(f"Started monitoring {symbol} ({mint[:8]}...) - Bonding curve: {bonding_curve[:16] if bonding_curve else 'None'}")
 
     async def _monitor(self, mint: str):
         async with self.semaphore:
@@ -498,31 +497,39 @@ class TokenManager:
                     # ensure rpc session open
                     if not self.rpc.session:
                         await self.rpc.__aenter__()
+                    
+                    # Intentar DexScreener primero
                     try:
                         price_data = await self._price_from_dexscreener(mint)
-                    except Exception:
+                    except Exception as e:
+                        logging.debug(f"DexScreener failed for {mint}: {e}")
                         price_data = None
 
-                    # fallback to on-chain bonding curve if available
+                    # Si DexScreener falla, intentar bonding curve on-chain
                     if not price_data:
+                        # Si no tenemos bonding_curve, intentar calcularla
+                        if not token.bonding_curve:
+                            token.bonding_curve = compute_bonding_curve_pda(mint)
+                            if token.bonding_curve:
+                                logging.info(f"Calculated bonding curve PDA for {token.symbol}: {token.bonding_curve[:16]}...")
+                                await self.db.upsert_token(token)  # Actualizar en DB
+
                         if token.bonding_curve:
                             try:
                                 acc = await self.rpc.get_account_base64(token.bonding_curve)
                                 if acc and acc.get('value') and acc['value'].get('data'):
                                     parsed = parse_bonding_curve_account_b64(acc['value']['data'][0])
-                                    if parsed:
-                                        price_data = {'price': parsed['price'], 'market_cap': parsed['market_cap'], 'source': 'bonding_curve', 'complete': parsed['complete']}
-                            except Exception:
+                                    if parsed and not parsed.get('complete', True):
+                                        price_data = {
+                                            'price': parsed['price'], 
+                                            'market_cap': parsed['market_cap'], 
+                                            'source': 'bonding_curve', 
+                                            'complete': parsed['complete']
+                                        }
+                                        logging.debug(f"Got price from bonding curve for {token.symbol}: {parsed['price']}")
+                            except Exception as e:
+                                logging.debug(f"Bonding curve RPC failed for {mint}: {e}")
                                 price_data = None
-                        else:
-                            # try computing bonding curve PDA heuristics (best-effort)
-                            try:
-                                # attempt to compute bonding curve PDA from mint (some heuristics)
-                                # This is expensive: requires on-chain data exploration. We'll try a common PDA derivation:
-                                # not implemented full scan here; skip for now
-                                pass
-                            except Exception:
-                                pass
 
                     if not price_data:
                         await asyncio.sleep(self.cfg.PRICE_POLL_INTERVAL_SEC)
