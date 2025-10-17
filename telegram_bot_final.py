@@ -388,10 +388,10 @@ def compute_associated_bonding_curve_pda(bonding_curve_pubkey: PublicKey, mint_p
     Best-effort: Many have used seeds [bonding_curve, token_program_id, mint] and associated token program.
     We try several common PDA derivations used by pump.fun ecosystem.
     """
-    # CORREGIDO: Usar from_string para crear PublicKeys
-    PROGRAM_PUBKEY = PublicKey.from_string(PUMP_FUN_IDL['metadata']['address'])
-    tokenprog = PublicKey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-    atoken_program = PublicKey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    # CORREGIDO: Usar constructor directo en lugar de from_string
+    PROGRAM_PUBKEY = PublicKey(PUMP_FUN_IDL['metadata']['address'])
+    tokenprog = PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    atoken_program = PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 
     # Try 1: associated bonding curve (bondingCurve + tokenprog + mint) with atoken program
     seeds1 = [bytes(bonding_curve_pubkey), bytes(tokenprog), bytes(mint_pubkey)]
