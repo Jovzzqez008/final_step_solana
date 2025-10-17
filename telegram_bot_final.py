@@ -694,13 +694,16 @@ def create_app(bot_instance):
             data = await request.json()
         except Exception:
             return Response(status_code=400)
+        
         # simple parsing
         message = data.get("message") or data.get("edited_message") or {}
         if not message:
             return {"ok": True}
+            
         chat = message.get("chat", {})
         text = message.get("text", "")
         from_user = message.get("from", {})
+        
         # only accept from configured chat id if set
         allowed = True
         if bot_instance.config.TELEGRAM_CHAT_ID:
@@ -708,6 +711,7 @@ def create_app(bot_instance):
         if not allowed:
             logging.debug("Telegram update from unauthorized chat; ignored")
             return {"ok": True}
+            
         # handle commands
         if text and text.startswith("/"):
             if text.split()[0] == "/start":
@@ -716,15 +720,28 @@ def create_app(bot_instance):
                     [InlineKeyboardButton("▶️ Iniciar Monitor", callback_data="cmd:start_monitor")],
                     [InlineKeyboardButton("📊 Status", callback_data="cmd:status"), InlineKeyboardButton("🔍 Tokens", callback_data="cmd:tokens")]
                 ])
-                await bot_instance.bot.send_message(chat_id=chat.get("id"), text="🤖 *Pump.fun Bot*\nUse the buttons below.", parse_mode="Markdown", reply_markup=kb)
+                # CORREGIDO: Usar await con send_message
+                await bot_instance.bot.send_message(
+                    chat_id=chat.get("id"), 
+                    text="🤖 *Pump.fun Bot*\nUse the buttons below.", 
+                    parse_mode="Markdown", 
+                    reply_markup=kb
+                )
                 return {"ok": True}
+                
             if text.split()[0] == "/iniciar":
                 # start the WSS monitoring
                 if not bot_instance.portal_task:
                     bot_instance.portal_task = asyncio.create_task(bot_instance.portal_listener.connect())
-                    await bot_instance.bot.send_message(chat_id=chat.get("id"), text="▶️ Monitoring started (PumpPortal).")
+                    await bot_instance.bot.send_message(
+                        chat_id=chat.get("id"), 
+                        text="▶️ Monitoring started (PumpPortal)."
+                    )
                 else:
-                    await bot_instance.bot.send_message(chat_id=chat.get("id"), text="⚠️ Already running.")
+                    await bot_instance.bot.send_message(
+                        chat_id=chat.get("id"), 
+                        text="⚠️ Already running."
+                    )
                 return {"ok": True}
 
         # also handle callback_query style updates (Telegram sends them under 'callback_query')
@@ -811,7 +828,8 @@ class PumpFunService:
             if webhook_url:
                 full = webhook_url.rstrip("/") + self.config.TELEGRAM_WEBHOOK_PATH
                 try:
-                    self.bot.set_webhook(url=full)
+                    # CORREGIDO: Añadir await para set_webhook
+                    await self.bot.set_webhook(url=full)
                     logging.info(f"✅ Telegram webhook set to {full}")
                 except Exception as e:
                     logging.error(f"Failed to set webhook: {e}")
