@@ -484,7 +484,15 @@ class TokenManager:
 
     async def add_token(self, mint: str, symbol: str="UNKNOWN", name: str="UNKNOWN", bonding_curve: Optional[str]=None, initial_price: float=0.0, initial_market_cap: float=0.0):
         if mint in self.monitored:
+            logging.debug(f"Token {mint} already being monitored - skipping")
             return
+        
+        # ✅ DEBUG: Log de entrada
+        logging.info(f"➕ Adding token: {symbol} ({name})")
+        logging.info(f"   Mint: {mint}")
+        logging.info(f"   Initial price: ${initial_price}")
+        logging.info(f"   Initial mcap: ${initial_market_cap}")
+        logging.info(f"   Bonding curve from source: {bonding_curve[:16] if bonding_curve else 'None'}...")
         
         # FORZAR cálculo de bonding_curve SIEMPRE (incluso si PumpPortal envía una)
         calculated_bonding_curve = compute_bonding_curve_pda(mint)
@@ -492,7 +500,44 @@ class TokenManager:
             bonding_curve = calculated_bonding_curve
             logging.info(f"✅ Forced bonding curve calculation for {symbol}: {bonding_curve[:16]}...")
         else:
-            logging.warning(f"⚠️ Could not calculate bonding curve for {symbol}")
+            logging.warning(f"⚠️ Could not calculate bonding curve for {symbol} ({mint[:8]}...)")
+        
+        # ✅ FIX: Si no tenemos precio inicial, intentar obtenerlo inmediatamente
+        if initial_price == 0.0:
+            logging.warning(f"⚠️ No initial price from WSS for {symbol}, fetching immediately...")
+            
+            # Asegurar que la sesión RPC esté abierta
+            if not self.rpc.session:
+                self.rpc.session = aiohttp.ClientSession()
+            
+            # Intentar DexScreener primero
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+                    async with session.get(url, timeout=6) as resp:
+                        if resp.status == 200:
+                            js = await resp.json()
+                            if js.get('pairs'):
+                                p = js['pairs'][0]
+                                initial_price = float(p.get('priceUsd', p.get('price', 0)))
+                                initial_market_cap = float(p.get('marketCap', 0) or 0)
+                                logging.info(f"✅ Got initial price from DexScreener: ${initial_price}")
+            except Exception as e:
+                logging.debug(f"DexScreener immediate fetch failed: {e}")
+            
+            # Si DexScreener falla, intentar bonding curve
+            if initial_price == 0.0 and bonding_curve:
+                try:
+                    logging.info(f"🔄 Trying bonding curve for initial price...")
+                    acc = await self.rpc.get_account_base64(bonding_curve)
+                    if acc and acc.get('value') and acc['value'].get('data'):
+                        parsed = parse_bonding_curve_account_b64(acc['value']['data'][0])
+                        if parsed and parsed['price'] > 0:
+                            initial_price = parsed['price']
+                            initial_market_cap = parsed['market_cap']
+                            logging.info(f"✅ Got initial price from bonding curve: ${initial_price}")
+                except Exception as e:
+                    logging.debug(f"Bonding curve immediate fetch failed: {e}")
         
         token = TokenData(mint=mint, symbol=symbol, name=name,
                           initial_price=initial_price,
@@ -502,9 +547,13 @@ class TokenManager:
                           bonding_curve=bonding_curve)
         self.monitored[mint] = token
         token.last_checked = datetime.now(timezone.utc)
+        
+        # ✅ DEBUG: Log antes de guardar en DB
+        logging.info(f"💾 Saving to DB: {symbol} with initial_price=${initial_price}, bonding_curve={bonding_curve[:16] if bonding_curve else 'None'}...")
         await self.db.upsert_token(token)
+        
         self.tasks[mint] = asyncio.create_task(self._monitor(mint))
-        logging.info(f"Started monitoring {symbol} ({mint[:8]}...) - Bonding curve: {bonding_curve[:16] if bonding_curve else 'None'}")
+        logging.info(f"✅ Started monitoring {symbol} ({mint[:8]}...) - Initial price: ${initial_price}, Bonding curve: {bonding_curve[:16] if bonding_curve else 'None'}")
 
     async def _monitor(self, mint: str):
         async with self.semaphore:
@@ -528,14 +577,18 @@ class TokenManager:
                     # Intentar DexScreener primero
                     try:
                         price_data = await self._price_from_dexscreener(mint)
+                        if price_data:
+                            logging.debug(f"💰 DexScreener price for {token.symbol}: ${price_data['price']}")
                     except Exception as e:
                         logging.debug(f"DexScreener failed for {mint}: {e}")
                         price_data = None
 
                     # Si DexScreener falla, intentar bonding curve on-chain
                     if not price_data:
+                        logging.debug(f"🔄 DexScreener failed for {token.symbol}, trying bonding curve...")
                         # Si no tenemos bonding_curve, intentar calcularla de nuevo
                         if not token.bonding_curve:
+                            logging.warning(f"⚠️ No bonding curve stored for {token.symbol}, recalculating...")
                             token.bonding_curve = compute_bonding_curve_pda(mint)
                             if token.bonding_curve:
                                 logging.info(f"Recalculated bonding curve PDA for {token.symbol}: {token.bonding_curve[:16]}...")
@@ -543,6 +596,7 @@ class TokenManager:
 
                         if token.bonding_curve:
                             try:
+                                logging.debug(f"📡 Fetching bonding curve account: {token.bonding_curve[:16]}...")
                                 acc = await self.rpc.get_account_base64(token.bonding_curve)
                                 if acc and acc.get('value') and acc['value'].get('data'):
                                     parsed = parse_bonding_curve_account_b64(acc['value']['data'][0])
@@ -553,14 +607,16 @@ class TokenManager:
                                             'source': 'bonding_curve', 
                                             'complete': parsed['complete']
                                         }
-                                        logging.debug(f"Got price from bonding curve for {token.symbol}: {parsed['price']}")
+                                        logging.info(f"✅ Got price from bonding curve for {token.symbol}: ${parsed['price']:.8f}")
                                     else:
-                                        logging.debug(f"Could not parse bonding curve data for {token.symbol}")
+                                        logging.warning(f"⚠️ Could not parse bonding curve data for {token.symbol}")
                                 else:
-                                    logging.debug(f"No bonding curve account data for {token.symbol}")
+                                    logging.warning(f"⚠️ No bonding curve account data for {token.symbol} at {token.bonding_curve[:16]}...")
                             except Exception as e:
-                                logging.debug(f"Bonding curve RPC failed for {mint}: {e}")
+                                logging.warning(f"❌ Bonding curve RPC failed for {mint}: {e}")
                                 price_data = None
+                        else:
+                            logging.warning(f"❌ No bonding curve available for {token.symbol} - cannot fetch price")
 
                     if not price_data:
                         await asyncio.sleep(self.cfg.PRICE_POLL_INTERVAL_SEC)
@@ -686,25 +742,40 @@ class PumpPortalListener:
                 self.ws = None
 
     async def _handle(self, payload: Dict):
+        # ✅ DEBUG: Log completo del payload recibido
+        logging.debug(f"📥 WSS payload received: {json.dumps(payload, indent=2)}")
+        
         if 'data' in payload and isinstance(payload['data'], dict):
             p = payload['data']
         else:
             p = payload
+        
         mint = p.get('mint') or p.get('token') or None
         symbol = p.get('symbol') or p.get('tokenSymbol') or 'UNKNOWN'
         name = p.get('name') or p.get('tokenName') or symbol
         bonding_curve = p.get('bondingCurve') or p.get('bonding_curve') or None
         initial_price = 0.0
         initial_mcap = 0.0
+        
+        # ✅ DEBUG: Log de parsing
+        logging.info(f"🔍 Parsing token: mint={mint}, symbol={symbol}, name={name}")
+        logging.info(f"🔍 Bonding curve from WSS: {bonding_curve}")
+        
         if isinstance(p.get('pairs'), list) and p.get('pairs'):
             try:
                 initial_price = float(p['pairs'][0].get('priceUsd', p['pairs'][0].get('price', 0)))
                 initial_mcap = float(p['pairs'][0].get('marketCap', 0) or 0)
-            except Exception:
+                logging.info(f"💰 Initial price from WSS: ${initial_price}, mcap: ${initial_mcap}")
+            except Exception as e:
+                logging.warning(f"⚠️ Failed to parse price from WSS pairs: {e}")
                 initial_price = 0.0
+        else:
+            logging.warning(f"⚠️ No pairs data in WSS message for {symbol}")
+        
         if not mint:
-            logging.debug("WSS message without mint")
+            logging.warning("❌ WSS message without mint - ignoring")
             return
+        
         await self.manager.add_token(mint=str(mint), symbol=symbol, name=name, bonding_curve=bonding_curve, initial_price=initial_price, initial_market_cap=initial_mcap)
 
     async def stop(self):
