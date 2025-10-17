@@ -1,28 +1,21 @@
 {
   "alert_rules": [
     {
-      "name": "quick_double",
+      "name": "ultra_fast_2x",
       "alert_percent": 100.0,
-      "time_window_min": 3,
-      "description": "2x en 3 minutos (muy rápido)"
-    },
-    {
-      "name": "fast_3x",
-      "alert_percent": 200.0,
       "time_window_min": 10,
-      "description": "3x en 10 minutos (momentum fuerte)"
+      "description": "2x en 10 minutos"
     },
     {
-      "name": "solid_5x",
-      "alert_percent": 400.0,
-      "time_window_min": 20,
-      "description": "5x en 20 minutos (explosivo)"
+      "name": "fast_150",
+      "alert_percent": 150.0,
+      "time_window_min": 15,
+      "description": "2.5x en 15 minutos"
     }
   ],
   "monitoring": {
-    "max_monitor_time_min": 20,
-    "dump_threshold_percent": -70,
-    "price_poll_interval_sec": 2,
-    "max_concurrent_monitors": 2000
+    "max_monitor_time_min": 25,
+    "dump_threshold_percent": -50,
+    "price_poll_interval_sec": 3
   }
 }
