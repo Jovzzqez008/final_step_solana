@@ -107,6 +107,18 @@ class Config:
         self.HELIUS_RPC_URL = os.getenv('HELIUS_RPC_URL', data.get('helius_rpc_url', ''))
         self.PUMPPORTAL_WSS = os.getenv('PUMPPORTAL_WSS', data.get('pumpportal_wss', 'wss://pumpportal.fun/api/data'))
         self.REDIS_URL = os.getenv('REDIS_URL', data.get('redis_url', 'redis://localhost:6379/0'))
+        
+        # ✅ NUEVO: Helius WebSocket URL (si existe HELIUS_RPC_URL, construir WSS)
+        self.HELIUS_WSS = os.getenv('HELIUS_WSS', None)
+        if not self.HELIUS_WSS and self.HELIUS_RPC_URL:
+            # Extraer API key del RPC URL y construir WSS
+            # Ejemplo: https://mainnet.helius-rpc.com/?api-key=XXX -> wss://atlas-mainnet.helius-rpc.com?api-key=XXX
+            if 'api-key=' in self.HELIUS_RPC_URL:
+                api_key = self.HELIUS_RPC_URL.split('api-key=')[1].split('&')[0]
+                self.HELIUS_WSS = f"wss://atlas-mainnet.helius-rpc.com?api-key={api_key}"
+                logging.info(f"✅ Helius WSS auto-configured from RPC URL")
+        
+        self.USE_HELIUS_WSS = os.getenv('USE_HELIUS_WSS', 'true').lower() == 'true'
 
         # alert rules (allow override)
         self.ALERT_RULES = data.get('alert_rules', [
@@ -701,7 +713,166 @@ class TokenManager:
         logging.info(f"Removed {mint}: {reason}")
 
 # -----------------------
-# PumpPortal websocket listener (adds tokens to manager)
+# Helius WebSocket Listener (NEW - replaces PumpPortal)
+# -----------------------
+class HeliusListener:
+    def __init__(self, cfg: Config, manager: TokenManager):
+        self.cfg = cfg
+        self.manager = manager
+        self.running = False
+        self.ws = None
+        self.reconnect = 5
+        self.max_reconnect = 60
+        self.pump_program_id = PUMP_FUN_IDL['metadata']['address']
+
+    async def connect(self):
+        if not self.cfg.HELIUS_WSS:
+            logging.error("❌ HELIUS_WSS not configured, cannot start Helius listener")
+            return
+            
+        self.running = True
+        uri = self.cfg.HELIUS_WSS
+        
+        while self.running:
+            try:
+                logging.info(f"🔌 Connecting to Helius WSS: {uri[:50]}...")
+                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
+                    self.ws = websocket
+                    self.reconnect = 5
+                    
+                    # Subscribe to program logs for pump.fun
+                    subscribe_msg = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "logsSubscribe",
+                        "params": [
+                            {
+                                "mentions": [self.pump_program_id]
+                            },
+                            {
+                                "commitment": "confirmed"
+                            }
+                        ]
+                    }
+                    
+                    await websocket.send(json.dumps(subscribe_msg))
+                    logging.info(f"✅ Subscribed to pump.fun program logs")
+                    
+                    async for raw in websocket:
+                        try:
+                            data = json.loads(raw)
+                            await self._handle(data)
+                        except json.JSONDecodeError:
+                            logging.debug("Invalid JSON from Helius WSS")
+                        except Exception as e:
+                            logging.error(f"Helius WSS message handling failed: {e}")
+                            
+            except Exception as e:
+                logging.error(f"❌ Helius WSS connection error: {e}")
+                await asyncio.sleep(self.reconnect)
+                self.reconnect = min(self.reconnect * 2, self.max_reconnect)
+            finally:
+                self.ws = None
+
+    async def _handle(self, payload: Dict):
+        try:
+            # Helius sends logs in this format:
+            # {"jsonrpc":"2.0","method":"logsNotification","params":{"result":{"value":{"signature":"...","logs":[...]}}}}
+            if payload.get('method') != 'logsNotification':
+                return
+                
+            result = payload.get('params', {}).get('result', {}).get('value', {})
+            logs = result.get('logs', [])
+            signature = result.get('signature', '')
+            
+            # Look for "Program log: Instruction: Create" which indicates new token
+            is_create = any('Instruction: Create' in log or 'create' in log.lower() for log in logs)
+            
+            if not is_create:
+                return
+                
+            logging.debug(f"🆕 Detected potential new token in tx: {signature[:16]}...")
+            
+            # Fetch transaction details to extract mint address
+            if not self.manager.rpc.session:
+                self.manager.rpc.session = aiohttp.ClientSession()
+                
+            try:
+                tx_data = await self.manager.rpc.rpc("getTransaction", [
+                    signature,
+                    {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}
+                ])
+                
+                if not tx_data:
+                    logging.debug(f"Could not fetch tx data for {signature[:16]}...")
+                    return
+                    
+                # Extract mint from transaction
+                mint = await self._extract_mint_from_tx(tx_data)
+                
+                if mint:
+                    logging.info(f"🎯 New token detected from Helius: {mint[:16]}...")
+                    # Fetch metadata from chain or use placeholder
+                    await self.manager.add_token(
+                        mint=mint,
+                        symbol="UNKNOWN",
+                        name="UNKNOWN",
+                        bonding_curve=None,
+                        initial_price=0.0,
+                        initial_market_cap=0.0
+                    )
+                    
+            except Exception as e:
+                logging.debug(f"Error processing Helius tx {signature[:16]}: {e}")
+                
+        except Exception as e:
+            logging.error(f"Error in Helius handler: {e}")
+
+    async def _extract_mint_from_tx(self, tx_data: Dict) -> Optional[str]:
+        """Extract mint address from transaction data"""
+        try:
+            # Navigate through transaction structure
+            meta = tx_data.get('meta', {})
+            transaction = tx_data.get('transaction', {})
+            message = transaction.get('message', {})
+            instructions = message.get('instructions', [])
+            
+            # Look for token mint in postTokenBalances or instructions
+            post_balances = meta.get('postTokenBalances', [])
+            for balance in post_balances:
+                mint = balance.get('mint')
+                if mint and mint.endswith('pump'):
+                    return mint
+                    
+            # Alternative: look in account keys
+            account_keys = message.get('accountKeys', [])
+            for key in account_keys:
+                if isinstance(key, dict):
+                    pubkey = key.get('pubkey', '')
+                elif isinstance(key, str):
+                    pubkey = key
+                else:
+                    continue
+                    
+                if pubkey.endswith('pump'):
+                    return pubkey
+                    
+            return None
+            
+        except Exception as e:
+            logging.debug(f"Error extracting mint: {e}")
+            return None
+
+    async def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+# -----------------------
+# PumpPortal websocket listener (LEGACY - kept as fallback)
 # -----------------------
 class PumpPortalListener:
     def __init__(self, cfg: Config, manager: TokenManager):
@@ -840,12 +1011,18 @@ def create_app(bot_instance):
                 return {"ok": True}
                 
             elif command == "/iniciar":
-                # start the WSS monitoring
-                if not bot_instance.portal_task:
+                # start the WSS monitoring - prefer Helius over PumpPortal
+                if bot_instance.helius_listener and not bot_instance.helius_task:
+                    bot_instance.helius_task = asyncio.create_task(bot_instance.helius_listener.connect())
+                    await bot_instance.bot.send_message(
+                        chat_id=chat.get("id"), 
+                        text="▶️ Monitoring started (Helius WebSocket)."
+                    )
+                elif not bot_instance.portal_task:
                     bot_instance.portal_task = asyncio.create_task(bot_instance.portal_listener.connect())
                     await bot_instance.bot.send_message(
                         chat_id=chat.get("id"), 
-                        text="▶️ Monitoring started (PumpPortal)."
+                        text="▶️ Monitoring started (PumpPortal - fallback)."
                     )
                 else:
                     await bot_instance.bot.send_message(
@@ -856,11 +1033,17 @@ def create_app(bot_instance):
                 
             elif command == "/status":
                 # ✅ NUEVO: Comando /status directo
+                wss_status = "❌"
+                if bot_instance.helius_listener and bot_instance.helius_listener.ws:
+                    wss_status = "✅ Helius"
+                elif bot_instance.portal_listener and bot_instance.portal_listener.ws:
+                    wss_status = "✅ PumpPortal"
+                    
                 status_text = (
                     f"📊 *Estado del Bot*\n\n"
                     f"• Tokens monitoreados: {len(bot_instance.token_manager.monitored)}\n"
                     f"• Tareas activas: {len(bot_instance.token_manager.tasks)}\n"
-                    f"• WSS conectado: {'✅' if bot_instance.portal_listener.ws is not None else '❌'}\n"
+                    f"• WSS conectado: {wss_status}\n"
                     f"• Redis: {'✅' if bot_instance.redis else '❌'}\n"
                     f"• DB: {'✅' if bot_instance.db.pool else '❌'}\n"
                     f"• Alertas enviadas: {len(bot_instance.token_manager.alerted)}"
@@ -896,18 +1079,28 @@ def create_app(bot_instance):
             cd = cq.get("data", "")
             cid = cq['message']['chat']['id']
             if cd == "cmd:start_monitor":
-                if not bot_instance.portal_task:
+                # Prefer Helius over PumpPortal
+                if bot_instance.helius_listener and not bot_instance.helius_task:
+                    bot_instance.helius_task = asyncio.create_task(bot_instance.helius_listener.connect())
+                    await bot_instance.bot.send_message(chat_id=cid, text="▶️ Monitoring started (Helius).")
+                elif not bot_instance.portal_task:
                     bot_instance.portal_task = asyncio.create_task(bot_instance.portal_listener.connect())
                     await bot_instance.bot.send_message(chat_id=cid, text="▶️ Monitoring started (PumpPortal).")
                 else:
                     await bot_instance.bot.send_message(chat_id=cid, text="⚠️ Already running.")
                 return {"ok": True}
             elif cd == "cmd:status":
+                wss_status = "❌"
+                if bot_instance.helius_listener and bot_instance.helius_listener.ws:
+                    wss_status = "✅ Helius"
+                elif bot_instance.portal_listener and bot_instance.portal_listener.ws:
+                    wss_status = "✅ PumpPortal"
+                    
                 status_text = (
                     f"📊 *Estado del Bot*\n\n"
                     f"• Tokens monitoreados: {len(bot_instance.token_manager.monitored)}\n"
                     f"• Tareas activas: {len(bot_instance.token_manager.tasks)}\n"
-                    f"• WSS conectado: {'✅' if bot_instance.portal_listener.ws is not None else '❌'}\n"
+                    f"• WSS conectado: {wss_status}\n"
                     f"• Redis: {'✅' if bot_instance.redis else '❌'}\n"
                     f"• DB: {'✅' if bot_instance.db.pool else '❌'}\n"
                     f"• Alertas enviadas: {len(bot_instance.token_manager.alerted)}"
@@ -957,8 +1150,10 @@ class PumpFunService:
         self.redis = None
         # manager and listener created after redis & db connections
         self.token_manager = None
+        self.helius_listener = None  # ✅ NUEVO
         self.portal_listener = None
         self.portal_task = None
+        self.helius_task = None  # ✅ NUEVO
         self.fastapi_app = None
         self.http_server = None
 
@@ -978,8 +1173,17 @@ class PumpFunService:
 
         # init token manager and portal
         self.token_manager = TokenManager(self.config, self.db, self.rpc, self.redis)
+        
+        # ✅ NUEVO: Inicializar Helius listener si está configurado
+        if self.config.USE_HELIUS_WSS and self.config.HELIUS_WSS:
+            self.helius_listener = HeliusListener(self.config, self.token_manager)
+            logging.info("✅ Helius listener initialized (will be used instead of PumpPortal)")
+        else:
+            self.helius_listener = None
+            
         self.portal_listener = PumpPortalListener(self.config, self.token_manager)
         self.portal_task = None
+        self.helius_task = None
 
         # set webhook for telegram to our domain (if token and domain provided)
         if self.bot and self.config.TELEGRAM_BOT_TOKEN:
@@ -1002,6 +1206,12 @@ class PumpFunService:
 
     async def stop(self):
         # cancel tasks
+        if self.helius_task:
+            try:
+                self.helius_listener.running = False
+                self.helius_task.cancel()
+            except Exception:
+                pass
         if self.portal_task:
             try:
                 self.portal_listener.running = False
