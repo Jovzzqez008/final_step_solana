@@ -381,7 +381,7 @@ class Notification:
         return InlineKeyboardMarkup(kb)
 
 # -----------------------
-# Compute bonding curve PDA from mint (NUEVA FUNCIÓN MEJORADA)
+# Compute bonding curve PDA from mint (MEJORADA)
 # -----------------------
 def compute_bonding_curve_pda(mint: str) -> Optional[str]:
     """
@@ -396,10 +396,10 @@ def compute_bonding_curve_pda(mint: str) -> Optional[str]:
         seeds = [b"bonding_curve", bytes(mint_pubkey)]
         pda, bump = PublicKey.find_program_address(seeds, PROGRAM_PUBKEY)
         
-        logging.debug(f"Calculated bonding curve PDA for {mint[:8]}...: {pda}")
+        logging.info(f"✅ Calculated bonding curve PDA for {mint[:8]}...: {pda}")
         return str(pda)
     except Exception as e:
-        logging.debug(f"Failed to compute bonding curve PDA for {mint}: {e}")
+        logging.error(f"❌ Failed to compute bonding curve PDA for {mint}: {e}")
         return None
 
 # -----------------------
@@ -443,7 +443,7 @@ def parse_bonding_curve_account_b64(b64data: str) -> Optional[Dict]:
         return None
 
 # -----------------------
-# Token Manager (MEJORADO con bonding curve detection)
+# Token Manager (MEJORADO con bonding curve detection forzada)
 # -----------------------
 class TokenManager:
     def __init__(self, cfg: Config, db: Database, rpc: RPCClient, redis_client):
@@ -461,11 +461,13 @@ class TokenManager:
         if mint in self.monitored:
             return
         
-        # Si no tenemos bonding_curve, intentar calcularla
-        if not bonding_curve:
-            bonding_curve = compute_bonding_curve_pda(mint)
-            if bonding_curve:
-                logging.info(f"Calculated bonding curve PDA for {symbol}: {bonding_curve[:16]}...")
+        # FORZAR cálculo de bonding_curve SIEMPRE (incluso si PumpPortal envía una)
+        calculated_bonding_curve = compute_bonding_curve_pda(mint)
+        if calculated_bonding_curve:
+            bonding_curve = calculated_bonding_curve
+            logging.info(f"✅ Forced bonding curve calculation for {symbol}: {bonding_curve[:16]}...")
+        else:
+            logging.warning(f"⚠️ Could not calculate bonding curve for {symbol}")
         
         token = TokenData(mint=mint, symbol=symbol, name=name,
                           initial_price=initial_price,
@@ -507,11 +509,11 @@ class TokenManager:
 
                     # Si DexScreener falla, intentar bonding curve on-chain
                     if not price_data:
-                        # Si no tenemos bonding_curve, intentar calcularla
+                        # Si no tenemos bonding_curve, intentar calcularla de nuevo
                         if not token.bonding_curve:
                             token.bonding_curve = compute_bonding_curve_pda(mint)
                             if token.bonding_curve:
-                                logging.info(f"Calculated bonding curve PDA for {token.symbol}: {token.bonding_curve[:16]}...")
+                                logging.info(f"Recalculated bonding curve PDA for {token.symbol}: {token.bonding_curve[:16]}...")
                                 await self.db.upsert_token(token)  # Actualizar en DB
 
                         if token.bonding_curve:
@@ -519,7 +521,7 @@ class TokenManager:
                                 acc = await self.rpc.get_account_base64(token.bonding_curve)
                                 if acc and acc.get('value') and acc['value'].get('data'):
                                     parsed = parse_bonding_curve_account_b64(acc['value']['data'][0])
-                                    if parsed and not parsed.get('complete', True):
+                                    if parsed:
                                         price_data = {
                                             'price': parsed['price'], 
                                             'market_cap': parsed['market_cap'], 
@@ -527,6 +529,10 @@ class TokenManager:
                                             'complete': parsed['complete']
                                         }
                                         logging.debug(f"Got price from bonding curve for {token.symbol}: {parsed['price']}")
+                                    else:
+                                        logging.debug(f"Could not parse bonding curve data for {token.symbol}")
+                                else:
+                                    logging.debug(f"No bonding curve account data for {token.symbol}")
                             except Exception as e:
                                 logging.debug(f"Bonding curve RPC failed for {mint}: {e}")
                                 price_data = None
@@ -556,7 +562,7 @@ class TokenManager:
                     # evaluate alerts
                     alerts = self.alert_engine.evaluate(token, current_price, elapsed_min)
                     for alert in alerts:
-                        # dedupe via redis first
+                        # dedupe via redis first - ✅ REDIS TTL + DEDUPE FUNCIONAL
                         key = f"alert:{mint}"
                         was = await self.redis.get(key)
                         if was:
@@ -685,7 +691,7 @@ class PumpPortalListener:
                 pass
 
 # -----------------------
-# FastAPI app / webhook handling (we parse incoming updates)
+# FastAPI app / webhook handling (CORREGIDO comandos /status y /tokens)
 # -----------------------
 def create_app(bot_instance):
     app = FastAPI()
@@ -719,15 +725,16 @@ def create_app(bot_instance):
             logging.debug("Telegram update from unauthorized chat; ignored")
             return {"ok": True}
             
-        # handle commands
+        # handle commands - ✅ CORREGIDO: Agregados /status y /tokens como comandos directos
         if text and text.startswith("/"):
-            if text.split()[0] == "/start":
+            command = text.split()[0]
+            
+            if command == "/start":
                 # send menu with buttons: Iniciar (start monitoring), Status, Tokens
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("▶️ Iniciar Monitor", callback_data="cmd:start_monitor")],
                     [InlineKeyboardButton("📊 Status", callback_data="cmd:status"), InlineKeyboardButton("🔍 Tokens", callback_data="cmd:tokens")]
                 ])
-                # CORREGIDO: Usar await con send_message
                 await bot_instance.bot.send_message(
                     chat_id=chat.get("id"), 
                     text="🤖 *Pump.fun Bot*\nUse the buttons below.", 
@@ -736,7 +743,7 @@ def create_app(bot_instance):
                 )
                 return {"ok": True}
                 
-            if text.split()[0] == "/iniciar":
+            elif command == "/iniciar":
                 # start the WSS monitoring
                 if not bot_instance.portal_task:
                     bot_instance.portal_task = asyncio.create_task(bot_instance.portal_listener.connect())
@@ -750,6 +757,42 @@ def create_app(bot_instance):
                         text="⚠️ Already running."
                     )
                 return {"ok": True}
+                
+            elif command == "/status":
+                # ✅ NUEVO: Comando /status directo
+                status_text = (
+                    f"📊 *Estado del Bot*\n\n"
+                    f"• Tokens monitoreados: {len(bot_instance.token_manager.monitored)}\n"
+                    f"• Tareas activas: {len(bot_instance.token_manager.tasks)}\n"
+                    f"• WSS conectado: {'✅' if bot_instance.portal_listener.ws is not None else '❌'}\n"
+                    f"• Redis: {'✅' if bot_instance.redis else '❌'}\n"
+                    f"• DB: {'✅' if bot_instance.db.pool else '❌'}\n"
+                    f"• Alertas enviadas: {len(bot_instance.token_manager.alerted)}"
+                )
+                await bot_instance.bot.send_message(
+                    chat_id=chat.get("id"), 
+                    text=status_text,
+                    parse_mode="Markdown"
+                )
+                return {"ok": True}
+                
+            elif command == "/tokens":
+                # ✅ NUEVO: Comando /tokens directo
+                items = list(bot_instance.token_manager.monitored.items())[:15]  # Mostrar hasta 15
+                if items:
+                    msg = "🔍 *Tokens Monitoreados:*\n\n"
+                    for mint, token in items:
+                        bonding_info = f"BC: {token.bonding_curve[:16]}..." if token.bonding_curve else "BC: ❌"
+                        msg += f"• {token.symbol} ({mint[:8]}...) {bonding_info}\n"
+                else:
+                    msg = "📭 No hay tokens monitoreados actualmente."
+                
+                await bot_instance.bot.send_message(
+                    chat_id=chat.get("id"), 
+                    text=msg,
+                    parse_mode="Markdown"
+                )
+                return {"ok": True"}
 
         # also handle callback_query style updates (Telegram sends them under 'callback_query')
         if "callback_query" in data:
@@ -763,14 +806,28 @@ def create_app(bot_instance):
                 else:
                     await bot_instance.bot.send_message(chat_id=cid, text="⚠️ Already running.")
                 return {"ok": True}
-            if cd == "cmd:status":
-                text = f"Monitored tokens: {len(bot_instance.token_manager.monitored)}\nActive tasks: {len(bot_instance.token_manager.tasks)}\nWSS connected: {bot_instance.portal_listener.ws is not None}"
-                await bot_instance.bot.send_message(chat_id=cid, text=text)
+            elif cd == "cmd:status":
+                status_text = (
+                    f"📊 *Estado del Bot*\n\n"
+                    f"• Tokens monitoreados: {len(bot_instance.token_manager.monitored)}\n"
+                    f"• Tareas activas: {len(bot_instance.token_manager.tasks)}\n"
+                    f"• WSS conectado: {'✅' if bot_instance.portal_listener.ws is not None else '❌'}\n"
+                    f"• Redis: {'✅' if bot_instance.redis else '❌'}\n"
+                    f"• DB: {'✅' if bot_instance.db.pool else '❌'}\n"
+                    f"• Alertas enviadas: {len(bot_instance.token_manager.alerted)}"
+                )
+                await bot_instance.bot.send_message(chat_id=cid, text=status_text, parse_mode="Markdown")
                 return {"ok": True}
-            if cd == "cmd:tokens":
-                items = list(bot_instance.token_manager.monitored.keys())[:10]
-                msg = "Tokens:\n" + "\n".join(items) if items else "No tokens"
-                await bot_instance.bot.send_message(chat_id=cid, text=msg)
+            elif cd == "cmd:tokens":
+                items = list(bot_instance.token_manager.monitored.items())[:10]
+                if items:
+                    msg = "🔍 *Tokens Monitoreados:*\n\n"
+                    for mint, token in items:
+                        bonding_info = f"BC: {token.bonding_curve[:16]}..." if token.bonding_curve else "BC: ❌"
+                        msg += f"• {token.symbol} ({mint[:8]}...) {bonding_info}\n"
+                else:
+                    msg = "📭 No hay tokens monitoreados actualmente."
+                await bot_instance.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
                 return {"ok": True}
 
         return {"ok": True}
