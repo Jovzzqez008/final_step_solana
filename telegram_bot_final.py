@@ -34,9 +34,14 @@ from fastapi import FastAPI, Request, Response, BackgroundTasks
 # Redis asyncio client (redis-py >=5 supports asyncio)
 import redis.asyncio as aioredis
 
-# Solana / Anchor
-from solana.publickey import PublicKey
+# Solana / Anchor - CORREGIDO: Importación actualizada
 from solana.rpc.async_api import AsyncClient as SolanaAsyncClient
+
+# CORREGIDO: Importación actualizada para PublicKey
+try:
+    from solders.pubkey import Pubkey as PublicKey
+except ImportError:
+    from solana.publickey import PublicKey
 
 # Anchorpy (optional decoding / program usage if available)
 try:
@@ -383,9 +388,10 @@ def compute_associated_bonding_curve_pda(bonding_curve_pubkey: PublicKey, mint_p
     Best-effort: Many have used seeds [bonding_curve, token_program_id, mint] and associated token program.
     We try several common PDA derivations used by pump.fun ecosystem.
     """
-    PROGRAM_PUBKEY = PublicKey(PUMP_FUN_IDL['metadata']['address'])
-    tokenprog = PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
-    atoken_program = PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+    # CORREGIDO: Usar from_string para crear PublicKeys
+    PROGRAM_PUBKEY = PublicKey.from_string(PUMP_FUN_IDL['metadata']['address'])
+    tokenprog = PublicKey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+    atoken_program = PublicKey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 
     # Try 1: associated bonding curve (bondingCurve + tokenprog + mint) with atoken program
     seeds1 = [bytes(bonding_curve_pubkey), bytes(tokenprog), bytes(mint_pubkey)]
