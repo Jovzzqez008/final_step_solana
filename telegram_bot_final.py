@@ -1065,13 +1065,16 @@ def create_app(bot_instance):
             "rpc_providers": [p[0] for p in bot_instance.config.RPC_ENDPOINTS]
         }
 
-    # 🔥 HELIUS WEBHOOK
+    # 🔥 HELIUS WEBHOOK (WITH BETTER DEDUPLICATION)
+    webhook_processed_mints: deque = deque(maxlen=1000)
+    
     @app.post(bot_instance.config.HELIUS_WEBHOOK_PATH)
     async def helius_webhook(request: Request):
         try:
             data = await request.json()
             
             transactions = data if isinstance(data, list) else [data]
+            processed_count = 0
             
             for tx_data in transactions:
                 try:
@@ -1100,8 +1103,13 @@ def create_app(bot_instance):
                                     break
                     
                     if mint:
+                        # 🔥 WEBHOOK-LEVEL DEDUPLICATION
+                        if mint in webhook_processed_mints:
+                            continue
+                        
                         bonding_curve = compute_bonding_curve_pda(mint)
                         if bonding_curve:
+                            webhook_processed_mints.append(mint)
                             logging.info(f"🎯 Helius webhook: {mint}")
                             
                             symbol = "UNKNOWN"
@@ -1114,18 +1122,22 @@ def create_app(bot_instance):
                                     if len(parts) > 1:
                                         symbol = parts[0][:10]
                             
-                            await bot_instance.token_manager.add_token(
-                                mint=mint,
-                                symbol=symbol,
-                                name=name,
-                                bonding_curve=bonding_curve
+                            # Process asynchronously (don't block webhook)
+                            asyncio.create_task(
+                                bot_instance.token_manager.add_token(
+                                    mint=mint,
+                                    symbol=symbol,
+                                    name=name,
+                                    bonding_curve=bonding_curve
+                                )
                             )
+                            processed_count += 1
                 
                 except Exception as e:
                     logging.error(f"Webhook tx error: {e}")
                     continue
             
-            return {"status": "ok", "processed": len(transactions)}
+            return {"status": "ok", "processed": processed_count, "total": len(transactions)}
             
         except Exception as e:
             logging.error(f"❌ Webhook error: {e}")
