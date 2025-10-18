@@ -1,0 +1,27 @@
+{
+  "name": "pumpfun-monitor-bot",
+  "version": "1.0.0",
+  "description": "Pump.fun token monitoring bot with Telegram alerts",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node bot.js"
+  },
+  "keywords": [
+    "pump.fun",
+    "solana",
+    "trading",
+    "bot",
+    "telegram"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.2",
+    "node-telegram-bot-api": "^0.64.0",
+    "axios": "^1.6.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
