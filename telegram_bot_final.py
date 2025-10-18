@@ -1,808 +1,4 @@
-# Check dump
-                        if token.max_price > 0:
-                            loss = ((current_price - token.max_price) / token.max_price) * 100.0
-                            if loss <= self.cfg.DUMP_THRESHOLD_PERCENT:
-                                logging.info(f"📉 Dump: {token.symbol} {loss:.1f}%")
-                                await self.remove_token(mint, "dumped")
-                                return
-                        
-                        # Check timeout
-                        if elapsed_min >= self.cfg.MAX_MONITOR_TIME_MIN:
-                            await self.remove_token(mint, "timeout")
-                            return
-                        
-                        # Check alerts
-                        if token.initial_price > 0:
-                            alerts = self.alert_engine.evaluate(token, current_price, elapsed_min)
-                            for alert in alerts:
-                                key = f"alert:{mint}"
-                                if await self.redis.get(key):
-                                    continue
-                                
-                                await self.redis.set(key, "1", ex=self.cfg.CACHE_TTL_SEC)
-                                await self.db.record_alert(alert)
-                                await Notification.send_alert(token, alert)
-                                self.alerted.add(mint)
-                                
-                                logging.info(f"🚀 ALERT: {token.symbol} +{alert.gain_percent:.1f}%")
-                                await self.remove_token(mint, "alert_sent")
-                                return
-                        
-                        # Update DB
-                        if int(elapsed_min) % 2 == 0:
-                            await self.db.upsert_token(token)
-                
-        except Exception as e:
-            logging.error(f"❌ Handle message error: {e}")
-
-    async def add_token(self, token: TokenData):
-        if token.mint in self.token_data:
-            return
-        
-        self.token_data[token.mint] = token
-        await self.db.upsert_token(token)
-        
-        if self.ws:
-            await self._subscribe_to_token(token.mint)
-        
-        priority_str = "🔥 PRIORITY" if token.priority else ""
-        logging.info(f"✅ Streaming: {token.symbol} {priority_str}")
-
-    async def remove_token(self, mint: str, reason: str):
-        token = self.token_data.get(mint)
-        if not token:
-            return
-        
-        # Unsubscribe
-        if token.subscription_id and self.ws:
-            try:
-                unsubscribe_payload = {
-                    "jsonrpc": "2.0",
-                    "id": int(time.time() * 1000),
-                    "method": "accountUnsubscribe",
-                    "params": [token.subscription_id]
-                }
-                await self.ws.send(json.dumps(unsubscribe_payload))
-                
-                if token.subscription_id in self.subscription_map:
-                    del self.subscription_map[token.subscription_id]
-            except Exception:
-                pass
-        
-        token.status = reason
-        token.last_checked = datetime.now(timezone.utc)
-        await self.db.upsert_token(token)
-        
-        del self.token_data[mint]
-        logging.debug(f"🗑️ Removed: {token.symbol} ({reason})")
-
-    async def stop(self):
-        self.running = False
-        if self.ws:
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
-
-# ============================================================================
-# 🔥 TOKEN MANAGER (CON REINTENTOS DE PRECIO)
-# ============================================================================
-
-class TokenManager:
-    def __init__(self, cfg: Config, db: Database, rpc: RPCClient, streaming: StreamingManager):
-        self.cfg = cfg
-        self.db = db
-        self.rpc = rpc
-        self.streaming = streaming
-        self.processing: Set[str] = set()
-        self.processed_mints: deque = deque(maxlen=5000)
-
-    async def add_token(self, mint: str, symbol: str = "UNKNOWN", name: str = "UNKNOWN",
-                       bonding_curve: Optional[str] = None, initial_price: float = 0.0,
-                       initial_market_cap: float = 0.0):
-        
-        # 🔥 NORMALIZAR MINT (quitar "pump")
-        mint = normalize_mint(mint)
-        
-        if not mint or len(mint) != 44:
-            logging.debug(f"Invalid mint length: {mint}")
-            return
-        
-        # 🔥 DEDUPLICACIÓN
-        if mint in self.processing or mint in self.processed_mints:
-            return
-        
-        if mint in self.streaming.token_data:
-            return
-        
-        # Check limit
-        if len(self.streaming.token_data) >= self.cfg.MAX_TOKENS_MONITORED:
-            logging.warning(f"⚠️ Max tokens reached ({self.cfg.MAX_TOKENS_MONITORED})")
-            return
-        
-        # Mark as processing
-        self.processing.add(mint)
-        self.processed_mints.append(mint)
-        
-        try:
-            if not bonding_curve:
-                bonding_curve = compute_bonding_curve_pda(mint)
-            
-            if not bonding_curve:
-                logging.debug(f"Could not compute bonding curve for {mint[:8]}...")
-                return
-            
-            # Validate
-            logging.debug(f"🔍 Validating {mint[:8]}...")
-            is_valid = await validate_pump_fun_token(self.rpc, mint, bonding_curve)
-            if not is_valid:
-                logging.debug(f"❌ Invalid token: {mint[:8]}...")
-                return
-            
-            logging.info(f"🆕 New token: {mint}")
-            
-            # 🔥 BUCLE DE REINTENTOS PARA PRECIO INICIAL
-            if initial_price == 0.0:
-                for attempt in range(self.cfg.INITIAL_PRICE_RETRIES):
-                    try:
-                        if not self.rpc.session:
-                            await self.rpc.__aenter__()
-                        
-                        acc = await self.rpc.get_account_base64(bonding_curve)
-                        if acc and acc.get('value') and acc['value'].get('data'):
-                            parsed = parse_bonding_curve_account_b64(acc['value']['data'][0])
-                            if parsed and parsed['price'] > 0:
-                                initial_price = parsed['price']
-                                initial_market_cap = parsed['market_cap']
-                                logging.info(f"✅ ${mint[:8]}... Price: ${initial_price:.8f} | MCap: ${initial_market_cap:,.0f}")
-                                break
-                        
-                        if attempt < self.cfg.INITIAL_PRICE_RETRIES - 1:
-                            logging.debug(f"⏳ Retry {attempt + 1}/{self.cfg.INITIAL_PRICE_RETRIES}...")
-                            await asyncio.sleep(self.cfg.INITIAL_PRICE_RETRY_DELAY)
-                    except Exception as e:
-                        logging.debug(f"Price fetch error: {e}")
-                        if attempt < self.cfg.INITIAL_PRICE_RETRIES - 1:
-                            await asyncio.sleep(self.cfg.INITIAL_PRICE_RETRY_DELAY)
-            
-            # Skip if no price
-            if initial_price <= 0:
-                logging.warning(f"⚠️ Skipping {mint[:8]}... - no price after {self.cfg.INITIAL_PRICE_RETRIES} retries")
-                return
-            
-            # Priority
-            priority = initial_market_cap >= self.cfg.PRIORITY_THRESHOLD_MCAP
-            
-            token = TokenData(
-                mint=mint,
-                symbol=symbol,
-                name=name,
-                initial_price=initial_price,
-                initial_market_cap=initial_market_cap,
-                max_price=initial_price,
-                start_time=datetime.now(timezone.utc),
-                bonding_curve=bonding_curve,
-                priority=priority
-            )
-            
-            token.last_checked = datetime.now(timezone.utc)
-            
-            # Add to streaming
-            await self.streaming.add_token(token)
-            
-        finally:
-            if mint in self.processing:
-                self.processing.discard(mint)
-
-# ============================================================================
-# 🔥 PUMPPORTAL LISTENER (FALLBACK)
-# ============================================================================
-
-class PumpPortalListener:
-    def __init__(self, cfg: Config, manager: TokenManager):
-        self.cfg = cfg
-        self.manager = manager
-        self.running = False
-        self.ws = None
-        self.reconnect_delay = 5
-        self.max_reconnect_delay = 60
-        self.processed_sigs = deque(maxlen=1000)
-
-    async def connect(self):
-        if not self.cfg.PUMPPORTAL_WSS:
-            logging.info("ℹ️ PumpPortal not configured")
-            return
-        
-        self.running = True
-        uri = self.cfg.PUMPPORTAL_WSS
-        
-        while self.running:
-            try:
-                logging.info(f"🔌 Connecting to PumpPortal...")
-                
-                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
-                    self.ws = websocket
-                    self.reconnect_delay = 5
-                    
-                    subscribe_msg = {"method": "subscribeNewToken"}
-                    await websocket.send(json.dumps(subscribe_msg))
-                    logging.info("✅ PumpPortal subscribed")
-                    
-                    async for raw in websocket:
-                        try:
-                            data = json.loads(raw)
-                            await self._handle(data)
-                        except json.JSONDecodeError:
-                            pass
-                        except Exception as e:
-                            logging.error(f"PumpPortal error: {e}")
-                            
-            except Exception as e:
-                logging.error(f"❌ PumpPortal error: {e}")
-            finally:
-                self.ws = None
-                if self.running:
-                    logging.info(f"🔄 PumpPortal reconnecting in {self.reconnect_delay}s...")
-                    await asyncio.sleep(self.reconnect_delay)
-                    self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
-
-    async def _handle(self, payload: Dict):
-        try:
-            if 'signature' in payload and 'mint' in payload:
-                mint = payload['mint']
-                signature = payload['signature']
-                
-                if signature in self.processed_sigs:
-                    return
-                self.processed_sigs.append(signature)
-                
-                logging.info(f"🎯 PumpPortal: {mint}")
-                
-                symbol = payload.get('symbol', 'UNKNOWN')
-                name = payload.get('name', 'UNKNOWN')
-                bonding_curve = payload.get('bondingCurve')
-                
-                await self.manager.add_token(
-                    mint=mint,
-                    symbol=symbol,
-                    name=name,
-                    bonding_curve=bonding_curve
-                )
-        except Exception as e:
-            logging.error(f"PumpPortal handler error: {e}")
-
-    async def stop(self):
-        self.running = False
-        if self.ws:
-            try:
-                await self.ws.close()
-            except Exception:
-                pass
-
-# ============================================================================
-# 🔥 FASTAPI APP
-# ============================================================================
-
-def create_app(bot_instance):
-    app = FastAPI(title="Pump.fun Monitor v3.1 DEFINITIVO", version="3.1.0")
-
-    @app.get("/")
-    async def root():
-        return {
-            "status": "ok",
-            "service": "pump.fun monitor v3.1 DEFINITIVO",
-            "version": "3.1.0",
-            "features": [
-                "helius_webhooks",
-                "accountSubscribe_streaming",
-                "mint_normalization",
-                "initial_price_retry",
-                "manual_start_only"
-            ],
-            "mode": bot_instance.config.MODE
-        }
-
-    @app.get("/health")
-    async def health():
-        streaming_connected = bot_instance.streaming_manager.ws is not None
-        streaming_running = bot_instance.streaming_manager.running
-        pumpportal_running = bot_instance.pumpportal_listener.running if bot_instance.pumpportal_listener else False
-        
-        return {
-            "status": "healthy",
-            "streaming": {
-                "connected": streaming_connected,
-                "running": streaming_running,
-                "subscriptions": len(bot_instance.streaming_manager.subscription_map),
-                "tokens": len(bot_instance.streaming_manager.token_data)
-            },
-            "pumpportal": {
-                "running": pumpportal_running
-            },
-            "rpc": {
-                "provider": bot_instance.rpc._current_provider()[0],
-                "available_providers": len(bot_instance.rpc.providers)
-            },
-            "monitoring": {
-                "tokens": len(bot_instance.streaming_manager.token_data),
-                "processing": len(bot_instance.token_manager.processing),
-                "alerts_sent": len(bot_instance.streaming_manager.alerted),
-                "max_tokens": bot_instance.config.MAX_TOKENS_MONITORED
-            },
-            "services": {
-                "redis": bot_instance.redis is not None,
-                "database": bot_instance.db.pool is not None,
-                "telegram": bot_instance.bot is not None
-            }
-        }
-
-    @app.get("/metrics")
-    async def metrics():
-        tokens = []
-        for mint, token in list(bot_instance.streaming_manager.token_data.items())[:30]:
-            elapsed = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
-            gain = 0
-            if token.initial_price > 0 and token.max_price > 0:
-                gain = ((token.max_price - token.initial_price) / token.initial_price) * 100
-            
-            tokens.append({
-                "mint": mint[:16] + "...",
-                "symbol": token.symbol,
-                "gain_percent": round(gain, 2),
-                "elapsed_min": round(elapsed, 2),
-                "priority": token.priority,
-                "market_cap": round(token.initial_market_cap, 2),
-                "subscribed": token.subscription_id is not None
-            })
-        
-        return {
-            "monitored_tokens": len(bot_instance.streaming_manager.token_data),
-            "active_subscriptions": len(bot_instance.streaming_manager.subscription_map),
-            "processing": len(bot_instance.token_manager.processing),
-            "alerts_sent": len(bot_instance.streaming_manager.alerted),
-            "tokens": tokens
-        }
-
-    @app.get("/config")
-    async def get_config():
-        return {
-            "alert_percent": bot_instance.config.ALERT_PERCENT,
-            "alert_time_window_min": bot_instance.config.ALERT_TIME_WINDOW_MIN,
-            "max_monitor_time_min": bot_instance.config.MAX_MONITOR_TIME_MIN,
-            "dump_threshold_percent": bot_instance.config.DUMP_THRESHOLD_PERCENT,
-            "max_concurrent_monitors": bot_instance.config.MAX_CONCURRENT_MONITORS,
-            "max_tokens_monitored": bot_instance.config.MAX_TOKENS_MONITORED,
-            "priority_threshold_mcap": bot_instance.config.PRIORITY_THRESHOLD_MCAP,
-            "initial_price_retries": bot_instance.config.INITIAL_PRICE_RETRIES,
-            "initial_price_retry_delay": bot_instance.config.INITIAL_PRICE_RETRY_DELAY,
-            "mode": bot_instance.config.MODE,
-            "streaming_enabled": bot_instance.config.STREAMING_WSS is not None,
-            "rpc_providers": [p[0] for p in bot_instance.config.RPC_ENDPOINTS]
-        }
-
-    # 🔥 HELIUS WEBHOOK (CON DEDUPLICACIÓN)
-    webhook_processed_mints: deque = deque(maxlen=1000)
-    
-    @app.post(bot_instance.config.HELIUS_WEBHOOK_PATH)
-    async def helius_webhook(request: Request):
-        try:
-            data = await request.json()
-            
-            transactions = data if isinstance(data, list) else [data]
-            processed_count = 0
-            
-            for tx_data in transactions:
-                try:
-                    token_transfers = tx_data.get('tokenTransfers', [])
-                    account_data = tx_data.get('accountData', [])
-                    
-                    mint = None
-                    
-                    # From tokenTransfers
-                    for transfer in token_transfers:
-                        potential_mint = transfer.get('mint', '')
-                        if potential_mint and len(potential_mint) >= 32:
-                            # 🔥 NORMALIZAR
-                            potential_mint = normalize_mint(potential_mint)
-                            if len(potential_mint) == 44:
-                                if potential_mint not in ['So11111111111111111111111111111111111111112']:
-                                    mint = potential_mint
-                                    break
-                    
-                    # From accountData
-                    if not mint:
-                        for acc in account_data:
-                            if acc.get('account'):
-                                potential_mint = normalize_mint(acc['account'])
-                                if len(potential_mint) == 44:
-                                    mint = potential_mint
-                                    break
-                    
-                    if mint:
-                        # 🔥 WEBHOOK DEDUP
-                        if mint in webhook_processed_mints:
-                            continue
-                        
-                        bonding_curve = compute_bonding_curve_pda(mint)
-                        if bonding_curve:
-                            webhook_processed_mints.append(mint)
-                            logging.info(f"🎯 Helius webhook: {mint}")
-                            
-                            symbol = "UNKNOWN"
-                            name = "UNKNOWN"
-                            
-                            description = tx_data.get('description', '')
-                            if description:
-                                if "created" in description.lower() or "initialized" in description.lower():
-                                    parts = description.split()
-                                    if len(parts) > 1:
-                                        symbol = parts[0][:10]
-                            
-                            # Process async
-                            asyncio.create_task(
-                                bot_instance.token_manager.add_token(
-                                    mint=mint,
-                                    symbol=symbol,
-                                    name=name,
-                                    bonding_curve=bonding_curve
-                                )
-                            )
-                            processed_count += 1
-                
-                except Exception as e:
-                    logging.error(f"Webhook tx error: {e}")
-                    continue
-            
-            return {"status": "ok", "processed": processed_count, "total": len(transactions)}
-            
-        except Exception as e:
-            logging.error(f"❌ Webhook error: {e}")
-            return Response(status_code=400)
-
-    @app.post(bot_instance.config.TELEGRAM_WEBHOOK_PATH)
-    async def telegram_webhook(request: Request):
-        try:
-            data = await request.json()
-        except Exception:
-            return Response(status_code=400)
-        
-        message = data.get("message") or data.get("edited_message") or {}
-        if not message:
-            if "callback_query" in data:
-                await handle_callback_query(data['callback_query'], bot_instance)
-            return {"ok": True}
-        
-        chat = message.get("chat", {})
-        text = message.get("text", "")
-        
-        if bot_instance.config.TELEGRAM_CHAT_ID:
-            if str(chat.get("id")) != str(bot_instance.config.TELEGRAM_CHAT_ID):
-                return {"ok": True}
-        
-        if text.startswith("/"):
-            await handle_command(text, chat, bot_instance)
-        
-        return {"ok": True}
-
-    return app
-
-# ============================================================================
-# TELEGRAM COMMANDS
-# ============================================================================
-
-async def handle_command(text: str, chat: Dict, bot_instance):
-    command = text.split()[0]
-    chat_id = chat.get("id")
-    
-    if command == "/start":
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("▶️ Iniciar", callback_data="cmd:start")],
-            [InlineKeyboardButton("⏸️ Detener", callback_data="cmd:stop")],
-            [
-                InlineKeyboardButton("📊 Status", callback_data="cmd:status"),
-                InlineKeyboardButton("🔍 Tokens", callback_data="cmd:tokens")
-            ],
-            [InlineKeyboardButton("⚙️ Config", callback_data="cmd:config")]
-        ])
-        
-        await bot_instance.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"🤖 *Pump.fun Monitor Bot v3.1 DEFINITIVO*\n\n"
-                f"✅ Helius Webhooks\n"
-                f"✅ Streaming tiempo real\n"
-                f"✅ Precio inicial garantizado\n"
-                f"✅ Normalización de mints\n"
-                f"✅ NO auto-inicia\n\n"
-                f"Comandos:\n"
-                f"/iniciar - Iniciar monitoreo\n"
-                f"/detener - Detener monitoreo\n"
-                f"/status - Estado del bot\n"
-                f"/tokens - Tokens activos\n"
-                f"/config - Configuración"
-            ),
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-    
-    elif command == "/iniciar":
-        if not bot_instance.streaming_task or bot_instance.streaming_task.done():
-            bot_instance.streaming_task = asyncio.create_task(bot_instance.streaming_manager.connect())
-            
-            if bot_instance.pumpportal_listener and bot_instance.config.PUMPPORTAL_WSS:
-                if not bot_instance.pumpportal_task or bot_instance.pumpportal_task.done():
-                    bot_instance.pumpportal_task = asyncio.create_task(bot_instance.pumpportal_listener.connect())
-            
-            rpc_provider = bot_instance.rpc._current_provider()[0]
-            await bot_instance.bot.send_message(
-                chat_id=chat_id,
-                text=f"▶️ *Monitor INICIADO*\n\n🔍 Escuchando tokens...\n🌐 RPC: {rpc_provider}",
-                parse_mode="Markdown"
-            )
-        else:
-            await bot_instance.bot.send_message(
-                chat_id=chat_id,
-                text="⚠️ El monitor ya está corriendo"
-            )
-    
-    elif command == "/detener":
-        if bot_instance.streaming_manager.running:
-            await bot_instance.streaming_manager.stop()
-            
-            if bot_instance.pumpportal_listener:
-                await bot_instance.pumpportal_listener.stop()
-            
-            await bot_instance.bot.send_message(
-                chat_id=chat_id,
-                text="⏸️ *Monitor DETENIDO*",
-                parse_mode="Markdown"
-            )
-        else:
-            await bot_instance.bot.send_message(
-                chat_id=chat_id,
-                text="⚠️ El monitor no está corriendo"
-            )
-    
-    elif command == "/status":
-        streaming = bot_instance.streaming_manager
-        streaming_status = "✅ Conectado" if streaming.ws else "❌ Desconectado"
-        running_status = "✅ Activo" if streaming.running else "⏸️ Detenido"
-        rpc_provider = bot_instance.rpc._current_provider()[0]
-        pumpportal_status = "✅ Activo" if (bot_instance.pumpportal_listener and bot_instance.pumpportal_listener.running) else "⏸️ Inactivo"
-        
-        status_text = (
-            f"📊 *Estado del Bot v3.1*\n\n"
-            f"🔌 Streaming: {streaming_status}\n"
-            f"▶️ Monitoreo: {running_status}\n"
-            f"🌐 RPC: *{rpc_provider}*\n"
-            f"📡 PumpPortal: {pumpportal_status}\n\n"
-            f"📈 *Estadísticas*\n"
-            f"• Tokens: {len(streaming.token_data)}/{bot_instance.config.MAX_TOKENS_MONITORED}\n"
-            f"• Procesando: {len(bot_instance.token_manager.processing)}\n"
-            f"• Suscripciones: {len(streaming.subscription_map)}\n"
-            f"• Alertas: {len(streaming.alerted)}\n"
-            f"• Redis: {'✅' if bot_instance.redis else '❌'}\n"
-            f"• DB: {'✅' if bot_instance.db.pool else '❌'}"
-        )
-        await bot_instance.bot.send_message(chat_id=chat_id, text=status_text, parse_mode="Markdown")
-    
-    elif command == "/tokens":
-        tokens = list(bot_instance.streaming_manager.token_data.items())[:20]
-        if tokens:
-            msg = "🔍 *Tokens Monitoreados* (Top 20):\n\n"
-            for mint, token in tokens:
-                elapsed = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
-                gain = 0
-                if token.initial_price > 0 and token.max_price > 0:
-                    gain = ((token.max_price - token.initial_price) / token.initial_price) * 100
-                
-                priority_emoji = "🔥" if token.priority else "•"
-                sub_emoji = "📡" if token.subscription_id else "⏳"
-                msg += f"{priority_emoji} {token.symbol} {sub_emoji} | {gain:+.1f}% | {elapsed:.1f}min\n"
-                msg += f"   `{mint[:20]}...`\n"
-        else:
-            msg = "🔭 No hay tokens monitoreados"
-        
-        await bot_instance.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-    
-    elif command == "/config":
-        cfg = bot_instance.config
-        rpc_list = ", ".join([p[0] for p in cfg.RPC_ENDPOINTS])
-        msg = (
-            f"⚙️ *Configuración v3.1*\n\n"
-            f"📊 *Alertas*\n"
-            f"• Ganancia: {cfg.ALERT_PERCENT}%\n"
-            f"• Ventana: {cfg.ALERT_TIME_WINDOW_MIN} min\n\n"
-            f"⏱️ *Monitoreo*\n"
-            f"• Tiempo máx: {cfg.MAX_MONITOR_TIME_MIN} min\n"
-            f"• Dump threshold: {cfg.DUMP_THRESHOLD_PERCENT}%\n"
-            f"• Streaming: {'✅' if cfg.STREAMING_WSS else '❌'}\n\n"
-            f"🎯 *Límites*\n"
-            f"• Max tokens: {cfg.MAX_TOKENS_MONITORED}\n"
-            f"• Priority MCap: ${cfg.PRIORITY_THRESHOLD_MCAP:,.0f}\n\n"
-            f"🔄 *Precio Inicial*\n"
-            f"• Reintentos: {cfg.INITIAL_PRICE_RETRIES}\n"
-            f"• Delay: {cfg.INITIAL_PRICE_RETRY_DELAY}s\n\n"
-            f"🌐 *RPC*\n"
-            f"• Providers: {rpc_list}\n\n"
-            f"🔧 *Sistema*\n"
-            f"• Modo: {cfg.MODE}\n"
-            f"• Inicio: Manual (/iniciar)"
-        )
-        await bot_instance.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
-
-async def handle_callback_query(cq: Dict, bot_instance):
-    cd = cq.get("data", "")
-    chat_id = cq['message']['chat']['id']
-    
-    if cd == "cmd:start":
-        if not bot_instance.streaming_task or bot_instance.streaming_task.done():
-            bot_instance.streaming_task = asyncio.create_task(bot_instance.streaming_manager.connect())
-            if bot_instance.pumpportal_listener and bot_instance.config.PUMPPORTAL_WSS:
-                if not bot_instance.pumpportal_task or bot_instance.pumpportal_task.done():
-                    bot_instance.pumpportal_task = asyncio.create_task(bot_instance.pumpportal_listener.connect())
-            await bot_instance.bot.send_message(chat_id=chat_id, text="▶️ Monitor iniciado")
-        else:
-            await bot_instance.bot.send_message(chat_id=chat_id, text="⚠️ Ya está corriendo")
-    
-    elif cd == "cmd:stop":
-        if bot_instance.streaming_manager.running:
-            await bot_instance.streaming_manager.stop()
-            if bot_instance.pumpportal_listener:
-                await bot_instance.pumpportal_listener.stop()
-            await bot_instance.bot.send_message(chat_id=chat_id, text="⏸️ Monitor detenido")
-        else:
-            await bot_instance.bot.send_message(chat_id=chat_id, text="⚠️ No está corriendo")
-    
-    elif cd == "cmd:status":
-        await handle_command("/status", {"id": chat_id}, bot_instance)
-    
-    elif cd == "cmd:tokens":
-        await handle_command("/tokens", {"id": chat_id}, bot_instance)
-    
-    elif cd == "cmd:config":
-        await handle_command("/config", {"id": chat_id}, bot_instance)
-
-# ============================================================================
-# MAIN SERVICE
-# ============================================================================
-
-class PumpFunService:
-    def __init__(self):
-        self.config = Config()
-        setup_logging(self.config)
-        
-        self.bot = None
-        if self.config.ENABLE_TELEGRAM and self.config.TELEGRAM_BOT_TOKEN:
-            self.bot = Bot(token=self.config.TELEGRAM_BOT_TOKEN)
-        
-        Notification.init(self.config)
-        
-        self.db = Database(self.config)
-        self.rpc = RPCClient(self.config)
-        self.redis = None
-        self.streaming_manager = None
-        self.token_manager = None
-        self.pumpportal_listener = None
-        self.streaming_task = None
-        self.pumpportal_task = None
-        self.fastapi_app = None
-
-    async def start(self):
-        logging.info("🚀 Starting Pump.fun Monitor v3.1 DEFINITIVO...")
-        logging.info(f"⚙️ Mode: {self.config.MODE}")
-        
-        # Database
-        await self.db.connect()
-        
-        # Redis
-        try:
-            self.redis = aioredis.from_url(self.config.REDIS_URL, decode_responses=True)
-            await self.redis.ping()
-            logging.info("✅ Redis connected")
-        except Exception as e:
-            logging.error(f"❌ Redis failed: {e}")
-            raise
-        
-        # RPC
-        await self.rpc.__aenter__()
-        rpc_provider = self.rpc._current_provider()[0]
-        logging.info(f"✅ RPC ready: {rpc_provider} ({len(self.rpc.providers)} providers)")
-        
-        # Streaming Manager
-        alert_engine = AlertEngine(self.config)
-        self.streaming_manager = StreamingManager(self.config, alert_engine, self.db, self.redis)
-        logging.info(f"✅ Streaming manager ready")
-        
-        # Token Manager
-        self.token_manager = TokenManager(self.config, self.db, self.rpc, self.streaming_manager)
-        
-        # PumpPortal Listener
-        if self.config.PUMPPORTAL_WSS:
-            self.pumpportal_listener = PumpPortalListener(self.config, self.token_manager)
-            logging.info(f"✅ PumpPortal fallback ready")
-        
-        # Webhook
-        if self.bot:
-            webhook_url = self.config.DOMAIN_URL
-            if webhook_url:
-                full_url = f"https://{webhook_url.replace('https://', '').replace('http://', '')}{self.config.TELEGRAM_WEBHOOK_PATH}"
-                try:
-                    await self.bot.set_webhook(url=full_url)
-                    logging.info(f"✅ Telegram webhook: {full_url}")
-                except Exception as e:
-                    logging.warning(f"⚠️ Telegram webhook failed: {e}")
-        
-        # FastAPI
-        self.fastapi_app = create_app(self)
-        
-        logging.info("✅ Service ready")
-        logging.info("=" * 60)
-        logging.info("🎯 HELIUS WEBHOOK CONFIGURATION:")
-        logging.info(f"   URL: https://{self.config.DOMAIN_URL}{self.config.HELIUS_WEBHOOK_PATH}")
-        logging.info(f"   Account: {PUMP_FUN_PROGRAM_ID}")
-        logging.info(f"   Type: Enhanced Transaction")
-        logging.info("=" * 60)
-        logging.info("📱 IMPORTANTE: Bot NO se auto-inicia")
-        logging.info("📱 Use /iniciar en Telegram para empezar")
-
-    async def stop(self):
-        logging.info("🛑 Stopping...")
-        
-        if self.streaming_manager:
-            await self.streaming_manager.stop()
-        
-        if self.pumpportal_listener:
-            await self.pumpportal_listener.stop()
-        
-        if self.streaming_task:
-            self.streaming_task.cancel()
-        
-        if self.pumpportal_task:
-            self.pumpportal_task.cancel()
-        
-        if self.db:
-            await self.db.disconnect()
-        
-        if self.redis:
-            await self.redis.close()
-        
-        if self.rpc:
-            await self.rpc.__aexit__(None, None, None)
-        
-        logging.info("✅ Stopped")
-
-# ============================================================================
-# ENTRYPOINT
-# ============================================================================
-
-async def _main():
-    svc = PumpFunService()
-    await svc.start()
-    
-    config = uvicorn.Config(
-        svc.fastapi_app,
-        host="0.0.0.0",
-        port=svc.config.HEALTH_PORT,
-        log_level="info"
-    )
-    server = uvicorn.Server(config)
-    
-    logging.info("🎮 Bot ready - Esperando /iniciar en Telegram")
-    
-    await server.serve()
-
-def run_main():
-    try:
-        asyncio.run(_main())
-    except KeyboardInterrupt:
-        logging.info("⚠️ Interrupted")
-    except Exception as e:
-        logging.error(f"❌ Fatal: {e}")
-        raise
-
-if __name__ == "__main__":
-    run_main()#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 🚀 PUMP.FUN BOT - DEFINITIVO v3.1
@@ -849,7 +45,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Bot
 PUMP_FUN_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 
 # ============================================================================
-# 🔥 CONFIG
+# CONFIG
 # ============================================================================
 
 class Config:
@@ -866,17 +62,14 @@ class Config:
             except Exception:
                 data = {}
         
-        # 🔥 TELEGRAM
         self.TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', data.get('telegram_bot_token', ''))
         self.TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID', data.get('telegram_chat_id', ''))
         self.ENABLE_TELEGRAM = os.getenv('ENABLE_TELEGRAM', 'true').lower() == 'true'
         
-        # 🔥 DATABASE & REDIS
         self.DATABASE_URL = os.getenv('DATABASE_URL', data.get('database_url', ''))
         self.REDIS_URL = os.getenv('REDIS_URL', data.get('redis_url', 'redis://localhost:6379/0'))
         self.ENABLE_DB = os.getenv('ENABLE_DB', 'true').lower() == 'true'
         
-        # 🔥 RPC ENDPOINTS (PRIORIDAD: Helius primero)
         self.HELIUS_RPC_URL = os.getenv('HELIUS_RPC_URL', data.get('helius_rpc_url', ''))
         self.QUICKNODE_RPC_URL = os.getenv('QUICKNODE_RPC_URL', data.get('quicknode_rpc_url', ''))
         
@@ -890,7 +83,6 @@ class Config:
             self.RPC_ENDPOINTS.append(('alchemy', 'https://solana-mainnet.g.alchemy.com/v2/demo'))
             self.RPC_ENDPOINTS.append(('public', 'https://api.mainnet-beta.solana.com'))
         
-        # 🔥 WEBSOCKET
         self.HELIUS_WSS = os.getenv('HELIUS_WSS', None)
         self.QUICKNODE_WSS = os.getenv('QUICKNODE_WSS', None)
         self.PUMPPORTAL_WSS = os.getenv('PUMPPORTAL_WSS', None)
@@ -902,7 +94,6 @@ class Config:
         
         self.STREAMING_WSS = self.HELIUS_WSS or self.QUICKNODE_WSS
         
-        # 🔥 ALERT CONFIGURATION
         self.ALERT_PERCENT = float(os.getenv('ALERT_PERCENT', '100.0'))
         self.ALERT_TIME_WINDOW_MIN = float(os.getenv('ALERT_TIME_WINDOW_MIN', '20.0'))
         
@@ -911,28 +102,22 @@ class Config:
             {"name": "momentum_120", "alert_percent": 120.0, "time_window_min": 15}
         ])
         
-        # 🔥 MONITORING
         self.MAX_MONITOR_TIME_MIN = float(os.getenv('MAX_MONITOR_TIME_MIN', '30'))
         self.DUMP_THRESHOLD_PERCENT = float(os.getenv('DUMP_THRESHOLD_PERCENT', '-60'))
         self.MAX_CONCURRENT_MONITORS = int(os.getenv('MAX_CONCURRENT_MONITORS', '500'))
         self.MAX_TOKENS_MONITORED = int(os.getenv('MAX_TOKENS_MONITORED', '500'))
         
-        # 🔥 PRIORITY
         self.PRIORITY_THRESHOLD_MCAP = float(os.getenv('PRIORITY_THRESHOLD_MCAP', '50000'))
         
-        # 🔥 RETRY CONFIG (CRÍTICO)
         self.INITIAL_PRICE_RETRIES = int(os.getenv('INITIAL_PRICE_RETRIES', '5'))
         self.INITIAL_PRICE_RETRY_DELAY = float(os.getenv('INITIAL_PRICE_RETRY_DELAY', '2.0'))
         
-        # 🔥 CACHE
         self.CACHE_TTL_SEC = int(os.getenv('CACHE_TTL_SEC', '300'))
         
-        # 🔥 SERVER
         self.LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
         self.HEALTH_PORT = int(os.getenv('HEALTH_PORT', '8080'))
         self.MODE = os.getenv('MODE', 'production')
         
-        # 🔥 WEBHOOKS
         self.DOMAIN_URL = os.getenv('DOMAIN_URL', os.getenv('WEBHOOK_URL', ''))
         self.TELEGRAM_WEBHOOK_PATH = '/telegram/webhook'
         self.HELIUS_WEBHOOK_PATH = '/helius-webhook'
@@ -944,16 +129,10 @@ def setup_logging(cfg: Config):
         handlers=[logging.StreamHandler(sys.stdout)]
     )
 
-# ============================================================================
-# UTILITY: Limpiar mints (quitar "pump" suffix)
-# ============================================================================
-
 def normalize_mint(mint: str) -> str:
-    """🔥 Quita sufijo 'pump' y espacios del mint"""
     if not mint:
         return ""
     mint = mint.strip()
-    # Si termina en "pump", quitarlo
     if mint.endswith("pump"):
         mint = mint[:-4]
     return mint
@@ -997,7 +176,7 @@ class AlertData:
             self.extra_data = {}
 
 # ============================================================================
-# 🔥 RPC CLIENT
+# RPC CLIENT
 # ============================================================================
 
 class RPCClient:
@@ -1202,11 +381,10 @@ class Database:
             logging.debug(f"DB record_alert failed: {e}")
 
 # ============================================================================
-# BONDING CURVE (usando IDL correcto)
+# BONDING CURVE
 # ============================================================================
 
 def compute_bonding_curve_pda(mint: str) -> Optional[str]:
-    """Calcula PDA de bonding_curve usando el mint"""
     try:
         mint_bytes = base58.b58decode(mint)
         program_bytes = base58.b58decode(PUMP_FUN_PROGRAM_ID)
@@ -1230,18 +408,12 @@ def compute_bonding_curve_pda(mint: str) -> Optional[str]:
         return None
 
 def parse_bonding_curve_account_b64(b64data: str) -> Optional[Dict]:
-    """
-    Parse BondingCurve account según IDL:
-    - 8 bytes: discriminator (Anchor)
-    - 5 x u64: virtualTokenReserves, virtualSolReserves, realTokenReserves, realSolReserves, tokenTotalSupply
-    - 1 byte: bool complete
-    """
     try:
         raw = base64.b64decode(b64data)
-        if len(raw) < 49:  # 8 + 40 + 1
+        if len(raw) < 49:
             return None
             
-        offset = 8  # Skip Anchor discriminator
+        offset = 8
         vToken, vSol, rToken, rSol, supply = struct.unpack_from("<QQQQQ", raw, offset)
         offset += 40
         complete = struct.unpack_from("<?", raw, offset)[0]
@@ -1264,7 +436,6 @@ def parse_bonding_curve_account_b64(b64data: str) -> Optional[Dict]:
         return None
 
 async def validate_pump_fun_token(rpc: RPCClient, mint: str, bonding_curve: str) -> bool:
-    """Valida que el token sea de Pump.fun"""
     try:
         acc = await rpc.get_account_base64(bonding_curve)
         if not acc or not acc.get('value'):
@@ -1390,7 +561,7 @@ class Notification:
         ])
 
 # ============================================================================
-# 🔥 STREAMING MANAGER
+# STREAMING MANAGER
 # ============================================================================
 
 class StreamingManager:
@@ -1410,7 +581,7 @@ class StreamingManager:
 
     async def connect(self):
         if not self.cfg.STREAMING_WSS:
-            logging.warning("⚠️ No streaming WSS - price monitoring disabled")
+            logging.warning("⚠️ No streaming WSS")
             return
         
         self.running = True
@@ -1478,7 +649,6 @@ class StreamingManager:
 
     async def _handle_message(self, data: Dict):
         try:
-            # Subscription confirmation
             if 'id' in data and 'result' in data and not isinstance(data.get('result'), dict):
                 subscription_id = data['result']
                 request_id = data['id']
@@ -1491,7 +661,6 @@ class StreamingManager:
                         token.subscription_id = subscription_id
                         logging.info(f"✅ Subscribed: {token.symbol} (ID: {subscription_id})")
             
-            # Account notification
             elif 'method' in data and data.get('method') == 'accountNotification':
                 params = data.get('params', {})
                 subscription_id = params.get('subscription')
@@ -1521,6 +690,689 @@ class StreamingManager:
                         
                         elapsed_min = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
                         
-                        # Check dump
                         if token.max_price > 0:
-                            loss =
+                            loss = ((current_price - token.max_price) / token.max_price) * 100.0
+                            if loss <= self.cfg.DUMP_THRESHOLD_PERCENT:
+                                logging.info(f"📉 Dump: {token.symbol} {loss:.1f}%")
+                                await self.remove_token(mint, "dumped")
+                                return
+                        
+                        if elapsed_min >= self.cfg.MAX_MONITOR_TIME_MIN:
+                            await self.remove_token(mint, "timeout")
+                            return
+                        
+                        if token.initial_price > 0:
+                            alerts = self.alert_engine.evaluate(token, current_price, elapsed_min)
+                            for alert in alerts:
+                                key = f"alert:{mint}"
+                                if await self.redis.get(key):
+                                    continue
+                                
+                                await self.redis.set(key, "1", ex=self.cfg.CACHE_TTL_SEC)
+                                await self.db.record_alert(alert)
+                                await Notification.send_alert(token, alert)
+                                self.alerted.add(mint)
+                                
+                                logging.info(f"🚀 ALERT: {token.symbol} +{alert.gain_percent:.1f}%")
+                                await self.remove_token(mint, "alert_sent")
+                                return
+                        
+                        if int(elapsed_min) % 2 == 0:
+                            await self.db.upsert_token(token)
+                
+        except Exception as e:
+            logging.error(f"❌ Handle message error: {e}")
+
+    async def add_token(self, token: TokenData):
+        if token.mint in self.token_data:
+            return
+        
+        self.token_data[token.mint] = token
+        await self.db.upsert_token(token)
+        
+        if self.ws:
+            await self._subscribe_to_token(token.mint)
+        
+        priority_str = "🔥 PRIORITY" if token.priority else ""
+        logging.info(f"✅ Streaming: {token.symbol} {priority_str}")
+
+    async def remove_token(self, mint: str, reason: str):
+        token = self.token_data.get(mint)
+        if not token:
+            return
+        
+        if token.subscription_id and self.ws:
+            try:
+                unsubscribe_payload = {
+                    "jsonrpc": "2.0",
+                    "id": int(time.time() * 1000),
+                    "method": "accountUnsubscribe",
+                    "params": [token.subscription_id]
+                }
+                await self.ws.send(json.dumps(unsubscribe_payload))
+                
+                if token.subscription_id in self.subscription_map:
+                    del self.subscription_map[token.subscription_id]
+            except Exception:
+                pass
+        
+        token.status = reason
+        token.last_checked = datetime.now(timezone.utc)
+        await self.db.upsert_token(token)
+        
+        del self.token_data[mint]
+        logging.debug(f"🗑️ Removed: {token.symbol} ({reason})")
+
+    async def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+# ============================================================================
+# TOKEN MANAGER
+# ============================================================================
+
+class TokenManager:
+    def __init__(self, cfg: Config, db: Database, rpc: RPCClient, streaming: StreamingManager):
+        self.cfg = cfg
+        self.db = db
+        self.rpc = rpc
+        self.streaming = streaming
+        self.processing: Set[str] = set()
+        self.processed_mints: deque = deque(maxlen=5000)
+
+    async def add_token(self, mint: str, symbol: str = "UNKNOWN", name: str = "UNKNOWN",
+                       bonding_curve: Optional[str] = None, initial_price: float = 0.0,
+                       initial_market_cap: float = 0.0):
+        
+        mint = normalize_mint(mint)
+        
+        if not mint or len(mint) != 44:
+            logging.debug(f"Invalid mint length: {mint}")
+            return
+        
+        if mint in self.processing or mint in self.processed_mints:
+            return
+        
+        if mint in self.streaming.token_data:
+            return
+        
+        if len(self.streaming.token_data) >= self.cfg.MAX_TOKENS_MONITORED:
+            logging.warning(f"⚠️ Max tokens reached ({self.cfg.MAX_TOKENS_MONITORED})")
+            return
+        
+        self.processing.add(mint)
+        self.processed_mints.append(mint)
+        
+        try:
+            if not bonding_curve:
+                bonding_curve = compute_bonding_curve_pda(mint)
+            
+            if not bonding_curve:
+                logging.debug(f"Could not compute bonding curve for {mint[:8]}...")
+                return
+            
+            logging.debug(f"🔍 Validating {mint[:8]}...")
+            is_valid = await validate_pump_fun_token(self.rpc, mint, bonding_curve)
+            if not is_valid:
+                logging.debug(f"❌ Invalid token: {mint[:8]}...")
+                return
+            
+            logging.info(f"🆕 New token: {mint}")
+            
+            if initial_price == 0.0:
+                for attempt in range(self.cfg.INITIAL_PRICE_RETRIES):
+                    try:
+                        if not self.rpc.session:
+                            await self.rpc.__aenter__()
+                        
+                        acc = await self.rpc.get_account_base64(bonding_curve)
+                        if acc and acc.get('value') and acc['value'].get('data'):
+                            parsed = parse_bonding_curve_account_b64(acc['value']['data'][0])
+                            if parsed and parsed['price'] > 0:
+                                initial_price = parsed['price']
+                                initial_market_cap = parsed['market_cap']
+                                logging.info(f"✅ ${mint[:8]}... Price: ${initial_price:.8f} | MCap: ${initial_market_cap:,.0f}")
+                                break
+                        
+                        if attempt < self.cfg.INITIAL_PRICE_RETRIES - 1:
+                            logging.debug(f"⏳ Retry {attempt + 1}/{self.cfg.INITIAL_PRICE_RETRIES}...")
+                            await asyncio.sleep(self.cfg.INITIAL_PRICE_RETRY_DELAY)
+                    except Exception as e:
+                        logging.debug(f"Price fetch error: {e}")
+                        if attempt < self.cfg.INITIAL_PRICE_RETRIES - 1:
+                            await asyncio.sleep(self.cfg.INITIAL_PRICE_RETRY_DELAY)
+            
+            if initial_price <= 0:
+                logging.warning(f"⚠️ Skipping {mint[:8]}... - no price after {self.cfg.INITIAL_PRICE_RETRIES} retries")
+                return
+            
+            priority = initial_market_cap >= self.cfg.PRIORITY_THRESHOLD_MCAP
+            
+            token = TokenData(
+                mint=mint,
+                symbol=symbol,
+                name=name,
+                initial_price=initial_price,
+                initial_market_cap=initial_market_cap,
+                max_price=initial_price,
+                start_time=datetime.now(timezone.utc),
+                bonding_curve=bonding_curve,
+                priority=priority
+            )
+            
+            token.last_checked = datetime.now(timezone.utc)
+            
+            await self.streaming.add_token(token)
+            
+        finally:
+            if mint in self.processing:
+                self.processing.discard(mint)
+
+# ============================================================================
+# PUMPPORTAL LISTENER
+# ============================================================================
+
+class PumpPortalListener:
+    def __init__(self, cfg: Config, manager: TokenManager):
+        self.cfg = cfg
+        self.manager = manager
+        self.running = False
+        self.ws = None
+        self.reconnect_delay = 5
+        self.max_reconnect_delay = 60
+        self.processed_sigs = deque(maxlen=1000)
+
+    async def connect(self):
+        if not self.cfg.PUMPPORTAL_WSS:
+            logging.info("ℹ️ PumpPortal not configured")
+            return
+        
+        self.running = True
+        uri = self.cfg.PUMPPORTAL_WSS
+        
+        while self.running:
+            try:
+                logging.info(f"🔌 Connecting to PumpPortal...")
+                
+                async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as websocket:
+                    self.ws = websocket
+                    self.reconnect_delay = 5
+                    
+                    subscribe_msg = {"method": "subscribeNewToken"}
+                    await websocket.send(json.dumps(subscribe_msg))
+                    logging.info("✅ PumpPortal subscribed")
+                    
+                    async for raw in websocket:
+                        try:
+                            data = json.loads(raw)
+                            await self._handle(data)
+                        except json.JSONDecodeError:
+                            pass
+                        except Exception as e:
+                            logging.error(f"PumpPortal error: {e}")
+                            
+            except Exception as e:
+                logging.error(f"❌ PumpPortal error: {e}")
+            finally:
+                self.ws = None
+                if self.running:
+                    logging.info(f"🔄 PumpPortal reconnecting in {self.reconnect_delay}s...")
+                    await asyncio.sleep(self.reconnect_delay)
+                    self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+
+    async def _handle(self, payload: Dict):
+        try:
+            if 'signature' in payload and 'mint' in payload:
+                mint = payload['mint']
+                signature = payload['signature']
+                
+                if signature in self.processed_sigs:
+                    return
+                self.processed_sigs.append(signature)
+                
+                logging.info(f"🎯 PumpPortal: {mint}")
+                
+                symbol = payload.get('symbol', 'UNKNOWN')
+                name = payload.get('name', 'UNKNOWN')
+                bonding_curve = payload.get('bondingCurve')
+                
+                await self.manager.add_token(
+                    mint=mint,
+                    symbol=symbol,
+                    name=name,
+                    bonding_curve=bonding_curve
+                )
+        except Exception as e:
+            logging.error(f"PumpPortal handler error: {e}")
+
+    async def stop(self):
+        self.running = False
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+
+# ============================================================================
+# FASTAPI APP
+# ============================================================================
+
+def create_app(bot_instance):
+    app = FastAPI(title="Pump.fun Monitor v3.1", version="3.1.0")
+    webhook_processed_mints = deque(maxlen=1000)
+
+    @app.get("/")
+    async def root():
+        return {
+            "status": "ok",
+            "service": "pump.fun monitor v3.1",
+            "version": "3.1.0",
+            "mode": bot_instance.config.MODE
+        }
+
+    @app.get("/health")
+    async def health():
+        streaming_connected = bot_instance.streaming_manager.ws is not None
+        streaming_running = bot_instance.streaming_manager.running
+        
+        return {
+            "status": "healthy",
+            "streaming": {
+                "connected": streaming_connected,
+                "running": streaming_running,
+                "tokens": len(bot_instance.streaming_manager.token_data)
+            },
+            "rpc": {
+                "provider": bot_instance.rpc._current_provider()[0]
+            }
+        }
+
+    @app.get("/metrics")
+    async def metrics():
+        tokens = []
+        for mint, token in list(bot_instance.streaming_manager.token_data.items())[:30]:
+            elapsed = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
+            gain = 0
+            if token.initial_price > 0 and token.max_price > 0:
+                gain = ((token.max_price - token.initial_price) / token.initial_price) * 100
+            
+            tokens.append({
+                "mint": mint[:16] + "...",
+                "symbol": token.symbol,
+                "gain_percent": round(gain, 2),
+                "elapsed_min": round(elapsed, 2)
+            })
+        
+        return {
+            "monitored_tokens": len(bot_instance.streaming_manager.token_data),
+            "tokens": tokens
+        }
+
+    @app.post(bot_instance.config.HELIUS_WEBHOOK_PATH)
+    async def helius_webhook(request: Request):
+        try:
+            data = await request.json()
+            
+            transactions = data if isinstance(data, list) else [data]
+            processed_count = 0
+            
+            for tx_data in transactions:
+                try:
+                    token_transfers = tx_data.get('tokenTransfers', [])
+                    account_data = tx_data.get('accountData', [])
+                    
+                    mint = None
+                    
+                    for transfer in token_transfers:
+                        potential_mint = transfer.get('mint', '')
+                        if potential_mint and len(potential_mint) >= 32:
+                            potential_mint = normalize_mint(potential_mint)
+                            if len(potential_mint) == 44:
+                                if potential_mint not in ['So11111111111111111111111111111111111111112']:
+                                    mint = potential_mint
+                                    break
+                    
+                    if not mint:
+                        for acc in account_data:
+                            if acc.get('account'):
+                                potential_mint = normalize_mint(acc['account'])
+                                if len(potential_mint) == 44:
+                                    mint = potential_mint
+                                    break
+                    
+                    if mint:
+                        if mint in webhook_processed_mints:
+                            continue
+                        
+                        bonding_curve = compute_bonding_curve_pda(mint)
+                        if bonding_curve:
+                            webhook_processed_mints.append(mint)
+                            logging.info(f"🎯 Helius webhook: {mint}")
+                            
+                            symbol = "UNKNOWN"
+                            name = "UNKNOWN"
+                            
+                            description = tx_data.get('description', '')
+                            if description:
+                                if "created" in description.lower():
+                                    parts = description.split()
+                                    if len(parts) > 1:
+                                        symbol = parts[0][:10]
+                            
+                            asyncio.create_task(
+                                bot_instance.token_manager.add_token(
+                                    mint=mint,
+                                    symbol=symbol,
+                                    name=name,
+                                    bonding_curve=bonding_curve
+                                )
+                            )
+                            processed_count += 1
+                
+                except Exception as e:
+                    logging.error(f"Webhook tx error: {e}")
+                    continue
+            
+            return {"status": "ok", "processed": processed_count}
+            
+        except Exception as e:
+            logging.error(f"❌ Webhook error: {e}")
+            return Response(status_code=400)
+
+    @app.post(bot_instance.config.TELEGRAM_WEBHOOK_PATH)
+    async def telegram_webhook(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            return Response(status_code=400)
+        
+        message = data.get("message") or data.get("edited_message") or {}
+        if not message:
+            if "callback_query" in data:
+                await handle_callback_query(data['callback_query'], bot_instance)
+            return {"ok": True}
+        
+        chat = message.get("chat", {})
+        text = message.get("text", "")
+        
+        if bot_instance.config.TELEGRAM_CHAT_ID:
+            if str(chat.get("id")) != str(bot_instance.config.TELEGRAM_CHAT_ID):
+                return {"ok": True}
+        
+        if text.startswith("/"):
+            await handle_command(text, chat, bot_instance)
+        
+        return {"ok": True}
+
+    return app
+
+# ============================================================================
+# TELEGRAM COMMANDS
+# ============================================================================
+
+async def handle_command(text: str, chat: Dict, bot_instance):
+    command = text.split()[0]
+    chat_id = chat.get("id")
+    
+    if command == "/start":
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("▶️ Iniciar", callback_data="cmd:start")],
+            [InlineKeyboardButton("⏸️ Detener", callback_data="cmd:stop")],
+            [
+                InlineKeyboardButton("📊 Status", callback_data="cmd:status"),
+                InlineKeyboardButton("🔍 Tokens", callback_data="cmd:tokens")
+            ]
+        ])
+        
+        await bot_instance.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🤖 *Pump.fun Monitor Bot v3.1*\n\n"
+                f"✅ NO auto-inicia\n"
+                f"✅ Precio inicial garantizado\n"
+                f"✅ Streaming en tiempo real\n\n"
+                f"Comandos:\n"
+                f"/iniciar - Iniciar monitoreo\n"
+                f"/detener - Detener\n"
+                f"/status - Estado\n"
+                f"/tokens - Tokens activos"
+            ),
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+    
+    elif command == "/iniciar":
+        if not bot_instance.streaming_task or bot_instance.streaming_task.done():
+            bot_instance.streaming_task = asyncio.create_task(bot_instance.streaming_manager.connect())
+            
+            if bot_instance.pumpportal_listener and bot_instance.config.PUMPPORTAL_WSS:
+                if not bot_instance.pumpportal_task or bot_instance.pumpportal_task.done():
+                    bot_instance.pumpportal_task = asyncio.create_task(bot_instance.pumpportal_listener.connect())
+            
+            rpc_provider = bot_instance.rpc._current_provider()[0]
+            await bot_instance.bot.send_message(
+                chat_id=chat_id,
+                text=f"▶️ *Monitor INICIADO*\n\n🌐 RPC: {rpc_provider}",
+                parse_mode="Markdown"
+            )
+        else:
+            await bot_instance.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ Ya está corriendo"
+            )
+    
+    elif command == "/detener":
+        if bot_instance.streaming_manager.running:
+            await bot_instance.streaming_manager.stop()
+            
+            if bot_instance.pumpportal_listener:
+                await bot_instance.pumpportal_listener.stop()
+            
+            await bot_instance.bot.send_message(
+                chat_id=chat_id,
+                text="⏸️ *Monitor DETENIDO*",
+                parse_mode="Markdown"
+            )
+        else:
+            await bot_instance.bot.send_message(
+                chat_id=chat_id,
+                text="⚠️ No está corriendo"
+            )
+    
+    elif command == "/status":
+        streaming = bot_instance.streaming_manager
+        streaming_status = "✅ Conectado" if streaming.ws else "❌ Desconectado"
+        running_status = "✅ Activo" if streaming.running else "⏸️ Detenido"
+        rpc_provider = bot_instance.rpc._current_provider()[0]
+        
+        status_text = (
+            f"📊 *Estado del Bot v3.1*\n\n"
+            f"🔌 Streaming: {streaming_status}\n"
+            f"▶️ Monitoreo: {running_status}\n"
+            f"🌐 RPC: *{rpc_provider}*\n\n"
+            f"📈 *Estadísticas*\n"
+            f"• Tokens: {len(streaming.token_data)}\n"
+            f"• Suscripciones: {len(streaming.subscription_map)}\n"
+            f"• Alertas: {len(streaming.alerted)}"
+        )
+        await bot_instance.bot.send_message(chat_id=chat_id, text=status_text, parse_mode="Markdown")
+    
+    elif command == "/tokens":
+        tokens = list(bot_instance.streaming_manager.token_data.items())[:20]
+        if tokens:
+            msg = "🔍 *Tokens Monitoreados*:\n\n"
+            for mint, token in tokens:
+                elapsed = (datetime.now(timezone.utc) - token.start_time).total_seconds() / 60.0
+                gain = 0
+                if token.initial_price > 0 and token.max_price > 0:
+                    gain = ((token.max_price - token.initial_price) / token.initial_price) * 100
+                
+                priority_emoji = "🔥" if token.priority else "•"
+                sub_emoji = "📡" if token.subscription_id else "⏳"
+                msg += f"{priority_emoji} {token.symbol} {sub_emoji} | {gain:+.1f}% | {elapsed:.1f}min\n"
+        else:
+            msg = "🔭 No hay tokens"
+        
+        await bot_instance.bot.send_message(chat_id=chat_id, text=msg, parse_mode="Markdown")
+
+async def handle_callback_query(cq: Dict, bot_instance):
+    cd = cq.get("data", "")
+    chat_id = cq['message']['chat']['id']
+    
+    if cd == "cmd:start":
+        if not bot_instance.streaming_task or bot_instance.streaming_task.done():
+            bot_instance.streaming_task = asyncio.create_task(bot_instance.streaming_manager.connect())
+            if bot_instance.pumpportal_listener and bot_instance.config.PUMPPORTAL_WSS:
+                if not bot_instance.pumpportal_task or bot_instance.pumpportal_task.done():
+                    bot_instance.pumpportal_task = asyncio.create_task(bot_instance.pumpportal_listener.connect())
+            await bot_instance.bot.send_message(chat_id=chat_id, text="▶️ Monitor iniciado")
+        else:
+            await bot_instance.bot.send_message(chat_id=chat_id, text="⚠️ Ya está corriendo")
+    
+    elif cd == "cmd:stop":
+        if bot_instance.streaming_manager.running:
+            await bot_instance.streaming_manager.stop()
+            if bot_instance.pumpportal_listener:
+                await bot_instance.pumpportal_listener.stop()
+            await bot_instance.bot.send_message(chat_id=chat_id, text="⏸️ Monitor detenido")
+        else:
+            await bot_instance.bot.send_message(chat_id=chat_id, text="⚠️ No está corriendo")
+    
+    elif cd == "cmd:status":
+        await handle_command("/status", {"id": chat_id}, bot_instance)
+    
+    elif cd == "cmd:tokens":
+        await handle_command("/tokens", {"id": chat_id}, bot_instance)
+
+# ============================================================================
+# MAIN SERVICE
+# ============================================================================
+
+class PumpFunService:
+    def __init__(self):
+        self.config = Config()
+        setup_logging(self.config)
+        
+        self.bot = None
+        if self.config.ENABLE_TELEGRAM and self.config.TELEGRAM_BOT_TOKEN:
+            self.bot = Bot(token=self.config.TELEGRAM_BOT_TOKEN)
+        
+        Notification.init(self.config)
+        
+        self.db = Database(self.config)
+        self.rpc = RPCClient(self.config)
+        self.redis = None
+        self.streaming_manager = None
+        self.token_manager = None
+        self.pumpportal_listener = None
+        self.streaming_task = None
+        self.pumpportal_task = None
+        self.fastapi_app = None
+
+    async def start(self):
+        logging.info("🚀 Starting Pump.fun Monitor v3.1...")
+        logging.info(f"⚙️ Mode: {self.config.MODE}")
+        
+        await self.db.connect()
+        
+        try:
+            self.redis = aioredis.from_url(self.config.REDIS_URL, decode_responses=True)
+            await self.redis.ping()
+            logging.info("✅ Redis connected")
+        except Exception as e:
+            logging.error(f"❌ Redis failed: {e}")
+            raise
+        
+        await self.rpc.__aenter__()
+        rpc_provider = self.rpc._current_provider()[0]
+        logging.info(f"✅ RPC ready: {rpc_provider}")
+        
+        alert_engine = AlertEngine(self.config)
+        self.streaming_manager = StreamingManager(self.config, alert_engine, self.db, self.redis)
+        logging.info(f"✅ Streaming manager ready")
+        
+        self.token_manager = TokenManager(self.config, self.db, self.rpc, self.streaming_manager)
+        
+        if self.config.PUMPPORTAL_WSS:
+            self.pumpportal_listener = PumpPortalListener(self.config, self.token_manager)
+            logging.info(f"✅ PumpPortal ready")
+        
+        if self.bot:
+            webhook_url = self.config.DOMAIN_URL
+            if webhook_url:
+                full_url = f"https://{webhook_url.replace('https://', '').replace('http://', '')}{self.config.TELEGRAM_WEBHOOK_PATH}"
+                try:
+                    await self.bot.set_webhook(url=full_url)
+                    logging.info(f"✅ Telegram webhook: {full_url}")
+                except Exception as e:
+                    logging.warning(f"⚠️ Telegram webhook failed: {e}")
+        
+        self.fastapi_app = create_app(self)
+        
+        logging.info("✅ Service ready")
+        logging.info("=" * 60)
+        logging.info("📱 Bot NO se auto-inicia")
+        logging.info("📱 Use /iniciar en Telegram")
+        logging.info("=" * 60)
+
+    async def stop(self):
+        logging.info("🛑 Stopping...")
+        
+        if self.streaming_manager:
+            await self.streaming_manager.stop()
+        
+        if self.pumpportal_listener:
+            await self.pumpportal_listener.stop()
+        
+        if self.streaming_task:
+            self.streaming_task.cancel()
+        
+        if self.pumpportal_task:
+            self.pumpportal_task.cancel()
+        
+        if self.db:
+            await self.db.disconnect()
+        
+        if self.redis:
+            await self.redis.close()
+        
+        if self.rpc:
+            await self.rpc.__aexit__(None, None, None)
+        
+        logging.info("✅ Stopped")
+
+# ============================================================================
+# ENTRYPOINT
+# ============================================================================
+
+async def _main():
+    svc = PumpFunService()
+    await svc.start()
+    
+    config = uvicorn.Config(
+        svc.fastapi_app,
+        host="0.0.0.0",
+        port=svc.config.HEALTH_PORT,
+        log_level="info"
+    )
+    server = uvicorn.Server(config)
+    
+    logging.info("🎮 Bot ready - Esperando /iniciar")
+    
+    await server.serve()
+
+def run_main():
+    try:
+        asyncio.run(_main())
+    except KeyboardInterrupt:
+        logging.info("⚠️ Interrupted")
+    except Exception as e:
+        logging.error(f"❌ Fatal: {e}")
+        raise
+
+if __name__ == "__main__":
+    run_main()
