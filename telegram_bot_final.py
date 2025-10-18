@@ -890,7 +890,7 @@ class WebSocketListener:
             transaction = tx_data.get('transaction', {})
             message = transaction.get('message', {})
             
-            # 🔥 METHOD 1: postTokenBalances (with NULL safety)
+            # 🔥 METHOD 1: postTokenBalances (NULL-SAFE)
             post_balances = meta.get('postTokenBalances', [])
             
             if post_balances:
@@ -908,9 +908,10 @@ class WebSocketListener:
                         if amount is None:
                             continue
                         
-                        # Safe comparison
+                        # Safe comparison - convert to float first
                         try:
-                            if float(amount) > 0:
+                            amount_float = float(amount)
+                            if amount_float > 0:
                                 if mint != 'So11111111111111111111111111111111111111112':
                                     logging.debug(f"✅ Mint from postTokenBalances")
                                     return mint
