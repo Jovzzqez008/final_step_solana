@@ -8,7 +8,6 @@
 ✅ Deduplicación de mints
 ✅ Usa RPCs configurados (no public)
 """
-asioiiimdaimoaopásp´sp
 import os
 import sys
 import json
