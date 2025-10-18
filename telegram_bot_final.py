@@ -869,7 +869,7 @@ class WebSocketListener:
             logging.error(f"Handler error: {e}")
 
     async def _extract_mint_from_tx(self, signature: str) -> Optional[str]:
-        """🔥 MULTI-METHOD MINT EXTRACTION"""
+        """🔥 MULTI-METHOD MINT EXTRACTION - SAFE VERSION"""
         try:
             if not self.manager.rpc.session:
                 await self.manager.rpc.__aenter__()
@@ -890,81 +890,131 @@ class WebSocketListener:
             transaction = tx_data.get('transaction', {})
             message = transaction.get('message', {})
             
-            # METHOD 1: postTokenBalances
+            # 🔥 METHOD 1: postTokenBalances (with NULL safety)
             post_balances = meta.get('postTokenBalances', [])
             
             if post_balances:
                 for balance in post_balances:
-                    mint = balance.get('mint')
-                    amount = balance.get('uiTokenAmount', {}).get('uiAmount', 0)
-                    
-                    if mint and len(mint) == 44 and amount > 0:
-                        if mint != 'So11111111111111111111111111111111111111112':
-                            logging.debug(f"✅ Mint from postTokenBalances")
+                    try:
+                        mint = balance.get('mint')
+                        if not mint or len(mint) != 44:
+                            continue
+                        
+                        ui_amount = balance.get('uiTokenAmount')
+                        if not ui_amount or not isinstance(ui_amount, dict):
+                            continue
+                        
+                        amount = ui_amount.get('uiAmount')
+                        if amount is None:
+                            continue
+                        
+                        # Safe comparison
+                        try:
+                            if float(amount) > 0:
+                                if mint != 'So11111111111111111111111111111111111111112':
+                                    logging.debug(f"✅ Mint from postTokenBalances")
+                                    return mint
+                        except (ValueError, TypeError):
+                            continue
+                    except Exception:
+                        continue
+            
+            # 🔥 METHOD 2: Balance diff (safe)
+            try:
+                pre_balances = meta.get('preTokenBalances', [])
+                pre_mints = {b.get('mint') for b in pre_balances if b.get('mint')}
+                post_mints = {b.get('mint') for b in post_balances if b.get('mint')}
+                
+                new_mints = post_mints - pre_mints
+                if new_mints:
+                    for mint in new_mints:
+                        if mint and isinstance(mint, str) and len(mint) == 44:
+                            logging.debug(f"✅ Mint from balance diff")
                             return mint
+            except Exception as e:
+                logging.debug(f"Balance diff failed: {e}")
             
-            # METHOD 2: Balance diff
-            pre_balances = meta.get('preTokenBalances', [])
-            pre_mints = {b.get('mint') for b in pre_balances}
-            post_mints = {b.get('mint') for b in post_balances}
-            
-            new_mints = post_mints - pre_mints
-            if new_mints:
-                for mint in new_mints:
-                    if mint and len(mint) == 44:
-                        logging.debug(f"✅ Mint from balance diff")
-                        return mint
-            
-            # METHOD 3: Instructions
-            instructions = message.get('instructions', [])
-            
-            for inst in instructions:
-                if inst.get('programId') == PUMP_FUN_PROGRAM_ID:
+            # 🔥 METHOD 3: Instructions (safe)
+            try:
+                instructions = message.get('instructions', [])
+                
+                for inst in instructions:
+                    if inst.get('programId') != PUMP_FUN_PROGRAM_ID:
+                        continue
+                    
                     accounts = inst.get('accounts', [])
+                    if not isinstance(accounts, list):
+                        continue
                     
                     for i in [0, 1, 2]:
-                        if i < len(accounts):
-                            potential_mint = accounts[i]
-                            if len(potential_mint) == 44 and potential_mint != PUMP_FUN_PROGRAM_ID:
-                                known = [
-                                    '11111111111111111111111111111111',
-                                    'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-                                    'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
-                                    'SysvarRent111111111111111111111111111111111'
-                                ]
-                                if potential_mint not in known:
-                                    logging.debug(f"✅ Mint from instructions")
-                                    return potential_mint
-            
-            # METHOD 4: Account keys
-            account_keys = message.get('accountKeys', [])
-            
-            for i, key in enumerate(account_keys[:5]):
-                if isinstance(key, dict):
-                    pubkey = key.get('pubkey', '')
-                elif isinstance(key, str):
-                    pubkey = key
-                else:
-                    continue
-                
-                if len(pubkey) == 44:
-                    known_programs = [
-                        PUMP_FUN_PROGRAM_ID,
-                        '11111111111111111111111111111111',
-                        'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-                        'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
-                        'SysvarRent111111111111111111111111111111111',
-                        'So11111111111111111111111111111111111111112'
-                    ]
-                    
-                    if pubkey not in known_programs:
-                        try:
-                            decoded = base58.b58decode(pubkey)
-                            if len(decoded) == 32:
-                                logging.debug(f"✅ Mint from accountKeys")
-                                return pubkey
-                        except Exception:
+                        if i >= len(accounts):
                             continue
+                        
+                        potential_mint = accounts[i]
+                        if not potential_mint or not isinstance(potential_mint, str):
+                            continue
+                        
+                        if len(potential_mint) != 44:
+                            continue
+                        
+                        if potential_mint == PUMP_FUN_PROGRAM_ID:
+                            continue
+                        
+                        known = [
+                            '11111111111111111111111111111111',
+                            'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+                            'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+                            'SysvarRent111111111111111111111111111111111'
+                        ]
+                        
+                        if potential_mint not in known:
+                            logging.debug(f"✅ Mint from instructions[{i}]")
+                            return potential_mint
+            except Exception as e:
+                logging.debug(f"Instructions parse failed: {e}")
+            
+            # 🔥 METHOD 4: Account keys (safe)
+            try:
+                account_keys = message.get('accountKeys', [])
+                if not isinstance(account_keys, list):
+                    return None
+                
+                for i, key in enumerate(account_keys[:5]):
+                    try:
+                        if isinstance(key, dict):
+                            pubkey = key.get('pubkey', '')
+                        elif isinstance(key, str):
+                            pubkey = key
+                        else:
+                            continue
+                        
+                        if not pubkey or not isinstance(pubkey, str):
+                            continue
+                        
+                        if len(pubkey) != 44:
+                            continue
+                        
+                        known_programs = [
+                            PUMP_FUN_PROGRAM_ID,
+                            '11111111111111111111111111111111',
+                            'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+                            'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL',
+                            'SysvarRent111111111111111111111111111111111',
+                            'So11111111111111111111111111111111111111112'
+                        ]
+                        
+                        if pubkey not in known_programs:
+                            try:
+                                decoded = base58.b58decode(pubkey)
+                                if len(decoded) == 32:
+                                    logging.debug(f"✅ Mint from accountKeys[{i}]")
+                                    return pubkey
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+            except Exception as e:
+                logging.debug(f"AccountKeys parse failed: {e}")
             
             return None
             
