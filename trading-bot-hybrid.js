@@ -1,12 +1,22 @@
-// trading-bot-hybrid.js - Pump.fun Trading Bot con Helius Smart Trader
-// 🚀 Bot completo de trading con detección inteligente y stop-loss híbrido
-// 💰 Optimizado para operar automáticamente en pump.fun
+// trading-bot-hybrid.js - Pump.fun Trading Bot DEFINITIVO
+// 🚀 Bot robusto con datos DIRECTOS de blockchain + Smart Trader
+// 💰 Sin dependencias de APIs externas para pricing
 
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const { Connection, Keypair, VersionedTransaction, PublicKey } = require('@solana/web3.js');
 const bs58 = require('bs58');
+
+// ============================================================================
+// PUMP.FUN PROGRAM CONSTANTS (desde el IDL)
+// ============================================================================
+
+const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+
+// Constantes de bonding curve (valores iniciales del programa)
+const LAMPORTS_PER_SOL = 1_000_000_000;
 
 // ============================================================================
 // CONFIGURACIÓN
@@ -16,11 +26,14 @@ const CONFIG = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
+  
+  // RPC - Prioridad: Helius > Públicos
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
-  SOLANA_RPC: process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com',
+  
   PUMPPORTAL_WSS: 'wss://pumpportal.fun/api/data',
   PUMPPORTAL_API: 'https://pumpportal.fun/api/trade-local',
   
+  // Trading
   TRADE_AMOUNT_SOL: parseFloat(process.env.TRADE_AMOUNT_SOL || '0.007'),
   HARD_STOP_LOSS_PERCENT: parseFloat(process.env.HARD_STOP_LOSS || '-45'),
   QUICK_STOP_PERCENT: parseFloat(process.env.QUICK_STOP || '-25'),
@@ -38,19 +51,19 @@ const CONFIG = {
   STAGNANT_TIME_MIN: parseFloat(process.env.STAGNANT_TIME_MIN || '4'),
   MAX_WATCH_TIME_SEC: parseFloat(process.env.MAX_WATCH_TIME_SEC || '60'),
   
+  // Smart Trader - Umbrales de detección
   EARLY_VELOCITY_MIN: parseFloat(process.env.EARLY_VELOCITY_MIN || '15'),
-  EARLY_TIME_WINDOW: parseFloat(process.env.EARLY_TIME_WINDOW || '20'),
+  EARLY_TIME_WINDOW: parseFloat(process.env.EARLY_TIME_WINDOW || '30'),
   CONFIRMATION_VELOCITY: parseFloat(process.env.CONFIRMATION_VELOCITY || '35'),
-  CONFIRMATION_TIME: parseFloat(process.env.CONFIRMATION_TIME || '45'),
-  MIN_VOLUME_SOL: parseFloat(process.env.MIN_VOLUME_SOL || '0.4'),
-  MIN_TX_COUNT: parseInt(process.env.MIN_TX_COUNT || '8'),
-  MIN_UNIQUE_BUYERS: parseInt(process.env.MIN_UNIQUE_BUYERS || '6'),
-  MIN_HOLDERS: parseInt(process.env.MIN_HOLDERS || '12'),
-  MAX_TOP_HOLDER_PERCENT: parseFloat(process.env.MAX_TOP_HOLDER_PERCENT || '35'),
+  CONFIRMATION_TIME: parseFloat(process.env.CONFIRMATION_TIME || '60'),
+  MIN_VOLUME_SOL: parseFloat(process.env.MIN_VOLUME_SOL || '0.3'),
+  MIN_BUY_COUNT: parseInt(process.env.MIN_BUY_COUNT || '5'),
+  MIN_UNIQUE_BUYERS: parseInt(process.env.MIN_UNIQUE_BUYERS || '4'),
+  MIN_HOLDERS: parseInt(process.env.MIN_HOLDERS || '8'),
+  MAX_TOP_HOLDER_PERCENT: parseFloat(process.env.MAX_TOP_HOLDER_PERCENT || '40'),
   
-  MIN_LIQUIDITY_USD: parseFloat(process.env.MIN_LIQUIDITY_USD || '400'),
+  MIN_LIQUIDITY_SOL: parseFloat(process.env.MIN_LIQUIDITY_SOL || '0.5'),
   MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '3'),
-  MIN_PRICE_USD: 0.00000001,
   
   DUMP_DETECTION_PERCENT: parseFloat(process.env.DUMP_DETECTION_PERCENT || '-15'),
   DUMP_TIME_WINDOW: parseFloat(process.env.DUMP_TIME_WINDOW || '30'),
@@ -58,13 +71,155 @@ const CONFIG = {
   TRADING_ENABLED: process.env.TRADING_ENABLED !== 'false',
   DRY_RUN: process.env.DRY_RUN !== 'false',
   
-  SLIPPAGE: parseFloat(process.env.SLIPPAGE || '30'),
+  SLIPPAGE: parseFloat(process.env.SLIPPAGE || '25'),
   PRIORITY_FEE: parseFloat(process.env.PRIORITY_FEE || '0.0005'),
   
-  PRICE_CHECK_INTERVAL_MS: parseInt(process.env.CHECK_INTERVAL_MS || '2500'),
+  PRICE_CHECK_INTERVAL_MS: parseInt(process.env.CHECK_INTERVAL_MS || '3000'),
   
-  HEALTH_PORT: process.env.PORT || 8080
+  HEALTH_PORT: process.env.PORT || 8080,
+  
+  SOL_PRICE_USD: 150 // Estimado para cálculos
 };
+
+// ============================================================================
+// BLOCKCHAIN UTILITIES - PUMP.FUN
+// ============================================================================
+
+/**
+ * Deriva la bonding curve PDA para un mint según el programa Pump.fun
+ */
+function getBondingCurvePDA(mint) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('bonding-curve'), new PublicKey(mint).toBuffer()],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
+
+/**
+ * Obtiene datos reales de la bonding curve desde blockchain
+ */
+async function getBondingCurveData(mint) {
+  try {
+    const bondingCurvePDA = getBondingCurvePDA(mint);
+    const accountInfo = await connection.getAccountInfo(bondingCurvePDA);
+    
+    if (!accountInfo || accountInfo.data.length < 49) {
+      return null;
+    }
+    
+    const data = accountInfo.data;
+    
+    // Estructura según IDL de Pump.fun:
+    // discriminator: 8 bytes
+    // virtualTokenReserves: u64 (offset 8)
+    // virtualSolReserves: u64 (offset 16)
+    // realTokenReserves: u64 (offset 24)
+    // realSolReserves: u64 (offset 32)
+    // tokenTotalSupply: u64 (offset 40)
+    // complete: bool (offset 48)
+    
+    const virtualTokenReserves = data.readBigUInt64LE(8);
+    const virtualSolReserves = data.readBigUInt64LE(16);
+    const realTokenReserves = data.readBigUInt64LE(24);
+    const realSolReserves = data.readBigUInt64LE(32);
+    const tokenTotalSupply = data.readBigUInt64LE(40);
+    const complete = data.readUInt8(48) === 1;
+    
+    // Calcular precio usando la fórmula de bonding curve
+    // price = virtualSolReserves / virtualTokenReserves
+    const priceSOL = Number(virtualSolReserves) / Number(virtualTokenReserves);
+    const priceUSD = priceSOL * CONFIG.SOL_PRICE_USD;
+    
+    // Market cap
+    const circulatingSupply = Number(tokenTotalSupply) - Number(realTokenReserves);
+    const marketCapSOL = (circulatingSupply * priceSOL) / 1e9;
+    const marketCapUSD = marketCapSOL * CONFIG.SOL_PRICE_USD;
+    
+    // Liquidez (SOL en la curva)
+    const liquiditySOL = Number(realSolReserves) / LAMPORTS_PER_SOL;
+    const liquidityUSD = liquiditySOL * CONFIG.SOL_PRICE_USD;
+    
+    // Progreso hacia graduación (85 SOL = bonding curve completa)
+    const progress = (liquiditySOL / 85) * 100;
+    
+    return {
+      bondingCurve: bondingCurvePDA.toBase58(),
+      virtualTokenReserves: Number(virtualTokenReserves),
+      virtualSolReserves: Number(virtualSolReserves),
+      realTokenReserves: Number(realTokenReserves),
+      realSolReserves: Number(realSolReserves),
+      tokenTotalSupply: Number(tokenTotalSupply),
+      complete,
+      priceSOL,
+      priceUSD,
+      marketCapSOL,
+      marketCapUSD,
+      liquiditySOL,
+      liquidityUSD,
+      circulatingSupply,
+      progress: Math.min(progress, 100)
+    };
+  } catch (error) {
+    log.debug(`Error getting bonding curve: ${error.message}`);
+    return null;
+  }
+}
+
+/**
+ * Obtiene holders del token desde blockchain
+ */
+async function getTokenHolders(mint) {
+  try {
+    const mintPubkey = new PublicKey(mint);
+    
+    // Usar getProgramAccounts para obtener todas las token accounts
+    const accounts = await connection.getProgramAccounts(
+      TOKEN_PROGRAM,
+      {
+        filters: [
+          { dataSize: 165 }, // Token account data size
+          {
+            memcmp: {
+              offset: 0,
+              bytes: mintPubkey.toBase58()
+            }
+          }
+        ]
+      }
+    );
+    
+    let holders = [];
+    let totalSupply = 0;
+    
+    for (const { account } of accounts) {
+      // Token amount está en offset 64 (u64)
+      const amount = account.data.readBigUInt64LE(64);
+      const balance = Number(amount);
+      
+      if (balance > 0) {
+        holders.push(balance);
+        totalSupply += balance;
+      }
+    }
+    
+    holders.sort((a, b) => b - a);
+    
+    const topHolderPercent = holders.length > 0 && totalSupply > 0
+      ? (holders[0] / totalSupply) * 100
+      : 0;
+    
+    return {
+      holderCount: holders.length,
+      topHolderPercent,
+      totalSupply,
+      top10Sum: holders.slice(0, 10).reduce((a, b) => a + b, 0)
+    };
+  } catch (error) {
+    log.debug(`Error getting holders: ${error.message}`);
+    return null;
+  }
+}
 
 // ============================================================================
 // HELIUS SMART TRADER CLASS
@@ -75,6 +230,7 @@ class HeliusSmartTrader {
     this.config = config;
     this.connection = null;
     this.watchlist = new Map();
+    this.tradeWatchers = new Map(); // WebSocket watchers por token
     this.stats = {
       tokensAnalyzed: 0,
       tokensEntered: 0,
@@ -83,7 +239,7 @@ class HeliusSmartTrader {
       losses: 0,
       totalProfit: 0,
       totalHoldTime: 0,
-      heliusCalls: 0
+      blockchainCalls: 0
     };
   }
 
@@ -91,7 +247,7 @@ class HeliusSmartTrader {
     this.connection = connection;
   }
 
-  async analyzeToken({ mint, symbol, name, initialPrice, marketCap }) {
+  async analyzeToken({ mint, symbol, name, uri }) {
     this.stats.tokensAnalyzed++;
     
     if (this.watchlist.has(mint)) {
@@ -102,19 +258,21 @@ class HeliusSmartTrader {
       mint,
       symbol: symbol || 'UNKNOWN',
       name: name || 'UNKNOWN',
+      uri: uri || '',
       phase: 'watching',
       firstSeenTime: Date.now(),
-      firstSeenPrice: initialPrice || 0,
-      currentPrice: initialPrice || 0,
-      maxPrice: initialPrice || 0,
-      minPrice: initialPrice || 0,
-      volumeSOL: 0,
-      txCount: 0,
-      uniqueBuyers: 0,
-      uniqueSellers: 0,
+      firstSeenPrice: 0,
+      currentPrice: 0,
+      maxPrice: 0,
+      minPrice: 0,
+      liquiditySOL: 0,
+      liquidityUSD: 0,
+      buyCount: 0,
+      sellCount: 0,
+      uniqueBuyers: new Set(),
+      uniqueSellers: new Set(),
       holders: 0,
       topHolderPercent: 0,
-      liquidityUSD: marketCap || 0,
       priceHistory: [],
       checksCount: 0,
       lastCheckTime: Date.now(),
@@ -122,13 +280,83 @@ class HeliusSmartTrader {
       exitReason: null,
       trailingStopActive: false,
       lastMoveTime: Date.now(),
-      partialSellsDone: []
+      partialSellsDone: [],
+      initialHolders: 0
     };
 
     this.watchlist.set(mint, watch);
+    
+    // Suscribirse a trades del token en tiempo real
+    this.subscribeToTokenTrades(mint);
+    
+    // Iniciar monitoreo
     this.monitorToken(mint);
     
     return { shouldWatch: true };
+  }
+
+  /**
+   * Suscribirse a trades en tiempo real del token usando PumpPortal
+   */
+  subscribeToTokenTrades(mint) {
+    try {
+      const ws = new WebSocket(CONFIG.PUMPPORTAL_WSS);
+      
+      ws.on('open', () => {
+        ws.send(JSON.stringify({
+          method: 'subscribeTokenTrade',
+          keys: [mint]
+        }));
+        log.debug(`Suscrito a trades de ${mint.slice(0, 8)}`);
+      });
+      
+      ws.on('message', (data) => {
+        try {
+          const trade = JSON.parse(data);
+          this.handleTokenTrade(mint, trade);
+        } catch (err) {
+          // Ignorar errores de parsing
+        }
+      });
+      
+      ws.on('error', () => {
+        // Silenciar errores
+      });
+      
+      this.tradeWatchers.set(mint, ws);
+      
+      // Cerrar después de 2 minutos
+      setTimeout(() => {
+        if (this.tradeWatchers.has(mint)) {
+          ws.close();
+          this.tradeWatchers.delete(mint);
+        }
+      }, 120000);
+      
+    } catch (error) {
+      // Continuar sin suscripción si falla
+    }
+  }
+
+  /**
+   * Manejar trade en tiempo real
+   */
+  handleTokenTrade(mint, trade) {
+    const watch = this.watchlist.get(mint);
+    if (!watch) return;
+    
+    if (trade.tradeType === 'buy') {
+      watch.buyCount++;
+      if (trade.user) watch.uniqueBuyers.add(trade.user);
+    } else if (trade.tradeType === 'sell') {
+      watch.sellCount++;
+      if (trade.user) watch.uniqueSellers.add(trade.user);
+    }
+    
+    // Actualizar volumen aproximado
+    if (trade.sol_amount) {
+      watch.liquiditySOL = Math.max(watch.liquiditySOL, trade.sol_amount / 1e9);
+    }
   }
 
   async monitorToken(mint) {
@@ -152,54 +380,64 @@ class HeliusSmartTrader {
 
     try {
       watch.checksCount++;
+      this.stats.blockchainCalls++;
       
-      const [priceData, holdersData, txData] = await Promise.all([
-        this.getTokenPrice(mint).catch(() => null),
-        this.getHoldersInfo(mint).catch(() => null),
-        this.getRecentTransactions(mint).catch(() => null)
+      // Obtener datos DIRECTOS de blockchain
+      const [bondingData, holdersData] = await Promise.all([
+        getBondingCurveData(mint),
+        // Holders cada 3 checks (más costoso)
+        watch.checksCount % 3 === 0 ? getTokenHolders(mint) : null
       ]);
 
-      if (priceData && priceData.priceUSD > 0) {
-        watch.currentPrice = priceData.priceUSD;
-        watch.maxPrice = Math.max(watch.maxPrice, priceData.priceUSD);
-        watch.minPrice = watch.minPrice === 0 ? priceData.priceUSD : Math.min(watch.minPrice, priceData.priceUSD);
-        watch.volumeSOL = priceData.volumeSOL || watch.volumeSOL;
-        watch.liquidityUSD = priceData.liquidityUSD || watch.liquidityUSD;
+      // Usar datos de bonding curve (siempre más confiable)
+      if (bondingData) {
+        watch.currentPrice = bondingData.priceUSD;
+        watch.maxPrice = Math.max(watch.maxPrice || 0, bondingData.priceUSD);
+        watch.minPrice = watch.minPrice === 0 ? bondingData.priceUSD : Math.min(watch.minPrice, bondingData.priceUSD);
+        watch.liquiditySOL = bondingData.liquiditySOL;
+        watch.liquidityUSD = bondingData.liquidityUSD;
 
         if (watch.firstSeenPrice === 0) {
-          watch.firstSeenPrice = priceData.priceUSD;
+          watch.firstSeenPrice = bondingData.priceUSD;
         }
 
         watch.priceHistory.push({
           time: Date.now(),
-          price: priceData.priceUSD
+          price: bondingData.priceUSD
         });
 
-        const cutoff = Date.now() - 60000;
+        // Mantener solo últimos 90s
+        const cutoff = Date.now() - 90000;
         watch.priceHistory = watch.priceHistory.filter(p => p.time > cutoff);
       }
 
+      // Actualizar holders
       if (holdersData) {
-        watch.holders = holdersData.holderCount || watch.holders;
-        watch.topHolderPercent = holdersData.topHolderPercent || watch.topHolderPercent;
-      }
-
-      if (txData) {
-        watch.txCount = txData.txCount || watch.txCount;
-        watch.uniqueBuyers = txData.uniqueBuyers || watch.uniqueBuyers;
-        watch.uniqueSellers = txData.uniqueSellers || watch.uniqueSellers;
+        watch.holders = holdersData.holderCount;
+        watch.topHolderPercent = holdersData.topHolderPercent;
+        
+        if (watch.initialHolders === 0) {
+          watch.initialHolders = holdersData.holderCount;
+        }
       }
 
       watch.lastCheckTime = Date.now();
 
-      if (watch.checksCount % 8 === 0 && watch.phase === 'watching') {
+      // Log cada 5 checks
+      if (watch.checksCount % 5 === 0 && watch.phase === 'watching') {
         const elapsed = (Date.now() - watch.firstSeenTime) / 1000;
         const velocity = this.getVelocity(watch);
-        console.log(`[HELIUS] 📊 ${watch.symbol}: ${velocity >= 0 ? '+' : ''}${velocity.toFixed(1)}% | Vol: ${watch.volumeSOL.toFixed(1)} | Holders: ${watch.holders} | Tx: ${watch.txCount} | ${elapsed.toFixed(0)}s`);
+        console.log(
+          `[TRADER] 📊 ${watch.symbol}: ${velocity >= 0 ? '+' : ''}${velocity.toFixed(1)}% | ` +
+          `Liq: ${watch.liquiditySOL.toFixed(2)} SOL | ` +
+          `Buys: ${watch.buyCount} | ` +
+          `Holders: ${watch.holders} | ` +
+          `${elapsed.toFixed(0)}s`
+        );
       }
 
     } catch (error) {
-      console.log(`[DEBUG] Error updating watch ${mint.slice(0, 8)}: ${error.message}`);
+      log.debug(`Error updating ${mint.slice(0, 8)}: ${error.message}`);
     }
   }
 
@@ -209,6 +447,9 @@ class HeliusSmartTrader {
 
     const elapsed = (Date.now() - watch.firstSeenTime) / 1000;
 
+    // ════════════════════════════════════════════════════════════════════
+    // FASE: WATCHING - Detectar entrada
+    // ════════════════════════════════════════════════════════════════════
     if (watch.phase === 'watching') {
       if (elapsed > this.config.MAX_WATCH_TIME_SEC) {
         this.rejectToken(mint, 'timeout');
@@ -221,115 +462,117 @@ class HeliusSmartTrader {
 
       if (!hasEarlySignal && !hasConfirmation) return;
 
-      if (watch.volumeSOL < this.config.MIN_VOLUME_SOL) {
-        this.rejectToken(mint, `vol_bajo_${watch.volumeSOL.toFixed(2)}`);
+      // Validaciones
+      if (watch.liquiditySOL < this.config.MIN_LIQUIDITY_SOL) {
+        this.rejectToken(mint, `liq_${watch.liquiditySOL.toFixed(2)}SOL`);
         return;
       }
 
-      if (watch.txCount < this.config.MIN_TX_COUNT) {
-        this.rejectToken(mint, `tx_bajo_${watch.txCount}`);
+      if (watch.buyCount < this.config.MIN_BUY_COUNT) {
+        this.rejectToken(mint, `buys_${watch.buyCount}`);
         return;
       }
 
-      if (watch.uniqueBuyers < this.config.MIN_UNIQUE_BUYERS) {
-        this.rejectToken(mint, `buyers_bajo_${watch.uniqueBuyers}`);
+      if (watch.uniqueBuyers.size < this.config.MIN_UNIQUE_BUYERS) {
+        this.rejectToken(mint, `buyers_${watch.uniqueBuyers.size}`);
         return;
       }
 
-      if (watch.holders < this.config.MIN_HOLDERS) {
-        this.rejectToken(mint, `holders_bajo_${watch.holders}`);
+      if (watch.holders > 0 && watch.holders < this.config.MIN_HOLDERS) {
+        this.rejectToken(mint, `holders_${watch.holders}`);
         return;
       }
 
       if (watch.topHolderPercent > this.config.MAX_TOP_HOLDER_PERCENT) {
-        this.rejectToken(mint, `concentracion_${watch.topHolderPercent.toFixed(0)}`);
+        this.rejectToken(mint, `whale_${watch.topHolderPercent.toFixed(0)}%`);
         return;
       }
 
-      if (watch.liquidityUSD < this.config.MIN_LIQUIDITY_USD) {
-        this.rejectToken(mint, `liq_baja_${watch.liquidityUSD.toFixed(0)}`);
-        return;
-      }
-
+      // ✅ SEÑAL DE ENTRADA
       watch.phase = 'entering';
       watch.entryPrice = watch.currentPrice;
       this.stats.tokensEntered++;
 
-      console.log(`[HELIUS] 🚀 SEÑAL DE ENTRADA: ${watch.symbol}`);
-      console.log(`         Velocidad: +${velocity.toFixed(1)}% en ${elapsed.toFixed(0)}s | Vol: ${watch.volumeSOL.toFixed(1)} SOL`);
+      console.log(`[TRADER] 🚀 SEÑAL: ${watch.symbol} | +${velocity.toFixed(1)}% | ${watch.buyCount} buys | ${watch.liquiditySOL.toFixed(2)} SOL`);
     }
+    
+    // ════════════════════════════════════════════════════════════════════
+    // FASE: HOLDING - Monitorear salidas
+    // ════════════════════════════════════════════════════════════════════
     else if (watch.phase === 'holding') {
       const holdTime = (Date.now() - watch.firstSeenTime) / 60000;
       const profit = this.getProfitPercent(watch);
       const profitFromMax = this.getProfitFromMax(watch);
 
+      // Hard Stop
       if (profit <= this.config.HARD_STOP_LOSS_PERCENT) {
         watch.phase = 'exiting';
         watch.exitReason = 'hard_stop_loss';
-        console.log(`[HELIUS] 🛑 HARD STOP: ${watch.symbol} @ ${profit.toFixed(1)}%`);
+        console.log(`[TRADER] 🛑 HARD STOP: ${watch.symbol} @ ${profit.toFixed(1)}%`);
         return;
       }
 
+      // Quick Stop
       if (holdTime < (this.config.QUICK_STOP_TIME_SEC / 60) && profit <= this.config.QUICK_STOP_PERCENT) {
         watch.phase = 'exiting';
         watch.exitReason = 'quick_stop';
-        console.log(`[HELIUS] ⚡ QUICK STOP: ${watch.symbol} @ ${profit.toFixed(1)}%`);
+        console.log(`[TRADER] ⚡ QUICK STOP: ${watch.symbol} @ ${profit.toFixed(1)}%`);
         return;
       }
 
+      // Trailing Stop
       if (profit >= this.config.TRAILING_STOP_ACTIVATION && !watch.trailingStopActive) {
         watch.trailingStopActive = true;
-        console.log(`[HELIUS] 🛡️ TRAILING ACTIVADO: ${watch.symbol} @ +${profit.toFixed(1)}%`);
+        console.log(`[TRADER] 🛡️ TRAILING: ${watch.symbol} @ +${profit.toFixed(1)}%`);
       }
 
       if (watch.trailingStopActive && profitFromMax <= this.config.TRAILING_STOP_PERCENT) {
         watch.phase = 'exiting';
-        watch.exitReason = `trailing_stop_${profitFromMax.toFixed(1)}%_from_max`;
-        console.log(`[HELIUS] 📉 TRAILING STOP: ${watch.symbol} cayó ${profitFromMax.toFixed(1)}% desde máximo`);
+        watch.exitReason = `trailing_${profitFromMax.toFixed(1)}%`;
+        console.log(`[TRADER] 📉 TRAILING STOP: ${watch.symbol}`);
         return;
       }
 
+      // Take Profit
       for (const tp of this.config.TAKE_PROFIT_TARGETS) {
-        const alreadyDone = watch.partialSellsDone.includes(tp.percent);
-        
-        if (!alreadyDone && profit >= tp.percent) {
+        if (!watch.partialSellsDone.includes(tp.percent) && profit >= tp.percent) {
           watch.phase = 'exiting';
-          watch.exitReason = `take_profit_${tp.percent}%_sell_${tp.sellPercent}%`;
+          watch.exitReason = `tp_${tp.percent}%_sell_${tp.sellPercent}%`;
           watch.partialSellsDone.push(tp.percent);
-          console.log(`[HELIUS] 💚 TAKE PROFIT: ${watch.symbol} @ +${profit.toFixed(1)}% | Vender ${tp.sellPercent}%`);
+          console.log(`[TRADER] 💚 TP: ${watch.symbol} @ +${profit.toFixed(1)}% | Sell ${tp.sellPercent}%`);
           
           if (tp.sellPercent < 100) {
             setTimeout(() => {
               const w = this.watchlist.get(mint);
-              if (w && w.phase === 'exiting') {
-                w.phase = 'holding';
-              }
+              if (w && w.phase === 'exiting') w.phase = 'holding';
             }, 5000);
           }
           return;
         }
       }
 
+      // Max Hold Time
       if (holdTime >= this.config.MAX_HOLD_TIME_MIN) {
         watch.phase = 'exiting';
-        watch.exitReason = 'max_hold_time';
-        console.log(`[HELIUS] ⏰ MAX HOLD: ${watch.symbol} @ ${holdTime.toFixed(1)}min`);
+        watch.exitReason = 'max_hold';
+        console.log(`[TRADER] ⏰ MAX HOLD: ${watch.symbol}`);
         return;
       }
 
-      const timeSinceLastMove = (Date.now() - watch.lastMoveTime) / 60000;
-      if (timeSinceLastMove >= this.config.STAGNANT_TIME_MIN && profit > 0) {
+      // Stagnant
+      const timeSinceMove = (Date.now() - watch.lastMoveTime) / 60000;
+      if (timeSinceMove >= this.config.STAGNANT_TIME_MIN && profit > 0) {
         watch.phase = 'exiting';
         watch.exitReason = 'stagnant';
-        console.log(`[HELIUS] 😴 STAGNANT: ${watch.symbol} @ ${timeSinceLastMove.toFixed(1)}min sin movimiento`);
+        console.log(`[TRADER] 😴 STAGNANT: ${watch.symbol}`);
         return;
       }
 
-      const recentDump = this.detectDump(watch);
-      if (recentDump) {
+      // Dump Detection
+      if (this.detectDump(watch)) {
         watch.phase = 'exiting';
-        watch.exitReason = 'dump_detected';
-        console.log(`[HELIUS] 💥 DUMP DETECTADO: ${watch.symbol}`);
+        watch.exitReason = 'dump';
+        console.log(`[TRADER] 💥 DUMP: ${watch.symbol}`);
         return;
       }
 
@@ -339,111 +582,24 @@ class HeliusSmartTrader {
     }
   }
 
-  async getTokenPrice(mint) {
-    try {
-      this.stats.heliusCalls++;
-      
-      const response = await axios.get(
-        `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-        { timeout: 3000 }
-      );
-
-      if (response.data.pairs && response.data.pairs.length > 0) {
-        const pair = response.data.pairs[0];
-        return {
-          priceUSD: parseFloat(pair.priceUsd || 0),
-          volumeSOL: parseFloat(pair.volume?.h24 || 0) / 150,
-          liquidityUSD: parseFloat(pair.liquidity?.usd || 0)
-        };
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async getHoldersInfo(mint) {
-    try {
-      this.stats.heliusCalls++;
-      
-      const response = await axios.post(
-        `https://mainnet.helius-rpc.com/?api-key=${this.config.HELIUS_API_KEY}`,
-        {
-          jsonrpc: '2.0',
-          id: 'holders-' + Date.now(),
-          method: 'getTokenAccounts',
-          params: { mint: mint, limit: 100 }
-        },
-        { timeout: 3000 }
-      );
-
-      if (response.data.result?.token_accounts) {
-        const accounts = response.data.result.token_accounts;
-        const holderCount = accounts.length;
-        
-        let maxBalance = 0;
-        let totalSupply = 0;
-        
-        for (const account of accounts) {
-          const balance = parseFloat(account.amount || 0);
-          totalSupply += balance;
-          if (balance > maxBalance) maxBalance = balance;
-        }
-        
-        const topHolderPercent = totalSupply > 0 ? (maxBalance / totalSupply) * 100 : 0;
-        
-        return { holderCount, topHolderPercent };
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-
-  async getRecentTransactions(mint) {
-    try {
-      this.stats.heliusCalls++;
-      
-      const response = await axios.get(
-        `https://api.helius.xyz/v0/addresses/${mint}/transactions?api-key=${this.config.HELIUS_API_KEY}&limit=50`,
-        { timeout: 3000 }
-      );
-
-      if (response.data && Array.isArray(response.data)) {
-        const txs = response.data;
-        const buyers = new Set();
-        const sellers = new Set();
-
-        for (const tx of txs) {
-          if (tx.type === 'SWAP' || tx.type === 'TRANSFER') {
-            if (tx.feePayer) sellers.add(tx.feePayer);
-            if (tx.accountData?.[0]?.account) buyers.add(tx.accountData[0].account);
-          }
-        }
-
-        return {
-          txCount: txs.length,
-          uniqueBuyers: buyers.size,
-          uniqueSellers: sellers.size
-        };
-      }
-      return null;
-    } catch (error) {
-      return null;
-    }
-  }
-
   rejectToken(mint, reason) {
     const watch = this.watchlist.get(mint);
     if (watch) {
-      console.log(`[HELIUS] 🚫 ${watch.symbol} - ${reason}`);
+      console.log(`[TRADER] 🚫 ${watch.symbol} - ${reason}`);
     }
+    
+    // Cerrar WebSocket watcher
+    if (this.tradeWatchers.has(mint)) {
+      this.tradeWatchers.get(mint).close();
+      this.tradeWatchers.delete(mint);
+    }
+    
     this.watchlist.delete(mint);
     this.stats.tokensRejected++;
   }
 
   getVelocity(watch) {
-    if (watch.firstSeenPrice === 0) return 0;
+    if (watch.firstSeenPrice === 0 || watch.currentPrice === 0) return 0;
     return ((watch.currentPrice - watch.firstSeenPrice) / watch.firstSeenPrice) * 100;
   }
 
@@ -464,14 +620,14 @@ class HeliusSmartTrader {
   }
 
   detectDump(watch) {
-    if (watch.priceHistory.length < 2) return false;
+    if (watch.priceHistory.length < 3) return false;
     
     const cutoff = Date.now() - (this.config.DUMP_TIME_WINDOW * 1000);
-    const recentPrices = watch.priceHistory.filter(p => p.time >= cutoff);
+    const recent = watch.priceHistory.filter(p => p.time >= cutoff);
     
-    if (recentPrices.length < 2) return false;
+    if (recent.length < 2) return false;
     
-    const maxRecent = Math.max(...recentPrices.map(p => p.price));
+    const maxRecent = Math.max(...recent.map(p => p.price));
     const change = ((watch.currentPrice - maxRecent) / maxRecent) * 100;
     
     return change <= this.config.DUMP_DETECTION_PERCENT;
@@ -481,14 +637,15 @@ class HeliusSmartTrader {
     return {
       pumpfun: `https://pump.fun/${mint}`,
       dexscreener: `https://dexscreener.com/solana/${mint}`,
-      rugcheck: `https://rugcheck.xyz/tokens/${mint}`
+      rugcheck: `https://rugcheck.xyz/tokens/${mint}`,
+      solscan: `https://solscan.io/token/${mint}`
     };
   }
 
   getStats() {
-    const totalTrades = this.stats.wins + this.stats.losses;
-    const winRate = totalTrades > 0 ? (this.stats.wins / totalTrades) * 100 : 0;
-    const avgHoldTime = totalTrades > 0 ? this.stats.totalHoldTime / totalTrades : 0;
+    const total = this.stats.wins + this.stats.losses;
+    const winRate = total > 0 ? (this.stats.wins / total) * 100 : 0;
+    const avgHold = total > 0 ? this.stats.totalHoldTime / total : 0;
     
     return {
       tokensAnalyzed: this.stats.tokensAnalyzed,
@@ -498,8 +655,8 @@ class HeliusSmartTrader {
       losses: this.stats.losses,
       winRate: winRate.toFixed(1),
       totalProfit: this.stats.totalProfit,
-      avgHoldTime: avgHoldTime,
-      heliusCalls: this.stats.heliusCalls,
+      avgHoldTime: avgHold,
+      blockchainCalls: this.stats.blockchainCalls,
       currentlyWatching: this.watchlist.size
     };
   }
@@ -539,13 +696,13 @@ const stats = {
 // ============================================================================
 
 const log = {
-  info: (msg) => console.log(`[INFO] ${new Date().toISOString()} ${msg}`),
-  warn: (msg) => console.warn(`[WARN] ${new Date().toISOString()} ${msg}`),
-  error: (msg) => console.error(`[ERROR] ${new Date().toISOString()} ${msg}`),
-  trade: (msg) => console.log(`[TRADE] ${new Date().toISOString()} ${msg}`),
+  info: (msg) => console.log(`[INFO] ${msg}`),
+  warn: (msg) => console.warn(`[WARN] ${msg}`),
+  error: (msg) => console.error(`[ERROR] ${msg}`),
+  trade: (msg) => console.log(`[TRADE] ${msg}`),
   debug: (msg) => {
     if (process.env.LOG_LEVEL === 'DEBUG') {
-      console.log(`[DEBUG] ${new Date().toISOString()} ${msg}`);
+      console.log(`[DEBUG] ${msg}`);
     }
   }
 };
@@ -607,7 +764,7 @@ class PositionData {
 
 async function setupWallet() {
   if (!CONFIG.WALLET_PRIVATE_KEY) {
-    log.error('❌ WALLET_PRIVATE_KEY not configured');
+    log.error('❌ WALLET_PRIVATE_KEY no configurado');
     return false;
   }
   
@@ -615,44 +772,79 @@ async function setupWallet() {
     const secretKey = bs58.decode(CONFIG.WALLET_PRIVATE_KEY);
     wallet = Keypair.fromSecretKey(secretKey);
     
-    const rpcUrl = CONFIG.HELIUS_API_KEY 
-      ? `https://mainnet.helius-rpc.com/?api-key=${CONFIG.HELIUS_API_KEY}`
-      : CONFIG.SOLANA_RPC;
+    // Seleccionar RPC
+    let rpcUrl;
+    if (CONFIG.HELIUS_API_KEY && CONFIG.HELIUS_API_KEY.length > 20) {
+      rpcUrl = `https://mainnet.helius-rpc.com/?api-key=${CONFIG.HELIUS_API_KEY}`;
+      log.info('🚀 Usando Helius RPC');
+    } else {
+      const publicRPCs = [
+        'https://api.mainnet-beta.solana.com',
+        'https://solana-api.projectserum.com',
+        'https://rpc.ankr.com/solana'
+      ];
+      rpcUrl = publicRPCs[0];
+      log.warn('⚠️ Usando RPC público (puede tener límites)');
+    }
     
-    connection = new Connection(rpcUrl, 'confirmed');
+    connection = new Connection(rpcUrl, {
+      commitment: 'confirmed',
+      confirmTransactionInitialTimeout: 60000
+    });
     
-    const balance = await connection.getBalance(wallet.publicKey);
-    const balanceSOL = balance / 1e9;
+    log.info('🔍 Verificando wallet...');
+    
+    // Intentar obtener balance con retry
+    let balance = 0;
+    let attempts = 0;
+    
+    while (attempts < 3) {
+      try {
+        balance = await connection.getBalance(wallet.publicKey);
+        break;
+      } catch (err) {
+        attempts++;
+        if (err.message.includes('429')) {
+          log.warn(`⏳ Rate limit, esperando ${attempts * 2}s...`);
+          await sleep(attempts * 2000);
+        } else if (attempts === 3) {
+          log.warn('⚠️ No se pudo verificar balance, continuando...');
+        }
+      }
+    }
+    
+    const balanceSOL = balance / LAMPORTS_PER_SOL;
     
     log.info(`✅ Wallet: ${wallet.publicKey.toBase58()}`);
-    log.info(`💰 Balance: ${balanceSOL.toFixed(4)} SOL`);
     
-    if (balanceSOL < CONFIG.TRADE_AMOUNT_SOL * 2) {
-      log.warn(`⚠️ Balance bajo. Necesitas al menos ${(CONFIG.TRADE_AMOUNT_SOL * 2).toFixed(3)} SOL`);
+    if (balance > 0) {
+      log.info(`💰 Balance: ${balanceSOL.toFixed(4)} SOL`);
+      
+      if (balanceSOL < CONFIG.TRADE_AMOUNT_SOL * 2) {
+        log.warn(`⚠️ Balance bajo. Recomendado: ${(CONFIG.TRADE_AMOUNT_SOL * 2).toFixed(3)} SOL`);
+      }
     }
     
     return true;
   } catch (error) {
-    log.error(`❌ Wallet setup failed: ${error.message}`);
+    log.error(`❌ Error en wallet: ${error.message}`);
     return false;
   }
 }
 
 function initSmartTrader() {
-  if (!CONFIG.HELIUS_API_KEY) {
-    log.error('❌ HELIUS_API_KEY requerido para Smart Trader!');
-    return false;
-  }
-  
   smartTrader = new HeliusSmartTrader(CONFIG);
   smartTrader.init(connection);
   
-  log.info('✅ Helius Smart Trader inicializado');
+  log.info('✅ Smart Trader inicializado (Blockchain Direct)');
+  log.info(`   📊 Entrada: +${CONFIG.EARLY_VELOCITY_MIN}% (${CONFIG.EARLY_TIME_WINDOW}s) → +${CONFIG.CONFIRMATION_VELOCITY}% confirma`);
+  log.info(`   🛡️ Stops: Hard ${CONFIG.HARD_STOP_LOSS_PERCENT}% | Quick ${CONFIG.QUICK_STOP_PERCENT}% | Trailing ${CONFIG.TRAILING_STOP_PERCENT}%`);
+  
   return true;
 }
 
 // ============================================================================
-// TRADING FUNCTIONS
+// TRADING FUNCTIONS (PumpPortal)
 // ============================================================================
 
 async function executeBuy(mint, amountSOL) {
@@ -687,7 +879,8 @@ async function executeBuy(mint, amountSOL) {
     
     const signature = await connection.sendTransaction(tx, {
       skipPreflight: false,
-      maxRetries: 3
+      maxRetries: 3,
+      preflightCommitment: 'confirmed'
     });
     
     await connection.confirmTransaction(signature, 'confirmed');
@@ -735,7 +928,8 @@ async function executeSell(mint, percentage) {
     
     const signature = await connection.sendTransaction(tx, {
       skipPreflight: false,
-      maxRetries: 3
+      maxRetries: 3,
+      preflightCommitment: 'confirmed'
     });
     
     await connection.confirmTransaction(signature, 'confirmed');
@@ -763,7 +957,7 @@ async function sendTelegram(message, options = {}) {
       ...options
     });
   } catch (error) {
-    log.error(`Telegram failed: ${error.message}`);
+    log.error(`Telegram error: ${error.message}`);
   }
 }
 
@@ -775,8 +969,10 @@ async function handleNewToken(data) {
   try {
     stats.detected++;
     
-    const payload = data.data || data;
-    const mint = payload.mint || payload.token;
+    const mint = data.mint;
+    const symbol = data.symbol || 'UNKNOWN';
+    const name = data.name || symbol;
+    const uri = data.uri || '';
     
     if (!mint || positions.has(mint)) return;
     
@@ -789,19 +985,7 @@ async function handleNewToken(data) {
       return;
     }
     
-    const symbol = payload.symbol || payload.tokenSymbol || 'UNKNOWN';
-    const name = payload.name || payload.tokenName || symbol;
-    
-    let initialPrice = 0;
-    let marketCap = 0;
-    
-    if (payload.pairs && Array.isArray(payload.pairs) && payload.pairs.length > 0) {
-      const pair = payload.pairs[0];
-      initialPrice = parseFloat(pair.priceUsd || pair.price || 0);
-      marketCap = parseFloat(pair.marketCap || pair.fdv || 0);
-    }
-    
-    log.info(`🆕 Nuevo token: ${symbol} (${mint.slice(0, 8)})`);
+    log.info(`🆕 Token: ${symbol} (${mint.slice(0, 8)})`);
     
     if (!smartTrader) {
       log.warn('⚠️ Smart Trader no inicializado');
@@ -812,8 +996,7 @@ async function handleNewToken(data) {
       mint,
       symbol,
       name,
-      initialPrice,
-      marketCap
+      uri
     });
     
     if (!result.shouldWatch) {
@@ -824,7 +1007,7 @@ async function handleNewToken(data) {
     monitorSmartTraderSignals(mint, symbol, name);
     
   } catch (error) {
-    log.error(`Error manejando nuevo token: ${error.message}`);
+    log.error(`Error con token: ${error.message}`);
     stats.errors++;
   }
 }
@@ -843,38 +1026,37 @@ async function monitorSmartTraderSignals(mint, symbol, name) {
     const currentWatch = smartTrader.watchlist.get(mint);
     if (!currentWatch) break;
     
+    // COMPRA
     if (currentWatch.phase === 'entering' && !positions.has(mint)) {
       const buyPrice = currentWatch.entryPrice;
       const priceChange = smartTrader.getPriceChange(currentWatch, 'first');
       const links = smartTrader.generateLinks(mint);
       
       await sendTelegram(`
-🧠 *SMART TRADER - SEÑAL DE COMPRA*
+🧠 *SMART TRADER - COMPRA*
 
 *Token:* ${name} (${symbol})
-*Mint:* \`${mint}\`
+\`${mint}\`
 
-📊 *Análisis Helius:*
-• Cambio: +${priceChange.toFixed(1)}% en ${((Date.now() - currentWatch.firstSeenTime) / 1000).toFixed(0)}s
-• Volumen: ${currentWatch.volumeSOL.toFixed(2)} SOL
-• Compradores únicos: ${currentWatch.uniqueBuyers}
-• Holders: ${currentWatch.holders}
-• Liquidez: ${currentWatch.liquidityUSD.toFixed(0)}
-• Transacciones: ${currentWatch.txCount}
+📊 *Blockchain Data:*
+• Cambio: +${priceChange.toFixed(1)}% (${((Date.now() - currentWatch.firstSeenTime) / 1000).toFixed(0)}s)
+• Liquidez: ${currentWatch.liquiditySOL.toFixed(2)} SOL
+• Buys: ${currentWatch.buyCount} | Compradores: ${currentWatch.uniqueBuyers.size}
+• Holders: ${currentWatch.holders} | Top: ${currentWatch.topHolderPercent.toFixed(1)}%
 
-💰 *Acción:* Comprando ${CONFIG.TRADE_AMOUNT_SOL} SOL ahora...
+💰 Comprando ${CONFIG.TRADE_AMOUNT_SOL} SOL...
 
-🔍 [Pump.fun](${links.pumpfun}) | [DexScreener](${links.dexscreener})
+[Pump](${links.pumpfun}) | [Dex](${links.dexscreener}) | [Rug](${links.rugcheck})
       `.trim());
       
-      log.trade(`🔥 SMART BUY: ${symbol} @ ${buyPrice.toFixed(8)} | +${priceChange.toFixed(1)}%`);
+      log.trade(`🔥 BUY: ${symbol} @ ${buyPrice.toFixed(8)} | +${priceChange.toFixed(1)}%`);
       
       const buyResult = await executeBuy(mint, CONFIG.TRADE_AMOUNT_SOL);
       
       if (!buyResult.success) {
         log.error(`❌ Compra falló: ${buyResult.error}`);
         stats.errors++;
-        await sendTelegram(`❌ *ERROR EN COMPRA*\n\n${symbol}: ${buyResult.error}`);
+        await sendTelegram(`❌ *ERROR*\n\n${symbol}: ${buyResult.error}`);
         smartTrader.rejectToken(mint, 'buy_failed');
         return;
       }
@@ -894,7 +1076,7 @@ async function monitorSmartTraderSignals(mint, symbol, name) {
       currentWatch.phase = 'holding';
       
       const dryTag = buyResult.dryRun ? '[DRY RUN] ' : '';
-      log.trade(`${dryTag}✅ POSICIÓN ABIERTA: ${symbol} @ ${buyPrice.toFixed(8)}`);
+      log.trade(`${dryTag}✅ POSICIÓN: ${symbol} @ ${buyPrice.toFixed(8)}`);
       
       await sendTelegram(`
 ${dryTag}✅ *COMPRA EJECUTADA*
@@ -903,30 +1085,24 @@ ${dryTag}✅ *COMPRA EJECUTADA*
 *Precio:* ${buyPrice.toFixed(8)}
 *Invertido:* ${CONFIG.TRADE_AMOUNT_SOL} SOL
 
-📈 *Entrada:*
-• Pump detectado: +${priceChange.toFixed(1)}%
-• Tiempo análisis: ${((Date.now() - currentWatch.firstSeenTime) / 1000).toFixed(0)}s
-
-🛡️ *Smart Stops activos:*
-• Hard Stop: ${CONFIG.HARD_STOP_LOSS_PERCENT}%
-• Quick Stop: ${CONFIG.QUICK_STOP_PERCENT}% (<2min)
-• Trailing: ${CONFIG.TRAILING_STOP_PERCENT}% (activa al +${CONFIG.TRAILING_STOP_ACTIVATION}%)
+📈 +${priceChange.toFixed(1)}% detectado
 
 ${buyResult.dryRun ? '' : `[Tx](https://solscan.io/tx/${buyResult.signature})`}
       `.trim());
       
       monitorSmartPosition(mint).catch(err => {
-        log.error(`Error en smart monitor: ${err.message}`);
+        log.error(`Error monitor: ${err.message}`);
       });
     }
     
+    // VENTA
     if (currentWatch.phase === 'exiting' && positions.has(mint)) {
       const position = positions.get(mint);
-      const sellPercent = currentWatch.exitReason?.includes('take_profit') 
-        ? parseInt(currentWatch.exitReason.match(/\d+/)?.[0] || 100)
+      const sellPercent = currentWatch.exitReason?.includes('tp_') 
+        ? parseInt(currentWatch.exitReason.match(/sell_(\d+)/)?.[1] || 100)
         : 100;
       
-      log.trade(`🚪 SMART SELL: ${symbol} | ${currentWatch.exitReason} | ${sellPercent}%`);
+      log.trade(`🚪 SELL: ${symbol} | ${currentWatch.exitReason} | ${sellPercent}%`);
       
       await closePosition(mint, sellPercent, currentWatch.exitReason);
       
@@ -947,7 +1123,7 @@ async function monitorSmartPosition(mint) {
   
   if (!position || !watch) return;
   
-  log.info(`👀 Smart Monitor: ${position.symbol}...`);
+  log.info(`👀 Monitoreando: ${position.symbol}...`);
   
   while (positions.has(mint) && smartTrader.watchlist.has(mint) && watch.phase === 'holding') {
     
@@ -958,16 +1134,15 @@ async function monitorSmartPosition(mint) {
     position.maxPrice = Math.max(position.maxPrice, currentWatch.currentPrice);
     position.minPrice = Math.min(position.minPrice || currentWatch.currentPrice, currentWatch.currentPrice);
     
-    if (currentWatch.checksCount % 8 === 0) {
+    if (currentWatch.checksCount % 5 === 0) {
       const profit = position.profitPercent;
       const holdTime = position.elapsedMinutes;
       
       log.info(
         `📊 ${position.symbol}: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}% | ` +
         `${currentWatch.currentPrice.toFixed(8)} | ` +
-        `${position.remainingPercent}% | ` +
         `${holdTime.toFixed(1)}min | ` +
-        `Trailing: ${currentWatch.trailingStopActive ? '🛡️' : '❌'}`
+        `Trail: ${currentWatch.trailingStopActive ? '🛡️' : '❌'}`
       );
     }
     
@@ -976,19 +1151,19 @@ async function monitorSmartPosition(mint) {
 }
 
 // ============================================================================
-// CLOSE & FINALIZE POSITION
+// CLOSE POSITION
 // ============================================================================
 
 async function closePosition(mint, percentage, reason) {
   const position = positions.get(mint);
   if (!position || percentage === 0) return;
   
-  log.trade(`Cerrando posición: ${position.symbol} (${percentage}%) - ${reason}`);
+  log.trade(`Cerrando: ${position.symbol} (${percentage}%) - ${reason}`);
   
   const sellResult = await executeSell(mint, percentage);
   
   if (!sellResult.success) {
-    log.error(`❌ No se pudo vender ${position.symbol}`);
+    log.error(`❌ Venta falló: ${position.symbol}`);
     stats.errors++;
     return;
   }
@@ -1013,7 +1188,7 @@ async function finalizePosition(mint, reason) {
   
   const totalProfit = position.estimatedTotalProfitSOL;
   const profitPercent = position.profitPercent;
-  const profitUSD = totalProfit * 150;
+  const profitUSD = totalProfit * CONFIG.SOL_PRICE_USD;
   
   stats.sold++;
   stats.totalProfitSOL += totalProfit;
@@ -1037,26 +1212,19 @@ async function finalizePosition(mint, reason) {
   const emoji = totalProfit > 0 ? '💚' : '❌';
   const dryTag = position.txSells.some(tx => tx && tx.includes('dry-run')) ? '[DRY RUN] ' : '';
   
-  log.trade(`${dryTag}${emoji} CERRADO: ${position.symbol} | ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(1)}% (${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(4)} SOL) | ${reason}`);
+  log.trade(`${dryTag}${emoji} CERRADO: ${position.symbol} | ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(1)}% (${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(4)} SOL)`);
   
   await sendTelegram(`
-${dryTag}${emoji} *POSICIÓN CERRADA*
+${dryTag}${emoji} *CERRADO*
 
-*Token:* ${position.name} (${position.symbol})
-*Compra:* ${position.buyPrice.toFixed(8)}
-*Venta:* ${position.currentPrice.toFixed(8)}
-*Ganancia:* ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(1)}%
-
-*Profit:*
-• ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(4)} SOL
-• ${profitUSD.toFixed(2)} USD
-
+*${position.name}* (${position.symbol})
+*Profit:* ${profitPercent >= 0 ? '+' : ''}${profitPercent.toFixed(1)}%
+*SOL:* ${totalProfit >= 0 ? '+' : ''}${totalProfit.toFixed(4)} SOL
 *Tiempo:* ${position.elapsedMinutes.toFixed(1)} min
 *Razón:* ${reason}
 
 *Balance Hoy:*
-• ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
-• W/L: ${stats.wins}/${stats.losses}
+${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL | W/L: ${stats.wins}/${stats.losses}
   `.trim());
   
   setTimeout(() => positions.delete(mint), 60000);
@@ -1067,7 +1235,7 @@ ${dryTag}${emoji} *POSICIÓN CERRADA*
 // ============================================================================
 
 function connectWebSocket() {
-  log.info('🔌 Conectando a PumpPortal WebSocket...');
+  log.info('🔌 Conectando a PumpPortal...');
   
   ws = new WebSocket(CONFIG.PUMPPORTAL_WSS);
   
@@ -1081,11 +1249,8 @@ function connectWebSocket() {
     log.info('✅ Suscrito a nuevos tokens');
     
     if (CONFIG.TRADING_ENABLED && wallet) {
-      const mode = CONFIG.DRY_RUN ? '🟡 DRY RUN (Simulación)' : '🔴 LIVE (Dinero Real)';
-      log.warn(`🤖 MODO TRADING: ${mode}`);
-      log.info(`💰 Monto por trade: ${CONFIG.TRADE_AMOUNT_SOL} SOL`);
-    } else {
-      log.warn('⚠️ Trading deshabilitado - Solo monitoreo');
+      const mode = CONFIG.DRY_RUN ? '🟡 DRY RUN' : '🔴 LIVE';
+      log.warn(`🤖 MODO: ${mode}`);
     }
   });
   
@@ -1094,27 +1259,27 @@ function connectWebSocket() {
       const parsed = JSON.parse(data);
       handleNewToken(parsed);
     } catch (error) {
-      log.error(`Error parseando mensaje: ${error.message}`);
+      // Ignorar errores de parsing
     }
   });
   
   ws.on('error', (error) => {
-    log.error(`❌ WebSocket error: ${error.message}`);
+    log.error(`WebSocket error: ${error.message}`);
   });
   
   ws.on('close', () => {
-    log.warn('⚠️ WebSocket desconectado, reconectando en 5s...');
+    log.warn('⚠️ WebSocket cerrado, reconectando...');
     setTimeout(connectWebSocket, 5000);
   });
 }
 
 // ============================================================================
-// TELEGRAM BOT COMMANDS
+// TELEGRAM BOT
 // ============================================================================
 
 function setupTelegramBot() {
   if (!CONFIG.TELEGRAM_BOT_TOKEN) {
-    log.warn('⚠️ TELEGRAM_BOT_TOKEN no configurado');
+    log.warn('⚠️ Telegram no configurado');
     return;
   }
   
@@ -1122,50 +1287,31 @@ function setupTelegramBot() {
   
   telegramBot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    const mode = CONFIG.DRY_RUN ? '🟡 DRY RUN' : '🔴 LIVE';
-    
     telegramBot.sendMessage(chatId, `
-🤖 *Pump.fun Trading Bot con Helius*
+🤖 *Pump.fun Bot - Blockchain Direct*
 
-*Estado:* ${CONFIG.TRADING_ENABLED ? '✅ ACTIVO' : '❌ INACTIVO'}
-*Modo:* ${mode}
-*Por trade:* ${CONFIG.TRADE_AMOUNT_SOL} SOL
+*Estado:* ${CONFIG.TRADING_ENABLED ? '✅' : '❌'}
+*Modo:* ${CONFIG.DRY_RUN ? '🟡 DRY RUN' : '🔴 LIVE'}
 
 *Comandos:*
-/status - Estado del bot
+/status - Estado
 /stats - Estadísticas
-/smartstats - Stats Smart Trader
-/positions - Posiciones abiertas
-/balance - Balance wallet
+/positions - Posiciones
+/balance - Balance
     `.trim(), { parse_mode: 'Markdown' });
   });
   
-  telegramBot.onText(/\/status/, async (msg) => {
+  telegramBot.onText(/\/status/, (msg) => {
     const chatId = msg.chat.id;
     const wsStatus = ws && ws.readyState === WebSocket.OPEN ? '✅' : '❌';
-    
-    let positionsText = '';
-    if (positions.size > 0) {
-      positionsText = '\n\n*Posiciones:*\n';
-      for (const [mint, pos] of positions) {
-        const profit = pos.profitPercent;
-        const emoji = profit > 0 ? '💚' : '❌';
-        positionsText += `${emoji} ${pos.symbol}: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}%\n`;
-      }
-    }
     
     telegramBot.sendMessage(chatId, `
 📊 *ESTADO*
 
-*Conexión:*
-• WebSocket: ${wsStatus}
-• Trading: ${CONFIG.TRADING_ENABLED ? '✅' : '❌'}
-
-*Actividad:*
-• Detectados: ${stats.detected}
-• Comprados: ${stats.bought}
-• Posiciones: ${positions.size}
-${positionsText}
+*Conexión:* ${wsStatus}
+*Posiciones:* ${positions.size}/${CONFIG.MAX_CONCURRENT_POSITIONS}
+*Detectados:* ${stats.detected}
+*Comprados:* ${stats.bought}
     `.trim(), { parse_mode: 'Markdown' });
   });
   
@@ -1176,98 +1322,57 @@ ${positionsText}
       : 0;
     
     telegramBot.sendMessage(chatId, `
-📈 *ESTADÍSTICAS*
+📈 *STATS*
 
-*Profit Total:*
-• ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
-
-*Trades:*
-• Wins: ${stats.wins} (${winRate}%)
-• Losses: ${stats.losses}
-• Mejor: +${stats.bestTrade.toFixed(1)}%
-• Peor: ${stats.worstTrade.toFixed(1)}%
+*Profit:* ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
+*Trades:* ${stats.wins}W / ${stats.losses}L (${winRate}%)
+*Mejor:* +${stats.bestTrade.toFixed(1)}%
     `.trim(), { parse_mode: 'Markdown' });
-  });
-  
-  telegramBot.onText(/\/smartstats/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    if (!smartTrader) {
-      telegramBot.sendMessage(chatId, '❌ Smart Trader no inicializado');
-      return;
-    }
-    
-    const smartStats = smartTrader.getStats();
-    
-    telegramBot.sendMessage(chatId, `
-🧠 *SMART TRADER STATS*
-
-*Performance:*
-• Analizados: ${smartStats.tokensAnalyzed}
-• Entradas: ${smartStats.tokensEntered}
-• Rechazados: ${smartStats.tokensRejected}
-• Win rate: ${smartStats.winRate}%
-
-*Trading:*
-• Wins: ${smartStats.wins}
-• Losses: ${smartStats.losses}
-• Profit: ${smartStats.totalProfit.toFixed(4)} SOL
-
-*Helius:*
-• API calls: ${smartStats.heliusCalls}
-• Watching: ${smartStats.currentlyWatching}
-  `.trim(), { parse_mode: 'Markdown' });
   });
   
   telegramBot.onText(/\/positions/, (msg) => {
     const chatId = msg.chat.id;
     
     if (positions.size === 0) {
-      telegramBot.sendMessage(chatId, '🔭 Sin posiciones abiertas');
+      telegramBot.sendMessage(chatId, '🔭 Sin posiciones');
       return;
     }
     
-    let message = '📊 *POSICIONES ABIERTAS*\n\n';
-    
+    let msg_text = '📊 *POSICIONES*\n\n';
     for (const [mint, pos] of positions) {
       const profit = pos.profitPercent;
-      const emoji = profit > 0 ? '💚' : '❌';
-      
-      message += `${emoji} *${pos.symbol}*\n`;
-      message += `Ganancia: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}%\n`;
-      message += `Tiempo: ${pos.elapsedMinutes.toFixed(1)} min\n\n`;
+      msg_text += `${profit > 0 ? '💚' : '❌'} ${pos.symbol}: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}%\n`;
     }
     
-    telegramBot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    telegramBot.sendMessage(chatId, msg_text, { parse_mode: 'Markdown' });
   });
   
   telegramBot.onText(/\/balance/, async (msg) => {
     const chatId = msg.chat.id;
     
-    if (!wallet || !connection) {
+    if (!wallet) {
       telegramBot.sendMessage(chatId, '❌ Wallet no configurado');
       return;
     }
     
     try {
       const balance = await connection.getBalance(wallet.publicKey);
-      const balanceSOL = balance / 1e9;
+      const sol = balance / LAMPORTS_PER_SOL;
       
       telegramBot.sendMessage(chatId, `
 💰 *BALANCE*
 
-• ${balanceSOL.toFixed(4)} SOL
-• Posiciones: ${positions.size}
+${sol.toFixed(4)} SOL
 
 *Profit Sesión:*
-• ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
+${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
       `.trim(), { parse_mode: 'Markdown' });
     } catch (error) {
-      telegramBot.sendMessage(chatId, `❌ Error: ${error.message}`);
+      telegramBot.sendMessage(chatId, `❌ ${error.message}`);
     }
   });
   
-  log.info('✅ Telegram bot inicializado');
+  log.info('✅ Telegram bot listo');
 }
 
 // ============================================================================
@@ -1286,18 +1391,18 @@ function startHealthServer() {
         stats: stats
       }));
     } else {
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.writeHead(200);
       res.end('Bot Running ✅');
     }
   });
   
   server.listen(CONFIG.HEALTH_PORT, () => {
-    log.info(`✅ Health server: http://0.0.0.0:${CONFIG.HEALTH_PORT}`);
+    log.info(`✅ Health: http://0.0.0.0:${CONFIG.HEALTH_PORT}`);
   });
 }
 
 // ============================================================================
-// UTILITIES
+// UTILS
 // ============================================================================
 
 function sleep(ms) {
@@ -1311,35 +1416,25 @@ function sleep(ms) {
 async function main() {
   console.log('\n\n');
   log.info('═══════════════════════════════════════════════════════════════');
-  log.info('🚀 PUMP.FUN TRADING BOT CON HELIUS - INICIANDO');
+  log.info('🚀 PUMP.FUN BOT - BLOCKCHAIN DIRECT');
   log.info('═══════════════════════════════════════════════════════════════');
-  
-  if (!CONFIG.HELIUS_API_KEY) {
-    log.error('❌ HELIUS_API_KEY requerido!');
-    process.exit(1);
-  }
   
   if (CONFIG.TRADING_ENABLED) {
     if (!CONFIG.WALLET_PRIVATE_KEY) {
-      log.error('❌ WALLET_PRIVATE_KEY requerido!');
+      log.error('❌ WALLET_PRIVATE_KEY requerido');
       process.exit(1);
     }
     
     log.info('💼 Configurando wallet...');
-    const walletReady = await setupWallet();
+    const walletOk = await setupWallet();
     
-    if (!walletReady) {
-      log.error('❌ Error configurando wallet!');
+    if (!walletOk) {
+      log.error('❌ Error en wallet');
       process.exit(1);
     }
     
     log.info('🧠 Inicializando Smart Trader...');
-    const smartReady = initSmartTrader();
-    
-    if (!smartReady) {
-      log.error('❌ Error inicializando Smart Trader!');
-      process.exit(1);
-    }
+    initSmartTrader();
   }
   
   log.info('');
@@ -1359,7 +1454,7 @@ async function main() {
   connectWebSocket();
   
   log.info('');
-  log.info('✅ Bot iniciado correctamente');
+  log.info('✅ Bot iniciado');
   log.info('═══════════════════════════════════════════════════════════════');
   
   if (telegramBot && CONFIG.TELEGRAM_CHAT_ID) {
@@ -1367,20 +1462,21 @@ async function main() {
 🤖 *Bot Iniciado*
 
 *Modo:* ${CONFIG.DRY_RUN ? '🟡 DRY RUN' : '🔴 LIVE'}
+*Datos:* Blockchain Direct 🚀
 *Monto:* ${CONFIG.TRADE_AMOUNT_SOL} SOL/trade
 
-🧠 Helius Smart Trader activo 👀
+Bot monitoreando pump.fun 👀
     `.trim());
   }
 }
 
-process.on('SIGTERM', async () => {
+process.on('SIGTERM', () => {
   log.info('🛑 Cerrando...');
   if (ws) ws.close();
   process.exit(0);
 });
 
-process.on('SIGINT', async () => {
+process.on('SIGINT', () => {
   log.info('🛑 Cerrando...');
   if (ws) ws.close();
   process.exit(0);
