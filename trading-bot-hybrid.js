@@ -307,10 +307,47 @@ async function executeSell(mint, percentage) {
 }
 
 // ============================================================================
-// PRICE FETCHER
+// PRICE FETCHER (HYBRID: Bonding Curve + DexScreener)
 // ============================================================================
 
+// Importar el calculador de precios
+const { HybridPriceFetcher } = require('./price-calculator');
+let priceFetcher = null;
+
+/**
+ * Inicializar el fetcher de precios híbrido
+ */
+function initPriceFetcher() {
+  if (!connection) {
+    log.warn('⚠️ Connection no inicializada, usando solo DexScreener');
+    return;
+  }
+  
+  priceFetcher = new HybridPriceFetcher(connection, 150); // SOL @ $150 USD
+  log.info('✅ Price fetcher híbrido inicializado');
+}
+
+/**
+ * Obtiene el precio actual usando estrategia híbrida
+ * 1. Intenta desde bonding curve (más rápido y preciso)
+ * 2. Fallback a DexScreener si falla
+ */
 async function getCurrentPrice(mint) {
+  // Si tenemos el fetcher híbrido, usarlo
+  if (priceFetcher) {
+    try {
+      const priceData = await priceFetcher.getPrice(mint);
+      
+      if (priceData && priceData.priceUSD > 0) {
+        log.debug(`Precio obtenido desde ${priceData.source}: ${priceData.priceUSD.toFixed(8)}`);
+        return priceData.priceUSD;
+      }
+    } catch (error) {
+      log.debug(`Hybrid fetcher failed: ${error.message}`);
+    }
+  }
+  
+  // Fallback a método simple con DexScreener
   try {
     const response = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
@@ -325,6 +362,20 @@ async function getCurrentPrice(mint) {
   }
   
   return null;
+}
+
+/**
+ * Obtiene datos completos del precio (incluye liquidez, market cap, etc)
+ */
+async function getFullPriceData(mint) {
+  if (!priceFetcher) return null;
+  
+  try {
+    return await priceFetcher.getPrice(mint);
+  } catch (error) {
+    log.debug(`Error getting full price data: ${error.message}`);
+    return null;
+  }
 }
 
 // ============================================================================
