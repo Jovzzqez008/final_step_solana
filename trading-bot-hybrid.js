@@ -13,49 +13,31 @@ const bs58 = require('bs58');
 // ============================================================================
 
 const CONFIG = {
-  // 🔐 Telegram (REQUERIDO para recibir alertas)
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
-  
-  // 💼 Wallet de Solana (REQUERIDO para trading)
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
-  
-  // 🚀 Helius (REQUERIDO para datos precisos)
   HELIUS_API_KEY: process.env.HELIUS_API_KEY || '',
-  
-  // 🌐 RPC de Solana (se sobrescribirá con Helius si está disponible)
   SOLANA_RPC: process.env.SOLANA_RPC || 'https://api.mainnet-beta.solana.com',
-  
-  // 📡 PumpPortal API
   PUMPPORTAL_WSS: 'wss://pumpportal.fun/api/data',
   PUMPPORTAL_API: 'https://pumpportal.fun/api/trade-local',
   
-  // ════════════════════════════════════════════════════════════════════════
-  // 💰 ESTRATEGIA DE TRADING
-  // ════════════════════════════════════════════════════════════════════════
-  
   TRADE_AMOUNT_SOL: parseFloat(process.env.TRADE_AMOUNT_SOL || '0.007'),
-  
-  // 🛡️ STOP LOSS
   HARD_STOP_LOSS_PERCENT: parseFloat(process.env.HARD_STOP_LOSS || '-45'),
   QUICK_STOP_PERCENT: parseFloat(process.env.QUICK_STOP || '-25'),
   QUICK_STOP_TIME_SEC: 120,
   TRAILING_STOP_ACTIVATION: parseFloat(process.env.TRAILING_ACTIVATION || '40'),
   TRAILING_STOP_PERCENT: parseFloat(process.env.TRAILING_PERCENT || '-20'),
   
-  // 💚 TAKE PROFIT
   TAKE_PROFIT_TARGETS: [
     { percent: 80, sellPercent: 40 },
     { percent: 150, sellPercent: 30 },
     { percent: 300, sellPercent: 100 }
   ],
   
-  // ⏱️ Timeouts
   MAX_HOLD_TIME_MIN: parseFloat(process.env.MAX_HOLD_TIME_MIN || '12'),
   STAGNANT_TIME_MIN: parseFloat(process.env.STAGNANT_TIME_MIN || '4'),
   MAX_WATCH_TIME_SEC: parseFloat(process.env.MAX_WATCH_TIME_SEC || '60'),
   
-  // 🎯 Helius Smart Trader - Detección
   EARLY_VELOCITY_MIN: parseFloat(process.env.EARLY_VELOCITY_MIN || '15'),
   EARLY_TIME_WINDOW: parseFloat(process.env.EARLY_TIME_WINDOW || '20'),
   CONFIRMATION_VELOCITY: parseFloat(process.env.CONFIRMATION_VELOCITY || '35'),
@@ -66,16 +48,13 @@ const CONFIG = {
   MIN_HOLDERS: parseInt(process.env.MIN_HOLDERS || '12'),
   MAX_TOP_HOLDER_PERCENT: parseFloat(process.env.MAX_TOP_HOLDER_PERCENT || '35'),
   
-  // 🛡️ FILTROS DE SEGURIDAD
   MIN_LIQUIDITY_USD: parseFloat(process.env.MIN_LIQUIDITY_USD || '400'),
   MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '3'),
   MIN_PRICE_USD: 0.00000001,
   
-  // Detección de dump
   DUMP_DETECTION_PERCENT: parseFloat(process.env.DUMP_DETECTION_PERCENT || '-15'),
   DUMP_TIME_WINDOW: parseFloat(process.env.DUMP_TIME_WINDOW || '30'),
   
-  // ⚙️ CONFIGURACIÓN DE EJECUCIÓN
   TRADING_ENABLED: process.env.TRADING_ENABLED !== 'false',
   DRY_RUN: process.env.DRY_RUN !== 'false',
   
@@ -147,8 +126,6 @@ class HeliusSmartTrader {
     };
 
     this.watchlist.set(mint, watch);
-    
-    // Iniciar monitoreo automático
     this.monitorToken(mint);
     
     return { shouldWatch: true };
@@ -176,7 +153,6 @@ class HeliusSmartTrader {
     try {
       watch.checksCount++;
       
-      // Obtener datos actualizados
       const [priceData, holdersData, txData] = await Promise.all([
         this.getTokenPrice(mint).catch(() => null),
         this.getHoldersInfo(mint).catch(() => null),
@@ -199,7 +175,6 @@ class HeliusSmartTrader {
           price: priceData.priceUSD
         });
 
-        // Mantener solo últimos 60s
         const cutoff = Date.now() - 60000;
         watch.priceHistory = watch.priceHistory.filter(p => p.time > cutoff);
       }
@@ -217,7 +192,6 @@ class HeliusSmartTrader {
 
       watch.lastCheckTime = Date.now();
 
-      // Log cada 8 checks
       if (watch.checksCount % 8 === 0 && watch.phase === 'watching') {
         const elapsed = (Date.now() - watch.firstSeenTime) / 1000;
         const velocity = this.getVelocity(watch);
@@ -235,29 +209,18 @@ class HeliusSmartTrader {
 
     const elapsed = (Date.now() - watch.firstSeenTime) / 1000;
 
-    // ════════════════════════════════════════════════════════════════════
-    // FASE: WATCHING - Detectar señal de entrada
-    // ════════════════════════════════════════════════════════════════════
     if (watch.phase === 'watching') {
-      // Timeout
       if (elapsed > this.config.MAX_WATCH_TIME_SEC) {
         this.rejectToken(mint, 'timeout');
         return;
       }
 
       const velocity = this.getVelocity(watch);
-
-      // Señal temprana
       const hasEarlySignal = velocity >= this.config.EARLY_VELOCITY_MIN && elapsed <= this.config.EARLY_TIME_WINDOW;
-      
-      // Confirmación
       const hasConfirmation = velocity >= this.config.CONFIRMATION_VELOCITY && elapsed <= this.config.CONFIRMATION_TIME;
 
-      if (!hasEarlySignal && !hasConfirmation) {
-        return;
-      }
+      if (!hasEarlySignal && !hasConfirmation) return;
 
-      // Validar criterios
       if (watch.volumeSOL < this.config.MIN_VOLUME_SOL) {
         this.rejectToken(mint, `vol_bajo_${watch.volumeSOL.toFixed(2)}`);
         return;
@@ -288,7 +251,6 @@ class HeliusSmartTrader {
         return;
       }
 
-      // ✅ SEÑAL DE ENTRADA
       watch.phase = 'entering';
       watch.entryPrice = watch.currentPrice;
       this.stats.tokensEntered++;
@@ -296,16 +258,11 @@ class HeliusSmartTrader {
       console.log(`[HELIUS] 🚀 SEÑAL DE ENTRADA: ${watch.symbol}`);
       console.log(`         Velocidad: +${velocity.toFixed(1)}% en ${elapsed.toFixed(0)}s | Vol: ${watch.volumeSOL.toFixed(1)} SOL`);
     }
-
-    // ════════════════════════════════════════════════════════════════════
-    // FASE: HOLDING - Monitorear y decidir salidas
-    // ════════════════════════════════════════════════════════════════════
     else if (watch.phase === 'holding') {
       const holdTime = (Date.now() - watch.firstSeenTime) / 60000;
       const profit = this.getProfitPercent(watch);
       const profitFromMax = this.getProfitFromMax(watch);
 
-      // 🛑 Hard Stop Loss
       if (profit <= this.config.HARD_STOP_LOSS_PERCENT) {
         watch.phase = 'exiting';
         watch.exitReason = 'hard_stop_loss';
@@ -313,7 +270,6 @@ class HeliusSmartTrader {
         return;
       }
 
-      // 🛑 Quick Stop (caída rápida temprana)
       if (holdTime < (this.config.QUICK_STOP_TIME_SEC / 60) && profit <= this.config.QUICK_STOP_PERCENT) {
         watch.phase = 'exiting';
         watch.exitReason = 'quick_stop';
@@ -321,7 +277,6 @@ class HeliusSmartTrader {
         return;
       }
 
-      // 🛡️ Trailing Stop
       if (profit >= this.config.TRAILING_STOP_ACTIVATION && !watch.trailingStopActive) {
         watch.trailingStopActive = true;
         console.log(`[HELIUS] 🛡️ TRAILING ACTIVADO: ${watch.symbol} @ +${profit.toFixed(1)}%`);
@@ -334,8 +289,7 @@ class HeliusSmartTrader {
         return;
       }
 
-      // 💚 Take Profit Parcial
-      for (const tp of this.config.TAKE_PROFIT_LEVELS) {
+      for (const tp of this.config.TAKE_PROFIT_TARGETS) {
         const alreadyDone = watch.partialSellsDone.includes(tp.percent);
         
         if (!alreadyDone && profit >= tp.percent) {
@@ -344,7 +298,6 @@ class HeliusSmartTrader {
           watch.partialSellsDone.push(tp.percent);
           console.log(`[HELIUS] 💚 TAKE PROFIT: ${watch.symbol} @ +${profit.toFixed(1)}% | Vender ${tp.sellPercent}%`);
           
-          // Si no es venta total, volver a holding después de ejecutar
           if (tp.sellPercent < 100) {
             setTimeout(() => {
               const w = this.watchlist.get(mint);
@@ -357,7 +310,6 @@ class HeliusSmartTrader {
         }
       }
 
-      // ⏰ Max Hold Time
       if (holdTime >= this.config.MAX_HOLD_TIME_MIN) {
         watch.phase = 'exiting';
         watch.exitReason = 'max_hold_time';
@@ -365,7 +317,6 @@ class HeliusSmartTrader {
         return;
       }
 
-      // 😴 Stagnant (sin movimiento)
       const timeSinceLastMove = (Date.now() - watch.lastMoveTime) / 60000;
       if (timeSinceLastMove >= this.config.STAGNANT_TIME_MIN && profit > 0) {
         watch.phase = 'exiting';
@@ -374,7 +325,6 @@ class HeliusSmartTrader {
         return;
       }
 
-      // 💥 Dump Detection
       const recentDump = this.detectDump(watch);
       if (recentDump) {
         watch.phase = 'exiting';
@@ -383,7 +333,6 @@ class HeliusSmartTrader {
         return;
       }
 
-      // Actualizar lastMoveTime si hay cambio significativo
       if (Math.abs(profit) > 5) {
         watch.lastMoveTime = Date.now();
       }
@@ -571,8 +520,6 @@ let connection = null;
 let smartTrader = null;
 
 const positions = new Map();
-const pendingTokens = new Map();
-
 const stats = {
   detected: 0,
   filtered: 0,
@@ -655,7 +602,7 @@ class PositionData {
 }
 
 // ============================================================================
-// WALLET SETUP
+// WALLET & SMART TRADER SETUP
 // ============================================================================
 
 async function setupWallet() {
@@ -668,7 +615,6 @@ async function setupWallet() {
     const secretKey = bs58.decode(CONFIG.WALLET_PRIVATE_KEY);
     wallet = Keypair.fromSecretKey(secretKey);
     
-    // Usar Helius RPC si está disponible
     const rpcUrl = CONFIG.HELIUS_API_KEY 
       ? `https://mainnet.helius-rpc.com/?api-key=${CONFIG.HELIUS_API_KEY}`
       : CONFIG.SOLANA_RPC;
@@ -686,10 +632,27 @@ async function setupWallet() {
     }
     
     return true;
+  } catch (error) {
+    log.error(`❌ Wallet setup failed: ${error.message}`);
+    return false;
+  }
+}
+
+function initSmartTrader() {
+  if (!CONFIG.HELIUS_API_KEY) {
+    log.error('❌ HELIUS_API_KEY requerido para Smart Trader!');
+    return false;
+  }
+  
+  smartTrader = new HeliusSmartTrader(CONFIG);
+  smartTrader.init(connection);
+  
+  log.info('✅ Helius Smart Trader inicializado');
+  return true;
 }
 
 // ============================================================================
-// PUMPPORTAL TRADING FUNCTIONS
+// TRADING FUNCTIONS
 // ============================================================================
 
 async function executeBuy(mint, amountSOL) {
@@ -700,8 +663,6 @@ async function executeBuy(mint, amountSOL) {
   }
   
   try {
-    log.debug(`Enviando orden de compra para ${mint.slice(0, 8)}`);
-    
     const response = await axios.post(CONFIG.PUMPPORTAL_API, {
       publicKey: wallet.publicKey.toBase58(),
       action: 'buy',
@@ -729,7 +690,6 @@ async function executeBuy(mint, amountSOL) {
       maxRetries: 3
     });
     
-    log.debug(`Esperando confirmación de compra: ${signature.slice(0, 16)}...`);
     await connection.confirmTransaction(signature, 'confirmed');
     
     log.trade(`✅ COMPRA: ${mint.slice(0, 8)} | ${amountSOL} SOL | Tx: ${signature.slice(0, 16)}...`);
@@ -750,8 +710,6 @@ async function executeSell(mint, percentage) {
   
   try {
     const amount = percentage === 100 ? '100%' : `${percentage}%`;
-    
-    log.debug(`Enviando orden de venta para ${mint.slice(0, 8)} (${percentage}%)`);
     
     const response = await axios.post(CONFIG.PUMPPORTAL_API, {
       publicKey: wallet.publicKey.toBase58(),
@@ -792,7 +750,7 @@ async function executeSell(mint, percentage) {
 }
 
 // ============================================================================
-// TELEGRAM NOTIFICATIONS
+// TELEGRAM
 // ============================================================================
 
 async function sendTelegram(message, options = {}) {
@@ -810,7 +768,7 @@ async function sendTelegram(message, options = {}) {
 }
 
 // ============================================================================
-// HANDLE NEW TOKEN (CON SMART TRADER)
+// HANDLE NEW TOKEN
 // ============================================================================
 
 async function handleNewToken(data) {
@@ -820,22 +778,13 @@ async function handleNewToken(data) {
     const payload = data.data || data;
     const mint = payload.mint || payload.token;
     
-    if (!mint) {
-      log.debug('Token sin mint, ignorando');
-      return;
-    }
-    
-    if (positions.has(mint)) {
-      return;
-    }
+    if (!mint || positions.has(mint)) return;
     
     if (!CONFIG.TRADING_ENABLED || !wallet) {
-      log.debug(`Token detectado: ${mint.slice(0, 8)} (trading deshabilitado)`);
       return;
     }
     
     if (positions.size >= CONFIG.MAX_CONCURRENT_POSITIONS) {
-      log.debug(`Posiciones llenas (${CONFIG.MAX_CONCURRENT_POSITIONS}), ignorando token`);
       stats.filtered++;
       return;
     }
@@ -854,10 +803,6 @@ async function handleNewToken(data) {
     
     log.info(`🆕 Nuevo token: ${symbol} (${mint.slice(0, 8)})`);
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // 🧠 HELIUS SMART TRADER
-    // ═══════════════════════════════════════════════════════════════════════
-    
     if (!smartTrader) {
       log.warn('⚠️ Smart Trader no inicializado');
       return;
@@ -872,12 +817,10 @@ async function handleNewToken(data) {
     });
     
     if (!result.shouldWatch) {
-      log.debug(`❌ Token no agregado: ${result.reason}`);
       stats.filtered++;
       return;
     }
     
-    // Iniciar monitoreo de señales
     monitorSmartTraderSignals(mint, symbol, name);
     
   } catch (error) {
@@ -900,15 +843,11 @@ async function monitorSmartTraderSignals(mint, symbol, name) {
     const currentWatch = smartTrader.watchlist.get(mint);
     if (!currentWatch) break;
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // 🟢 SEÑAL DE COMPRA
-    // ═══════════════════════════════════════════════════════════════════════
     if (currentWatch.phase === 'entering' && !positions.has(mint)) {
       const buyPrice = currentWatch.entryPrice;
       const priceChange = smartTrader.getPriceChange(currentWatch, 'first');
       const links = smartTrader.generateLinks(mint);
       
-      // 🔔 ALERTA TELEGRAM ANTES DE COMPRAR
       await sendTelegram(`
 🧠 *SMART TRADER - SEÑAL DE COMPRA*
 
@@ -925,13 +864,11 @@ async function monitorSmartTraderSignals(mint, symbol, name) {
 
 💰 *Acción:* Comprando ${CONFIG.TRADE_AMOUNT_SOL} SOL ahora...
 
-🔍 *Links:*
-[Pump.fun](${links.pumpfun}) | [DexScreener](${links.dexscreener}) | [RugCheck](${links.rugcheck})
+🔍 [Pump.fun](${links.pumpfun}) | [DexScreener](${links.dexscreener})
       `.trim());
       
       log.trade(`🔥 SMART BUY: ${symbol} @ ${buyPrice.toFixed(8)} | +${priceChange.toFixed(1)}%`);
       
-      // EJECUTAR COMPRA
       const buyResult = await executeBuy(mint, CONFIG.TRADE_AMOUNT_SOL);
       
       if (!buyResult.success) {
@@ -942,7 +879,6 @@ async function monitorSmartTraderSignals(mint, symbol, name) {
         return;
       }
       
-      // CREAR POSICIÓN
       const position = new PositionData({
         mint,
         symbol,
@@ -960,7 +896,6 @@ async function monitorSmartTraderSignals(mint, symbol, name) {
       const dryTag = buyResult.dryRun ? '[DRY RUN] ' : '';
       log.trade(`${dryTag}✅ POSICIÓN ABIERTA: ${symbol} @ ${buyPrice.toFixed(8)}`);
       
-      // 🔔 CONFIRMACIÓN TELEGRAM
       await sendTelegram(`
 ${dryTag}✅ *COMPRA EJECUTADA*
 
@@ -976,8 +911,6 @@ ${dryTag}✅ *COMPRA EJECUTADA*
 • Hard Stop: ${CONFIG.HARD_STOP_LOSS_PERCENT}%
 • Quick Stop: ${CONFIG.QUICK_STOP_PERCENT}% (<2min)
 • Trailing: ${CONFIG.TRAILING_STOP_PERCENT}% (activa al +${CONFIG.TRAILING_STOP_ACTIVATION}%)
-• Take Profit: +80%, +150%, +300%
-• Max Hold: ${CONFIG.MAX_HOLD_TIME_MIN} min
 
 ${buyResult.dryRun ? '' : `[Tx](https://solscan.io/tx/${buyResult.signature})`}
       `.trim());
@@ -987,9 +920,6 @@ ${buyResult.dryRun ? '' : `[Tx](https://solscan.io/tx/${buyResult.signature})`}
       });
     }
     
-    // ═══════════════════════════════════════════════════════════════════════
-    // 🔴 SEÑAL DE VENTA
-    // ═══════════════════════════════════════════════════════════════════════
     if (currentWatch.phase === 'exiting' && positions.has(mint)) {
       const position = positions.get(mint);
       const sellPercent = currentWatch.exitReason?.includes('take_profit') 
@@ -1124,9 +1054,8 @@ ${dryTag}${emoji} *POSICIÓN CERRADA*
 *Tiempo:* ${position.elapsedMinutes.toFixed(1)} min
 *Razón:* ${reason}
 
-*Balance Total Hoy:*
+*Balance Hoy:*
 • ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
-• ${stats.totalProfitUSD.toFixed(2)} USD
 • W/L: ${stats.wins}/${stats.losses}
   `.trim());
   
@@ -1134,7 +1063,7 @@ ${dryTag}${emoji} *POSICIÓN CERRADA*
 }
 
 // ============================================================================
-// WEBSOCKET CONNECTION
+// WEBSOCKET
 // ============================================================================
 
 function connectWebSocket() {
@@ -1191,7 +1120,6 @@ function setupTelegramBot() {
   
   telegramBot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { polling: true });
   
-  // /start
   telegramBot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
     const mode = CONFIG.DRY_RUN ? '🟡 DRY RUN' : '🔴 LIVE';
@@ -1203,94 +1131,64 @@ function setupTelegramBot() {
 *Modo:* ${mode}
 *Por trade:* ${CONFIG.TRADE_AMOUNT_SOL} SOL
 
-*Smart Trader:*
-• Helius RPC: ✅ Ultrarrápido
-• Detección: +${CONFIG.EARLY_VELOCITY_MIN}% → +${CONFIG.CONFIRMATION_VELOCITY}%
-• Stops: ${CONFIG.HARD_STOP_LOSS_PERCENT}%, ${CONFIG.QUICK_STOP_PERCENT}%, ${CONFIG.TRAILING_STOP_PERCENT}%
-
 *Comandos:*
 /status - Estado del bot
-/stats - Estadísticas generales
-/smartstats - Stats del Smart Trader
+/stats - Estadísticas
+/smartstats - Stats Smart Trader
 /positions - Posiciones abiertas
-/balance - Balance de wallet
-/help - Ayuda
+/balance - Balance wallet
     `.trim(), { parse_mode: 'Markdown' });
   });
   
-  // /status
   telegramBot.onText(/\/status/, async (msg) => {
     const chatId = msg.chat.id;
     const wsStatus = ws && ws.readyState === WebSocket.OPEN ? '✅' : '❌';
     
     let positionsText = '';
     if (positions.size > 0) {
-      positionsText = '\n\n*Posiciones Abiertas:*\n';
+      positionsText = '\n\n*Posiciones:*\n';
       for (const [mint, pos] of positions) {
         const profit = pos.profitPercent;
-        const emoji = profit > 0 ? '💚' : profit < -20 ? '❌' : '🟡';
-        const watch = smartTrader ? smartTrader.watchlist.get(mint) : null;
-        const trailing = watch && watch.trailingStopActive ? '🛡️' : '';
-        positionsText += `${emoji} ${pos.symbol}: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}% (${pos.remainingPercent}%) ${trailing}\n`;
+        const emoji = profit > 0 ? '💚' : '❌';
+        positionsText += `${emoji} ${pos.symbol}: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}%\n`;
       }
-    } else {
-      positionsText = '\n\n🔭 Sin posiciones abiertas';
     }
     
-    const smartStatus = smartTrader ? `✅ (${smartTrader.watchlist.size} tokens)` : '❌';
-    
     telegramBot.sendMessage(chatId, `
-📊 *ESTADO DEL BOT*
+📊 *ESTADO*
 
 *Conexión:*
 • WebSocket: ${wsStatus}
 • Trading: ${CONFIG.TRADING_ENABLED ? '✅' : '❌'}
-• Modo: ${CONFIG.DRY_RUN ? 'DRY RUN' : 'LIVE'}
-• Smart Trader: ${smartStatus}
 
 *Actividad:*
 • Detectados: ${stats.detected}
-• Filtrados: ${stats.filtered}
 • Comprados: ${stats.bought}
-• Vendidos: ${stats.sold}
-• Posiciones: ${positions.size}/${CONFIG.MAX_CONCURRENT_POSITIONS}
+• Posiciones: ${positions.size}
 ${positionsText}
     `.trim(), { parse_mode: 'Markdown' });
   });
   
-  // /stats
   telegramBot.onText(/\/stats/, (msg) => {
     const chatId = msg.chat.id;
     const winRate = (stats.wins + stats.losses) > 0 
       ? ((stats.wins / (stats.wins + stats.losses)) * 100).toFixed(1) 
       : 0;
-    const avgProfit = stats.sold > 0 ? (stats.totalProfitSOL / stats.sold).toFixed(4) : 0;
     
     telegramBot.sendMessage(chatId, `
-📈 *ESTADÍSTICAS DE TRADING*
+📈 *ESTADÍSTICAS*
 
 *Profit Total:*
 • ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
-• ${stats.totalProfitUSD.toFixed(2)} USD
 
 *Trades:*
-• Total: ${stats.sold}
 • Wins: ${stats.wins} (${winRate}%)
 • Losses: ${stats.losses}
-
-*Performance:*
 • Mejor: +${stats.bestTrade.toFixed(1)}%
 • Peor: ${stats.worstTrade.toFixed(1)}%
-• Promedio: ${avgProfit} SOL/trade
-
-*Sistema:*
-• Tokens detectados: ${stats.detected}
-• Filtrados: ${stats.filtered}
-• Errores: ${stats.errors}
     `.trim(), { parse_mode: 'Markdown' });
   });
   
-  // /smartstats
   telegramBot.onText(/\/smartstats/, (msg) => {
     const chatId = msg.chat.id;
     
@@ -1301,49 +1199,31 @@ ${positionsText}
     
     const smartStats = smartTrader.getStats();
     
-    let watchingText = '';
-    if (smartTrader.watchlist.size > 0) {
-      watchingText = '\n\n*Tokens en análisis:*\n';
-      for (const [mint, watch] of smartTrader.watchlist) {
-        const elapsed = (Date.now() - watch.firstSeenTime) / 1000;
-        const change = smartTrader.getPriceChange(watch, 'first');
-        const phase = watch.phase === 'watching' ? '👀' : 
-                     watch.phase === 'holding' ? '💎' : '🚪';
-        
-        watchingText += `${phase} ${watch.symbol}: ${change >= 0 ? '+' : ''}${change.toFixed(1)}% | `;
-        watchingText += `Vol: ${watch.volumeSOL.toFixed(2)} | `;
-        watchingText += `${elapsed.toFixed(0)}s\n`;
-      }
-    }
-    
     telegramBot.sendMessage(chatId, `
 🧠 *SMART TRADER STATS*
 
 *Performance:*
-• Tokens analizados: ${smartStats.tokensAnalyzed}
-• Entradas ejecutadas: ${smartStats.tokensEntered}
+• Analizados: ${smartStats.tokensAnalyzed}
+• Entradas: ${smartStats.tokensEntered}
 • Rechazados: ${smartStats.tokensRejected}
 • Win rate: ${smartStats.winRate}%
 
 *Trading:*
 • Wins: ${smartStats.wins}
 • Losses: ${smartStats.losses}
-• Profit total: ${smartStats.totalProfit.toFixed(4)} SOL
-• Avg hold time: ${smartStats.avgHoldTime.toFixed(1)} min
+• Profit: ${smartStats.totalProfit.toFixed(4)} SOL
 
 *Helius:*
 • API calls: ${smartStats.heliusCalls}
-• Watching now: ${smartStats.currentlyWatching}
-${watchingText}
+• Watching: ${smartStats.currentlyWatching}
   `.trim(), { parse_mode: 'Markdown' });
   });
   
-  // /positions
   telegramBot.onText(/\/positions/, (msg) => {
     const chatId = msg.chat.id;
     
     if (positions.size === 0) {
-      telegramBot.sendMessage(chatId, '🔭 No hay posiciones abiertas actualmente');
+      telegramBot.sendMessage(chatId, '🔭 Sin posiciones abiertas');
       return;
     }
     
@@ -1351,30 +1231,16 @@ ${watchingText}
     
     for (const [mint, pos] of positions) {
       const profit = pos.profitPercent;
-      const profitSOL = pos.estimatedTotalProfitSOL;
       const emoji = profit > 0 ? '💚' : '❌';
-      const watch = smartTrader ? smartTrader.watchlist.get(mint) : null;
       
       message += `${emoji} *${pos.symbol}*\n`;
-      message += `Ganancia: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}% (${profitSOL >= 0 ? '+' : ''}${profitSOL.toFixed(4)} SOL)\n`;
-      message += `Precio: ${pos.buyPrice.toFixed(8)} → ${pos.currentPrice.toFixed(8)}\n`;
-      message += `Máximo: ${pos.maxPrice.toFixed(8)}\n`;
-      message += `Tiempo: ${pos.elapsedMinutes.toFixed(1)} min | Quedan: ${pos.remainingPercent}%\n`;
-      
-      if (watch) {
-        message += `Trailing: ${watch.trailingStopActive ? '✅ Activo' : '❌ Inactivo'}\n`;
-      }
-      
-      message += `[Pump.fun](https://pump.fun/${mint}) | [DexScreener](https://dexscreener.com/solana/${mint})\n\n`;
+      message += `Ganancia: ${profit >= 0 ? '+' : ''}${profit.toFixed(1)}%\n`;
+      message += `Tiempo: ${pos.elapsedMinutes.toFixed(1)} min\n\n`;
     }
     
-    telegramBot.sendMessage(chatId, message, { 
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true 
-    });
+    telegramBot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
   });
   
-  // /balance
   telegramBot.onText(/\/balance/, async (msg) => {
     const chatId = msg.chat.id;
     
@@ -1386,127 +1252,26 @@ ${watchingText}
     try {
       const balance = await connection.getBalance(wallet.publicKey);
       const balanceSOL = balance / 1e9;
-      const balanceUSD = balanceSOL * 150;
-      const tradesAvailable = Math.floor(balanceSOL / CONFIG.TRADE_AMOUNT_SOL);
       
       telegramBot.sendMessage(chatId, `
-💰 *BALANCE DE WALLET*
+💰 *BALANCE*
 
-*Dirección:*
-\`${wallet.publicKey.toBase58()}\`
-
-*Balance:*
 • ${balanceSOL.toFixed(4)} SOL
-• ~${balanceUSD.toFixed(2)} USD
-
-*Trading:*
-• Trades disponibles: ${tradesAvailable}
-• Monto por trade: ${CONFIG.TRADE_AMOUNT_SOL} SOL
-• Posiciones abiertas: ${positions.size}/${CONFIG.MAX_CONCURRENT_POSITIONS}
+• Posiciones: ${positions.size}
 
 *Profit Sesión:*
 • ${stats.totalProfitSOL >= 0 ? '+' : ''}${stats.totalProfitSOL.toFixed(4)} SOL
-• ${stats.totalProfitUSD.toFixed(2)} USD
       `.trim(), { parse_mode: 'Markdown' });
     } catch (error) {
-      telegramBot.sendMessage(chatId, `❌ Error obteniendo balance: ${error.message}`);
+      telegramBot.sendMessage(chatId, `❌ Error: ${error.message}`);
     }
-  });
-  
-  // /analysis <mint>
-  telegramBot.onText(/\/analysis (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const mint = match[1].trim();
-    
-    if (!smartTrader) {
-      telegramBot.sendMessage(chatId, '❌ Smart Trader no inicializado');
-      return;
-    }
-    
-    const watch = smartTrader.watchlist.get(mint);
-    
-    if (!watch) {
-      telegramBot.sendMessage(chatId, `❌ Token ${mint.slice(0, 8)} no está siendo analizado`);
-      return;
-    }
-    
-    const elapsed = (Date.now() - watch.firstSeenTime) / 1000;
-    const change = smartTrader.getPriceChange(watch, 'first');
-    const links = smartTrader.generateLinks(mint);
-    
-    telegramBot.sendMessage(chatId, `
-🔍 *ANÁLISIS DETALLADO*
-
-*Token:* ${watch.name} (${watch.symbol})
-*Mint:* \`${mint}\`
-
-📊 *Métricas:*
-• Precio: ${watch.currentPrice.toFixed(8)}
-• Cambio: ${change >= 0 ? '+' : ''}${change.toFixed(1)}%
-• Máximo: ${watch.maxPrice.toFixed(8)}
-• Mínimo: ${watch.minPrice.toFixed(8)}
-
-💰 *Actividad:*
-• Volumen: ${watch.volumeSOL.toFixed(2)} SOL
-• Liquidez: ${watch.liquidityUSD.toFixed(0)}
-• Transacciones: ${watch.txCount}
-• Compradores únicos: ${watch.uniqueBuyers}
-• Vendedores únicos: ${watch.uniqueSellers}
-
-👥 *Distribución:*
-• Holders: ${watch.holders}
-• Top holder: ${watch.topHolderPercent.toFixed(1)}%
-
-⏱️ *Tiempo:*
-• Observando: ${elapsed.toFixed(0)}s
-• Fase: ${watch.phase}
-• Checks: ${watch.checksCount}
-
-🔍 *Enlaces:*
-[Pump.fun](${links.pumpfun}) | [DexScreener](${links.dexscreener}) | [RugCheck](${links.rugcheck})
-  `.trim(), { 
-      parse_mode: 'Markdown',
-      disable_web_page_preview: true 
-    });
-  });
-  
-  // /help
-  telegramBot.onText(/\/help/, (msg) => {
-    const chatId = msg.chat.id;
-    
-    telegramBot.sendMessage(chatId, `
-❓ *AYUDA - Pump.fun Trading Bot*
-
-*Comandos:*
-/start - Iniciar bot y ver info
-/status - Estado actual del bot
-/stats - Estadísticas generales
-/smartstats - Stats del Smart Trader
-/positions - Ver posiciones abiertas
-/balance - Balance de wallet
-/analysis <mint> - Análisis detallado de token
-/help - Esta ayuda
-
-*Sobre el Bot:*
-Este bot usa Helius para detectar pumps en tiempo real y ejecutar trades automáticos con análisis inteligente de blockchain.
-
-*Smart Trader:*
-• Analiza holders, volumen, transacciones
-• Detecta señales tempranas (+${CONFIG.EARLY_VELOCITY_MIN}%)
-• Confirma con datos reales (+${CONFIG.CONFIRMATION_VELOCITY}%)
-• Stops inteligentes y take profit escalonado
-
-*Modo:* ${CONFIG.DRY_RUN ? 'DRY RUN (simulación)' : 'LIVE (dinero real)'}
-
-⚠️ *Riesgo:* Trading de criptomonedas es altamente riesgoso. Solo invierte lo que puedes perder.
-    `.trim(), { parse_mode: 'Markdown' });
   });
   
   log.info('✅ Telegram bot inicializado');
 }
 
 // ============================================================================
-// HEALTH CHECK SERVER
+// HEALTH SERVER
 // ============================================================================
 
 function startHealthServer() {
@@ -1517,29 +1282,12 @@ function startHealthServer() {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'healthy',
-        websocket_connected: ws && ws.readyState === WebSocket.OPEN,
-        trading_enabled: CONFIG.TRADING_ENABLED,
-        dry_run: CONFIG.DRY_RUN,
         positions: positions.size,
-        smart_trader_active: smartTrader !== null,
-        stats: stats,
-        uptime: process.uptime()
+        stats: stats
       }));
-    } else if (req.url === '/metrics') {
-      const metrics = {
-        positions: positions.size,
-        ...stats
-      };
-      
-      if (smartTrader) {
-        metrics.smartTrader = smartTrader.getStats();
-      }
-      
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(metrics));
     } else {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('Pump.fun Trading Bot with Helius - Running ✅');
+      res.end('Bot Running ✅');
     }
   });
   
@@ -1557,33 +1305,23 @@ function sleep(ms) {
 }
 
 // ============================================================================
-// MAIN FUNCTION
+// MAIN
 // ============================================================================
 
 async function main() {
-  console.log('\n'.repeat(2));
+  console.log('\n\n');
   log.info('═══════════════════════════════════════════════════════════════');
   log.info('🚀 PUMP.FUN TRADING BOT CON HELIUS - INICIANDO');
   log.info('═══════════════════════════════════════════════════════════════');
   
-  // Validar Helius
   if (!CONFIG.HELIUS_API_KEY) {
     log.error('❌ HELIUS_API_KEY requerido!');
-    log.error('   Obtén tu API key gratis en: https://helius.xyz');
     process.exit(1);
   }
   
-  // Validar Telegram
-  if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
-    log.warn('⚠️ Telegram no configurado - Las notificaciones estarán deshabilitadas');
-  }
-  
-  if (!CONFIG.TRADING_ENABLED) {
-    log.warn('⚠️ TRADING_ENABLED=false - Bot solo monitoreará (sin trading)');
-  } else {
+  if (CONFIG.TRADING_ENABLED) {
     if (!CONFIG.WALLET_PRIVATE_KEY) {
-      log.error('❌ WALLET_PRIVATE_KEY requerido para trading!');
-      log.error('   Configura la variable de entorno WALLET_PRIVATE_KEY');
+      log.error('❌ WALLET_PRIVATE_KEY requerido!');
       process.exit(1);
     }
     
@@ -1595,7 +1333,6 @@ async function main() {
       process.exit(1);
     }
     
-    // Inicializar Smart Trader
     log.info('🧠 Inicializando Smart Trader...');
     const smartReady = initSmartTrader();
     
@@ -1605,176 +1342,51 @@ async function main() {
     }
   }
   
-  // Mostrar configuración
-  log.info('');
-  log.info('⚙️  CONFIGURACIÓN:');
-  log.info(`   • Monto: ${CONFIG.TRADE_AMOUNT_SOL} SOL por trade`);
-  log.info(`   • Hard Stop: ${CONFIG.HARD_STOP_LOSS_PERCENT}%`);
-  log.info(`   • Quick Stop: ${CONFIG.QUICK_STOP_PERCENT}% (<${CONFIG.QUICK_STOP_TIME_SEC}s)`);
-  log.info(`   • Trailing: ${CONFIG.TRAILING_STOP_PERCENT}% (activa al +${CONFIG.TRAILING_STOP_ACTIVATION}%)`);
-  log.info(`   • Max Hold: ${CONFIG.MAX_HOLD_TIME_MIN} min`);
-  log.info(`   • Max Posiciones: ${CONFIG.MAX_CONCURRENT_POSITIONS}`);
-  log.info(`   • Min Liquidez: ${CONFIG.MIN_LIQUIDITY_USD}`);
-  log.info(`   • Slippage: ${CONFIG.SLIPPAGE}%`);
-  
-  // Advertencias según modo
   log.info('');
   if (CONFIG.DRY_RUN) {
     log.warn('═══════════════════════════════════════════════════════════════');
-    log.warn('🟡 MODO DRY RUN - TRANSACCIONES SIMULADAS');
-    log.warn('   No se gastará dinero real');
-    log.warn('   Para trading real: DRY_RUN=false');
+    log.warn('🟡 MODO DRY RUN - SIMULACIÓN');
     log.warn('═══════════════════════════════════════════════════════════════');
   } else if (CONFIG.TRADING_ENABLED) {
     log.warn('═══════════════════════════════════════════════════════════════');
     log.warn('🔴 MODO LIVE - DINERO REAL');
-    log.warn('   ⚠️  Las transacciones gastarán SOL real');
-    log.warn('   ⚠️  Asegúrate de entender los riesgos');
-    log.warn('   ⚠️  Solo usa fondos que puedas perder');
     log.warn('═══════════════════════════════════════════════════════════════');
   }
   
   log.info('');
-  log.info('🚀 Iniciando componentes...');
-  
-  // Iniciar componentes
   setupTelegramBot();
   startHealthServer();
   connectWebSocket();
   
   log.info('');
   log.info('✅ Bot iniciado correctamente');
-  log.info('📊 Esperando nuevos tokens...');
   log.info('═══════════════════════════════════════════════════════════════');
-  log.info('');
   
-  // Mensaje de bienvenida a Telegram
   if (telegramBot && CONFIG.TELEGRAM_CHAT_ID) {
     await sendTelegram(`
 🤖 *Bot Iniciado*
 
 *Modo:* ${CONFIG.DRY_RUN ? '🟡 DRY RUN' : '🔴 LIVE'}
-*Trading:* ${CONFIG.TRADING_ENABLED ? '✅ Activo' : '❌ Inactivo'}
 *Monto:* ${CONFIG.TRADE_AMOUNT_SOL} SOL/trade
 
-🧠 *Helius Smart Trader:*
-• RPC: Helius Enhanced
-• Detección: +${CONFIG.EARLY_VELOCITY_MIN}% → +${CONFIG.CONFIRMATION_VELOCITY}%
-• Análisis automático con datos reales
-
-El bot está monitoreando pump.fun 👀
+🧠 Helius Smart Trader activo 👀
     `.trim());
   }
 }
 
-// ============================================================================
-// PROCESS HANDLERS
-// ============================================================================
-
 process.on('SIGTERM', async () => {
-  log.info('');
-  log.info('🛑 SIGTERM recibido - Cerrando posiciones...');
-  
-  const closePromises = [];
-  for (const [mint, pos] of positions) {
-    if (pos.remainingPercent > 0) {
-      log.info(`   Cerrando ${pos.symbol}...`);
-      closePromises.push(closePosition(mint, pos.remainingPercent, 'shutdown'));
-    }
-  }
-  
-  await Promise.all(closePromises);
-  
+  log.info('🛑 Cerrando...');
   if (ws) ws.close();
-  log.info('✅ Shutdown completo');
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  log.info('');
-  log.info('🛑 SIGINT recibido - Cerrando posiciones...');
-  
-  const closePromises = [];
-  for (const [mint, pos] of positions) {
-    if (pos.remainingPercent > 0) {
-      log.info(`   Cerrando ${pos.symbol}...`);
-      closePromises.push(closePosition(mint, pos.remainingPercent, 'shutdown'));
-    }
-  }
-  
-  await Promise.all(closePromises);
-  
+  log.info('🛑 Cerrando...');
   if (ws) ws.close();
-  log.info('✅ Shutdown completo');
   process.exit(0);
 });
 
-process.on('uncaughtException', (error) => {
-  log.error(`❌ Uncaught Exception: ${error.message}`);
-  log.error(error.stack);
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  log.error(`❌ Unhandled Rejection: ${reason}`);
-});
-
-// ============================================================================
-// START BOT
-// ============================================================================
-
 main().catch(error => {
   log.error(`❌ Error fatal: ${error.message}`);
-  log.error(error.stack);
   process.exit(1);
 });
-  } catch (error) {
-    log.error(`❌ Wallet setup failed: ${error.message}`);
-    return false;
-  }
-}
-
-// ============================================================================
-// INIT SMART TRADER
-// ============================================================================
-
-function initSmartTrader() {
-  if (!CONFIG.HELIUS_API_KEY) {
-    log.error('❌ HELIUS_API_KEY requerido para Smart Trader!');
-    return false;
-  }
-  
-  smartTrader = new HeliusSmartTrader({
-    HELIUS_API_KEY: CONFIG.HELIUS_API_KEY,
-    EARLY_VELOCITY_MIN: CONFIG.EARLY_VELOCITY_MIN,
-    EARLY_TIME_WINDOW: CONFIG.EARLY_TIME_WINDOW,
-    CONFIRMATION_VELOCITY: CONFIG.CONFIRMATION_VELOCITY,
-    CONFIRMATION_TIME: CONFIG.CONFIRMATION_TIME,
-    MIN_VOLUME_SOL: CONFIG.MIN_VOLUME_SOL,
-    MIN_TX_COUNT: CONFIG.MIN_TX_COUNT,
-    MIN_UNIQUE_BUYERS: CONFIG.MIN_UNIQUE_BUYERS,
-    MIN_HOLDERS: CONFIG.MIN_HOLDERS,
-    MAX_TOP_HOLDER_PERCENT: CONFIG.MAX_TOP_HOLDER_PERCENT,
-    MIN_LIQUIDITY_USD: CONFIG.MIN_LIQUIDITY_USD,
-    HARD_STOP_LOSS_PERCENT: CONFIG.HARD_STOP_LOSS_PERCENT,
-    QUICK_STOP_PERCENT: CONFIG.QUICK_STOP_PERCENT,
-    QUICK_STOP_TIME_SEC: CONFIG.QUICK_STOP_TIME_SEC,
-    TRAILING_STOP_ACTIVATION: CONFIG.TRAILING_STOP_ACTIVATION,
-    TRAILING_STOP_PERCENT: CONFIG.TRAILING_STOP_PERCENT,
-    TAKE_PROFIT_TARGETS: CONFIG.TAKE_PROFIT_TARGETS,
-    MAX_HOLD_TIME_MIN: CONFIG.MAX_HOLD_TIME_MIN,
-    STAGNANT_TIME_MIN: CONFIG.STAGNANT_TIME_MIN,
-    DUMP_DETECTION_PERCENT: CONFIG.DUMP_DETECTION_PERCENT,
-    DUMP_TIME_WINDOW: CONFIG.DUMP_TIME_WINDOW,
-    PRICE_CHECK_INTERVAL_MS: CONFIG.PRICE_CHECK_INTERVAL_MS,
-    MAX_WATCH_TIME_SEC: CONFIG.MAX_WATCH_TIME_SEC
-  });
-  
-  smartTrader.init(connection);
-  
-  log.info('✅ Helius Smart Trader inicializado');
-  log.info(`   📡 RPC: Helius Enhanced`);
-  log.info(`   🎯 Entrada: +${CONFIG.EARLY_VELOCITY_MIN}% en ${CONFIG.EARLY_TIME_WINDOW}s → +${CONFIG.CONFIRMATION_VELOCITY}% confirma`);
-  log.info(`   🛡️ Stops: Hard ${CONFIG.HARD_STOP_LOSS_PERCENT}% | Quick ${CONFIG.QUICK_STOP_PERCENT}% | Trailing ${CONFIG.TRAILING_STOP_PERCENT}%`);
-  log.info(`   💚 Take Profits: +80%(40%) +150%(30%) +300%(100%)`);
-  
-  return true;
