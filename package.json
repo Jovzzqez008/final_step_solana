@@ -1,25 +1,29 @@
 {
-  "name": "pumpfun-monitor-bot",
-  "version": "1.0.0",
-  "description": "Pump.fun token monitoring bot with Telegram alerts",
-  "main": "bot.js",
+  "name": "pumpfun-trading-bot-pro",
+  "version": "2.0.0",
+  "description": "Pump.fun automated trading bot with two-level stop loss system",
+  "main": "trading-bot-hybrid.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "node bot.js"
+    "start": "node trading-bot-hybrid.js",
+    "dev": "node trading-bot-hybrid.js"
   },
   "keywords": [
     "pump.fun",
     "solana",
     "trading",
     "bot",
-    "telegram"
+    "telegram",
+    "automated",
+    "trailing-stop"
   ],
   "author": "",
   "license": "MIT",
   "dependencies": {
     "ws": "^8.14.2",
     "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.2"
+    "axios": "^1.6.2",
+    "@solana/web3.js": "^1.87.6",
+    "bs58": "^5.0.0"
   },
   "engines": {
     "node": ">=18.0.0"
