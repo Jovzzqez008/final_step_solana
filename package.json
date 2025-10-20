@@ -1,24 +1,31 @@
 {
   "name": "pumpfun-trading-bot-pro",
   "version": "2.0.0",
-  "description": "Bot automático de trading para pump.fun con stop-loss híbrido",
+  "description": "Pump.fun Trading Bot with Smart Trader and Blockchain Direct",
   "main": "trading-bot-hybrid.js",
   "scripts": {
     "start": "node trading-bot-hybrid.js",
-    "dev": "node trading-bot-hybrid.js",
-    "test": "echo \"No tests configured\" && exit 0"
+    "dev": "nodemon trading-bot-hybrid.js"
   },
-  "keywords": ["solana", "pump.fun", "trading", "bot", "crypto"],
+  "keywords": [
+    "pump.fun",
+    "solana",
+    "trading",
+    "bot",
+    "crypto"
+  ],
   "author": "",
-  "license": "MIT",
+  "license": "ISC",
   "dependencies": {
-    "ws": "^8.14.2",
-    "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.0",
-    "@solana/web3.js": "^1.87.6",
-    "@solana/buffer-layout": "^4.0.1",
-    "@solana/buffer-layout-utils": "^0.2.0",
-    "bs58": "^5.0.0"
+    "ws": "^8.18.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "axios": "^1.7.7",
+    "@solana/web3.js": "^1.95.8",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.9"
   },
   "engines": {
     "node": ">=18.0.0"
