@@ -399,13 +399,18 @@ async function analyzeToken(mint) {
     log('INFO', `[📊] ${watch.symbol}: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% | K: ${kGrowth > 0 ? '+' : ''}${kGrowth.toFixed(1)}% | Liq: ${realSolLiquidity.toFixed(2)} SOL`);
   }
   
-  // Señal temprana
-  if (!watch.earlySignal && elapsed <= CONFIG.EARLY_TIME_WINDOW && kGrowth >= CONFIG.MIN_K_GROWTH_PERCENT) {
+  // Señal temprana - CRITERIO MEJORADO: K growth O precio
+  const MIN_PRICE_CHANGE = parseFloat(process.env.MIN_PRICE_CHANGE_PERCENT || '15');
+  const hasKSignal = kGrowth >= CONFIG.MIN_K_GROWTH_PERCENT;
+  const hasPriceSignal = priceChange >= MIN_PRICE_CHANGE;
+  
+  if (!watch.earlySignal && elapsed <= CONFIG.EARLY_TIME_WINDOW && (hasKSignal || hasPriceSignal)) {
     watch.earlySignal = true;
-    log('SUCCESS', `[⚡ SEÑAL] ${watch.symbol} K+${kGrowth.toFixed(1)}% en ${elapsed.toFixed(0)}s`);
+    const signalType = hasKSignal ? 'K' : 'Precio';
+    log('SUCCESS', `[⚡ SEÑAL ${signalType}] ${watch.symbol} K+${kGrowth.toFixed(1)}% | P+${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s`);
     
     await sendTelegram(
-      `⚡ <b>SEÑAL TEMPRANA</b>\n\n` +
+      `⚡ <b>SEÑAL TEMPRANA (${signalType})</b>\n\n` +
       `${watch.name} (${watch.symbol})\n` +
       `<code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n\n` +
       `📈 Precio: +${priceChange.toFixed(1)}%\n` +
@@ -415,8 +420,11 @@ async function analyzeToken(mint) {
     );
   }
   
-  // Confirmación
-  if (watch.earlySignal && elapsed >= CONFIG.CONFIRMATION_TIME && kGrowth >= (CONFIG.MIN_K_GROWTH_PERCENT / 2)) {
+  // Confirmación - CRITERIO MEJORADO: mantener momentum
+  const confirmKGrowth = kGrowth >= (CONFIG.MIN_K_GROWTH_PERCENT / 2);
+  const confirmPrice = priceChange >= (MIN_PRICE_CHANGE * 0.7); // 70% del mínimo
+  
+  if (watch.earlySignal && elapsed >= CONFIG.CONFIRMATION_TIME && (confirmKGrowth || confirmPrice)) {
     
     // Validar filtros
     if (realSolLiquidity < CONFIG.MIN_REAL_SOL) {
