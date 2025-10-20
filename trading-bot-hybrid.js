@@ -1,6 +1,156 @@
-// trading-bot-hybrid.js - PUMP.FUN TRADING BOT - VERSIÓN FINAL
-// 🚀 Bot completo sin rate limits usando RPC público + Blockchain directo
-// 💰 Optimizado para detectar y operar automáticamente en pump.fun
+async function monitorPosition(mint) {
+  const pos = STATE.positions.get(mint);
+  if (!pos) return;
+  
+  try {
+    while (STATE.positions.has(mint) && pos.remainingPercent > 0) {
+      // Obtener precio actual de DexScreener
+      const data = await getTokenData(mint);
+      
+      if (!data || !data.price) {
+        await sleep(3000);
+        continue;
+      }
+      
+      const currentPrice = data.price;
+      const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
+      const holdTime = (Date.now() - pos.entryTime) / 60000;
+      
+      pos.currentPrice = currentPrice;
+      pos.pnl = pnlPercent;
+      
+      // Actualizar peak
+      if (pnlPercent > pos.peak) {
+        pos.peak = pnlPercent;
+      }
+      
+      // Activar trailing stop
+      if (pnlPercent >= CONFIG.TRAILING_ACTIVATION && !pos.trailingActive) {
+        pos.trailingActive = true;
+        pos.trailingStop = pnlPercent + CONFIG.TRAILING_PERCENT;
+        log('INFO', `[POSITION] 🛡️ Trailing activado para ${pos.symbol} @ +${pnlPercent.toFixed(1)}%`);
+        await sendTelegram(
+          `🛡️ <b>TRAILING STOP ACTIVADO</b>\n\n` +
+          `${pos.symbol}: +${pnlPercent.toFixed(1)}%\n` +
+          `Stop: +${pos.trailingStop.toFixed(1)}%`
+        );
+      }
+      
+      // Actualizar trailing
+      if (pos.trailingActive) {
+        const newStop = pnlPercent + CONFIG.TRAILING_PERCENT;
+        if (newStop > pos.trailingStop) {
+          pos.trailingStop = newStop;
+        }
+      }
+      
+      // Log estado
+      const stopIndicator = pos.trailingActive ? '🛡️' : '';
+      log('INFO', `[POSITION] 📊 ${pos.symbol}: ${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}% | ${currentPrice.toFixed(8)} | ${holdTime.toFixed(1)}min ${stopIndicator}`);
+      
+      // Checks de salida
+      let shouldSell = false;
+      let sellReason = '';
+      let sellPercentage = 100;
+      
+      // Hard stop
+      if (pnlPercent <= CONFIG.HARD_STOP_LOSS) {
+        shouldSell = true;
+        sellReason = `Hard Stop (${pnlPercent.toFixed(1)}%)`;
+      }
+      // Quick stop
+      else if (holdTime < 2 && pnlPercent <= CONFIG.QUICK_STOP) {
+        shouldSell = true;
+        sellReason = `Quick Stop (${pnlPercent.toFixed(1)}%)`;
+      }
+      // Trailing stop
+      else if (pos.trailingActive && pnlPercent <= pos.trailingStop) {
+        shouldSell = true;
+        sellReason = `Trailing Stop (${pnlPercent.toFixed(1)}%)`;
+      }
+      // Take profit escalonado
+      else if (pnlPercent >= CONFIG.TAKE_PROFIT_3 && !pos.tp3Taken) {
+        shouldSell = true;
+        sellPercentage = 50;
+        sellReason = `TP3 (${pnlPercent.toFixed(1)}%)`;
+        pos.tp3Taken = true;
+      }
+      else if (pnlPercent >= CONFIG.TAKE_PROFIT_2 && !pos.tp2Taken) {
+        shouldSell = true;
+        sellPercentage = 30;
+        sellReason = `TP2 (${pnlPercent.toFixed(1)}%)`;
+        pos.tp2Taken = true;
+      }
+      else if (pnlPercent >= CONFIG.TAKE_PROFIT_1 && !pos.tp1Taken) {
+        shouldSell = true;
+        sellPercentage = 25;
+        sellReason = `TP1 (${pnlPercent.toFixed(1)}%)`;
+        pos.tp1Taken = true;
+      }
+      // Max hold time
+      else if (holdTime >= CONFIG.MAX_HOLD_TIME_MIN) {
+        shouldSell = true;
+        sellReason = `Max Hold Time (${holdTime.toFixed(1)}min)`;
+      }
+      // Stagnant (sin movimiento)
+      else if (holdTime >= CONFIG.STAGNANT_TIME_MIN && Math.abs(pnlPercent - pos.lastPnl) < 2) {
+        shouldSell = true;
+        sellReason = `Stagnant (${holdTime.toFixed(1)}min)`;
+      }
+      
+      pos.lastPnl = pnlPercent;
+      
+      if (shouldSell) {
+        log('INFO', `[POSITION] 🔔 Vendiendo ${sellPercentage}% de ${pos.symbol}: ${sellReason}`);
+        
+        const result = await executeSell(mint, sellPercentage);
+        
+        if (result.success) {
+          const finalPnl = pnlPercent;
+          
+          // Si vendió todo, cerrar posición
+          if (sellPercentage === 100) {
+            STATE.positions.delete(mint);
+            STATE.stats.tradesExecuted++;
+            STATE.stats.totalPnL += finalPnl;
+            
+            if (finalPnl > 0) {
+              STATE.stats.wins++;
+              if (finalPnl > STATE.stats.bestTrade) STATE.stats.bestTrade = finalPnl;
+            } else {
+              STATE.stats.losses++;
+              if (finalPnl < STATE.stats.worstTrade) STATE.stats.worstTrade = finalPnl;
+            }
+          } else {
+            pos.remainingPercent -= sellPercentage;
+          }
+          
+          log('SUCCESS', `[POSITION] ✅ Vendido ${sellPercentage}% de ${pos.symbol}: ${finalPnl > 0 ? '+' : ''}${finalPnl.toFixed(2)}%`);
+          
+          await sendTelegram(
+            `${finalPnl > 0 ? '✅' : '❌'} <b>VENTA EJECUTADA</b>\n\n` +
+            `Token: ${pos.symbol}\n` +
+            `Razón: ${sellReason}\n` +
+            `Cantidad: ${sellPercentage}%\n\n` +
+            `PnL: ${finalPnl > 0 ? '+' : ''}${finalPnl.toFixed(2)}%\n` +
+            `Tiempo: ${holdTime.toFixed(1)}min\n` +
+            `Tx: <code>${result.signature.slice(0, 8)}...</code>`
+          );
+          
+          if (sellPercentage === 100) {
+            return; // Salir del loop
+          }
+        }
+      }
+      
+      await sleep(3000);
+    }
+  } catch (error) {
+    log('ERROR', `Error monitoreando posición ${mint.slice(0, 8)}: ${error.message}`);
+  }
+}// trading-bot-hybrid.js - PUMP.FUN TRADING BOT - VERSIÓN FINAL
+// 🚀 Bot completo usando DexScreener (sin Helius, sin rate limits)
+// 💰 Optimizado para operar automáticamente en pump.fun
 
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
@@ -8,6 +158,39 @@ const axios = require('axios');
 const { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
 const bs58 = require('bs58');
 require('dotenv').config();
+
+// ═══════════════════════════════════════════════════════════════
+// 🔧 HELPER: BASE58 DECODE (compatible con todas las versiones)
+// ═══════════════════════════════════════════════════════════════
+
+function decodeBase58(str) {
+  try {
+    // Intentar con bs58 normal
+    if (typeof bs58.decode === 'function') {
+      return bs58.decode(str);
+    }
+    // Intentar con default export
+    if (bs58.default && typeof bs58.default.decode === 'function') {
+      return bs58.default.decode(str);
+    }
+    // Fallback: decodificador manual
+    const ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    let num = BigInt(0);
+    for (let i = 0; i < str.length; i++) {
+      const value = ALPHABET.indexOf(str[i]);
+      if (value === -1) throw new Error(`Invalid base58 character: ${str[i]}`);
+      num = num * 58n + BigInt(value);
+    }
+    let hex = num.toString(16);
+    if (hex.length % 2) hex = '0' + hex;
+    for (let i = 0; i < str.length && str[i] === '1'; i++) {
+      hex = '00' + hex;
+    }
+    return Buffer.from(hex, 'hex');
+  } catch (error) {
+    throw new Error(`Error decodificando base58: ${error.message}`);
+  }
+}
 
 // ═══════════════════════════════════════════════════════════════
 // 📋 CONFIGURACIÓN
@@ -123,93 +306,40 @@ async function sendTelegram(message) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 🔗 BLOCKCHAIN HELPERS
+// 📊 DEXSCREENER - OBTENER DATOS DEL TOKEN
 // ═══════════════════════════════════════════════════════════════
 
-function getBondingCurvePDA(mint) {
-  const seeds = [
-    Buffer.from('bonding-curve'),
-    new PublicKey(mint).toBuffer()
-  ];
-  const [pda] = PublicKey.findProgramAddressSync(seeds, new PublicKey(CONFIG.PUMP_PROGRAM));
-  return pda;
-}
-
-async function getBondingCurveData(mint) {
+async function getTokenData(mint) {
   try {
-    const bondingCurvePDA = getBondingCurvePDA(mint);
-    const accountInfo = await STATE.connection.getAccountInfo(bondingCurvePDA);
+    const response = await axios.get(`${CONFIG.DEXSCREENER_API}${mint}`, {
+      timeout: 5000
+    });
     
-    if (!accountInfo) return null;
+    if (response.data.pairs && response.data.pairs.length > 0) {
+      const pair = response.data.pairs[0];
+      return {
+        price: parseFloat(pair.priceUsd || 0),
+        liquidity: parseFloat(pair.liquidity?.usd || 0),
+        marketCap: parseFloat(pair.marketCap || 0),
+        volume24h: parseFloat(pair.volume?.h24 || 0),
+        priceChange5m: parseFloat(pair.priceChange?.m5 || 0),
+        priceChange1h: parseFloat(pair.priceChange?.h1 || 0),
+        txns24h: pair.txns?.h24 || { buys: 0, sells: 0 },
+        symbol: pair.baseToken?.symbol || 'UNKNOWN',
+        name: pair.baseToken?.name || 'UNKNOWN'
+      };
+    }
     
-    const data = accountInfo.data;
-    return {
-      virtualTokenReserves: data.readBigUInt64LE(8),
-      virtualSolReserves: data.readBigUInt64LE(16),
-      realTokenReserves: data.readBigUInt64LE(24),
-      realSolReserves: data.readBigUInt64LE(32),
-      tokenTotalSupply: data.readBigUInt64LE(40),
-      complete: data.readUInt8(48) === 1
-    };
+    return null;
   } catch (error) {
-    log('WARN', `Error leyendo bonding curve ${mint.slice(0, 8)}: ${error.message}`);
+    // Silent fail - lo intentamos después
     return null;
   }
 }
 
-function calculatePrice(curve) {
-  if (!curve || curve.virtualTokenReserves === 0n) return 0;
-  return Number(curve.virtualSolReserves) / Number(curve.virtualTokenReserves);
-}
-
-async function getTokenHolders(mint) {
-  try {
-    const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-    const accounts = await STATE.connection.getProgramAccounts(
-      new PublicKey(TOKEN_PROGRAM),
-      {
-        filters: [
-          { dataSize: 165 },
-          { memcmp: { offset: 0, bytes: mint } }
-        ]
-      }
-    );
-    return accounts.length;
-  } catch (error) {
-    log('WARN', `Error obteniendo holders ${mint.slice(0, 8)}: ${error.message}`);
-    return 0;
-  }
-}
-
-async function getTopHolderPercent(mint) {
-  try {
-    const TOKEN_PROGRAM = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
-    const accounts = await STATE.connection.getProgramAccounts(
-      new PublicKey(TOKEN_PROGRAM),
-      {
-        filters: [
-          { dataSize: 165 },
-          { memcmp: { offset: 0, bytes: mint } }
-        ]
-      }
-    );
-    
-    if (accounts.length === 0) return 100;
-    
-    const balances = accounts.map(acc => {
-      const data = acc.account.data;
-      return Number(data.readBigUInt64LE(64));
-    });
-    
-    const maxBalance = Math.max(...balances);
-    const totalSupply = balances.reduce((a, b) => a + b, 0);
-    
-    return totalSupply > 0 ? (maxBalance / totalSupply) * 100 : 0;
-  } catch (error) {
-    log('WARN', `Error calculando top holder ${mint.slice(0, 8)}: ${error.message}`);
-    return 0;
-  }
-}
+// ═══════════════════════════════════════════════════════════════
+// 🔗 BLOCKCHAIN HELPERS (solo para transacciones)
+// ═══════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════
 // 💰 TRADING
@@ -327,12 +457,12 @@ async function analyzeToken(mint) {
   if (!token) return null;
   
   try {
-    // Obtener datos de blockchain
-    const curve = await getBondingCurveData(mint);
-    if (!curve) return null;
+    // Obtener datos de DexScreener
+    const data = await getTokenData(mint);
+    if (!data) return null;
     
-    const currentPrice = calculatePrice(curve);
-    const liquiditySol = Number(curve.realSolReserves) / LAMPORTS_PER_SOL;
+    const currentPrice = data.price;
+    const liquidityUSD = data.liquidity;
     
     // Actualizar precio en token
     if (!token.initialPrice) {
@@ -345,7 +475,7 @@ async function analyzeToken(mint) {
     const priceChange = ((currentPrice - token.initialPrice) / token.initialPrice) * 100;
     
     // Log progreso
-    log('INFO', `[TRADER] 📊 ${token.symbol}: ${priceChange.toFixed(1)}% | Liq: ${liquiditySol.toFixed(2)} SOL | Buys: ${token.buyCount} | ${elapsed.toFixed(0)}s`);
+    log('INFO', `[TRADER] 📊 ${token.symbol}: ${priceChange.toFixed(1)}% | Liq: ${liquidityUSD.toFixed(0)} | Buys: ${token.buyCount} | ${elapsed.toFixed(0)}s`);
     
     // Validaciones tempranas
     if (elapsed < CONFIG.EARLY_TIME_WINDOW) {
@@ -358,34 +488,29 @@ async function analyzeToken(mint) {
     // Validación de confirmación
     if (elapsed >= CONFIG.EARLY_TIME_WINDOW && elapsed <= CONFIG.CONFIRMATION_TIME) {
       if (token.earlySignal && priceChange >= CONFIG.CONFIRMATION_VELOCITY) {
-        // Obtener métricas adicionales
-        const holders = await getTokenHolders(mint);
-        const topHolderPct = await getTopHolderPercent(mint);
         
-        log('INFO', `[TRADER] 🔍 Validando ${token.symbol}: ${holders} holders, top ${topHolderPct.toFixed(1)}%`);
+        log('INFO', `[TRADER] 🔍 Validando ${token.symbol}: ${token.buyCount} buys, ${token.uniqueBuyers.size} únicos`);
         
-        // Todas las validaciones
+        // Validaciones
         const checks = {
           velocity: priceChange >= CONFIG.CONFIRMATION_VELOCITY,
-          liquidity: liquiditySol >= CONFIG.MIN_LIQUIDITY_SOL,
+          liquidity: liquidityUSD >= CONFIG.MIN_LIQUIDITY_SOL * 150, // Convert SOL to USD (~$150)
           buys: token.buyCount >= CONFIG.MIN_BUY_COUNT,
           uniqueBuyers: token.uniqueBuyers.size >= CONFIG.MIN_UNIQUE_BUYERS,
-          holders: holders >= CONFIG.MIN_HOLDERS,
-          topHolder: topHolderPct <= CONFIG.MAX_TOP_HOLDER_PERCENT
+          price: currentPrice > 0
         };
         
         const passed = Object.values(checks).every(v => v);
         
         if (passed) {
-          log('SUCCESS', `[TRADER] 🚀 SEÑAL CONFIRMADA: ${token.symbol} | +${priceChange.toFixed(1)}% | ${token.buyCount} buys | ${liquiditySol.toFixed(2)} SOL`);
+          log('SUCCESS', `[TRADER] 🚀 SEÑAL CONFIRMADA: ${token.symbol} | +${priceChange.toFixed(1)}% | ${token.buyCount} buys | ${liquidityUSD.toFixed(0)}`);
           await sendTelegram(
             `🚀 <b>SEÑAL DE COMPRA</b>\n\n` +
             `Token: ${token.name} (${token.symbol})\n` +
             `Mint: <code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n\n` +
             `📈 Precio: +${priceChange.toFixed(1)}%\n` +
-            `💰 Liquidez: ${liquiditySol.toFixed(2)} SOL\n` +
+            `💰 Liquidez: ${liquidityUSD.toFixed(0)}\n` +
             `🛒 Compras: ${token.buyCount}\n` +
-            `👥 Holders: ${holders}\n` +
             `⏱ Tiempo: ${elapsed.toFixed(0)}s`
           );
           return { shouldBuy: true, price: currentPrice, checks };
@@ -832,7 +957,29 @@ async function setupWallet() {
       throw new Error('WALLET_PRIVATE_KEY no configurada en .env');
     }
     
-    STATE.wallet = Keypair.fromSecretKey(bs58.decode(CONFIG.WALLET_PRIVATE_KEY));
+    // Decodificar private key - soportar diferentes versiones de bs58
+    let privateKeyBytes;
+    try {
+      // Intentar con bs58.decode
+      if (typeof bs58.decode === 'function') {
+        privateKeyBytes = bs58.decode(CONFIG.WALLET_PRIVATE_KEY);
+      } 
+      // Intentar con default export
+      else if (bs58.default && typeof bs58.default.decode === 'function') {
+        privateKeyBytes = bs58.default.decode(CONFIG.WALLET_PRIVATE_KEY);
+      }
+      // Si bs58 en sí es la función
+      else if (typeof bs58 === 'function') {
+        privateKeyBytes = bs58(CONFIG.WALLET_PRIVATE_KEY);
+      }
+      else {
+        throw new Error('No se pudo encontrar función decode en bs58');
+      }
+    } catch (decodeError) {
+      throw new Error(`Error decodificando private key: ${decodeError.message}`);
+    }
+    
+    STATE.wallet = Keypair.fromSecretKey(privateKeyBytes);
     log('SUCCESS', `✅ Wallet: ${STATE.wallet.publicKey.toString().slice(0, 8)}...`);
     
     // Usar RPC público por defecto
