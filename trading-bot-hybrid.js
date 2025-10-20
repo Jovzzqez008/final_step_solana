@@ -1,13 +1,15 @@
-// trading-bot-rpc.js - PUMP.FUN BOT CON PRECIOS RPC
-// 🚀 Obtiene precios directamente de la blockchain (bonding curve)
-// ✅ No depende de DexScreener para precios iniciales
-// ✅ Análisis inmediato desde el momento de creación
+// trading-bot-sdk.js - PUMP.FUN BOT CON SDK OFICIAL
+// 🚀 Usa @pump-fun/pump-sdk para precios y trading directos
+// ✅ No depende de Helius, Quicknode o APIs externas
+// ✅ Máxima precisión y velocidad
 
 require('dotenv').config();
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { Connection, PublicKey, Keypair, VersionedTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { Connection, PublicKey, Keypair, Transaction, sendAndConfirmTransaction, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const { PumpSdk, getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount } = require('@pump-fun/pump-sdk');
+const BN = require('bn.js');
 
 // ═══════════════════════════════════════════════════════════════
 // CONFIGURACIÓN
@@ -24,7 +26,7 @@ const CONFIG = {
   // Trading
   DRY_RUN: process.env.DRY_RUN === 'true',
   TRADE_AMOUNT_SOL: parseFloat(process.env.TRADE_AMOUNT_SOL || '0.007'),
-  SLIPPAGE: parseInt(process.env.SLIPPAGE || '25'),
+  SLIPPAGE: parseFloat(process.env.SLIPPAGE || '5'),
   PRIORITY_FEE: parseFloat(process.env.PRIORITY_FEE || '0.0005'),
   
   // Stop Loss / Take Profit
@@ -36,35 +38,29 @@ const CONFIG = {
   TAKE_PROFIT_2: parseFloat(process.env.TAKE_PROFIT_2 || '150'),
   TAKE_PROFIT_3: parseFloat(process.env.TAKE_PROFIT_3 || '300'),
   
-  // Smart Trader - MEJORADO PARA DETECCIÓN TEMPRANA
+  // Smart Trader
   EARLY_VELOCITY_MIN: parseFloat(process.env.EARLY_VELOCITY_MIN || '8'),
   EARLY_TIME_WINDOW: parseInt(process.env.EARLY_TIME_WINDOW || '45'),
   CONFIRMATION_VELOCITY: parseFloat(process.env.CONFIRMATION_VELOCITY || '20'),
   CONFIRMATION_TIME: parseInt(process.env.CONFIRMATION_TIME || '90'),
-  MIN_LIQUIDITY_SOL: parseFloat(process.env.MIN_LIQUIDITY_SOL || '0.15'), // Más bajo
-  MIN_BUY_COUNT: parseInt(process.env.MIN_BUY_COUNT || '2'), // Más bajo
-  MIN_REAL_SOL: parseFloat(process.env.MIN_REAL_SOL || '0.1'), // SOL real en curve
+  MIN_LIQUIDITY_SOL: parseFloat(process.env.MIN_LIQUIDITY_SOL || '0.15'),
+  MIN_BUY_COUNT: parseInt(process.env.MIN_BUY_COUNT || '2'),
+  MIN_REAL_SOL: parseFloat(process.env.MIN_REAL_SOL || '0.1'),
   
   // Timing
   MAX_HOLD_TIME_MIN: parseInt(process.env.MAX_HOLD_TIME_MIN || '12'),
   STAGNANT_TIME_MIN: parseInt(process.env.STAGNANT_TIME_MIN || '4'),
-  MAX_WATCH_TIME_SEC: parseInt(process.env.MAX_WATCH_TIME_SEC || '240'), // 4 minutos
+  MAX_WATCH_TIME_SEC: parseInt(process.env.MAX_WATCH_TIME_SEC || '240'),
   MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '3'),
   
   // Análisis
   PRICE_CHECK_INTERVAL_SEC: parseInt(process.env.PRICE_CHECK_INTERVAL_SEC || '3'),
   
-  // RPCs (añade tu mejor RPC aquí)
-  RPC_ENDPOINTS: [
-    process.env.HELIUS_RPC || 'https://api.mainnet-beta.solana.com',
-    'https://api.mainnet-beta.solana.com',
-    'https://solana-api.projectserum.com'
-  ],
+  // RPC
+  RPC_ENDPOINT: process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
   
-  // Pump.fun Constants
-  PUMP_PROGRAM_ID: '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P',
-  PUMP_CURVE_SEED: Buffer.from('bonding-curve'),
-  PUMP_TOKEN_DECIMALS: 6,
+  // Solscan API (opcional)
+  SOLSCAN_API_KEY: process.env.SOLSCAN_API_KEY || '',
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -74,7 +70,7 @@ const CONFIG = {
 const STATE = {
   wallet: null,
   connection: null,
-  currentRpcIndex: 0,
+  pumpSdk: null,
   bot: null,
   ws: null,
   positions: new Map(),
@@ -163,136 +159,98 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function getNextRPC() {
-  STATE.currentRpcIndex = (STATE.currentRpcIndex + 1) % CONFIG.RPC_ENDPOINTS.length;
-  const rpc = CONFIG.RPC_ENDPOINTS[STATE.currentRpcIndex];
-  STATE.connection = new Connection(rpc, 'confirmed');
-  log('INFO', `Cambiando a RPC: ${rpc}`);
-  return STATE.connection;
-}
-
 // ═══════════════════════════════════════════════════════════════
-// 💰 FUNCIONES DE PRECIO RPC (BONDING CURVE)
+// 💰 FUNCIONES DE PRECIO CON SDK OFICIAL (CORREGIDO)
 // ═══════════════════════════════════════════════════════════════
 
-// Deriva la dirección de la bonding curve desde el mint
-function findPumpCurveAddress(mintAddress) {
-  const programId = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
-  const [pda] = PublicKey.findProgramAddressSync(
-    [CONFIG.PUMP_CURVE_SEED, mintAddress.toBuffer()],
-    programId
-  );
-  return pda;
-}
-
-// Lee datos de la bonding curve desde RPC
-async function getPumpCurveState(curveAddress, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const accountInfo = await STATE.connection.getAccountInfo(curveAddress);
-      
-      if (!accountInfo || !accountInfo.data || accountInfo.data.length < 0x31) {
-        if (i < retries - 1) {
-          await sleep(1000);
-          continue;
-        }
-        return null;
-      }
-      
-      const data = accountInfo.data;
-      
-      // Verificar signature (primeros 8 bytes)
-      const expectedSig = Buffer.from([0x17, 0xb7, 0xf8, 0x37, 0x60, 0xd8, 0xac, 0x60]);
-      const actualSig = data.slice(0, 8);
-      
-      if (!actualSig.equals(expectedSig)) {
-        log('WARN', 'Signature de bonding curve inválida');
-        return null;
-      }
-      
-      // Leer campos (little-endian)
-      const virtualTokenReserves = data.readBigUInt64LE(0x08);
-      const virtualSolReserves = data.readBigUInt64LE(0x10);
-      const realTokenReserves = data.readBigUInt64LE(0x18);
-      const realSolReserves = data.readBigUInt64LE(0x20);
-      const tokenTotalSupply = data.readBigUInt64LE(0x28);
-      const complete = data[0x30] !== 0;
-      
-      return {
-        virtualTokenReserves,
-        virtualSolReserves,
-        realTokenReserves,
-        realSolReserves,
-        tokenTotalSupply,
-        complete
-      };
-      
-    } catch (error) {
-      log('WARN', `Error leyendo curve state (intento ${i + 1}/${retries}): ${error.message}`);
-      if (i < retries - 1) {
-        await sleep(1000);
-        // Cambiar RPC si falla
-        if (i > 0) getNextRPC();
-      }
-    }
-  }
-  
-  return null;
-}
-
-// Calcula precio del token en SOL
-function calculatePumpCurvePrice(curveState) {
-  if (!curveState) return null;
-  
-  const { virtualTokenReserves, virtualSolReserves } = curveState;
-  
-  if (virtualTokenReserves <= 0n || virtualSolReserves <= 0n) {
-    return null;
-  }
-  
-  // Precio = (SOL reserves / LAMPORTS_PER_SOL) / (Token reserves / 10^decimals)
-  const solAmount = Number(virtualSolReserves) / LAMPORTS_PER_SOL;
-  const tokenAmount = Number(virtualTokenReserves) / (10 ** CONFIG.PUMP_TOKEN_DECIMALS);
-  
-  return solAmount / tokenAmount;
-}
-
-// Obtiene precio de un token desde RPC
-async function getTokenPriceRPC(mint) {
+async function getTokenPriceSDK(mint) {
   try {
     const mintPubkey = new PublicKey(mint);
-    const curveAddress = findPumpCurveAddress(mintPubkey);
     
-    const curveState = await getPumpCurveState(curveAddress);
-    if (!curveState) return null;
+    // CORREGIDO: Usar fetchBuyState en lugar de getBondingCurveAccount
+    const global = await STATE.pumpSdk.fetchGlobal();
     
-    const priceSol = calculatePumpCurvePrice(curveState);
-    if (!priceSol) return null;
+    let bondingCurveData;
+    try {
+      const buyState = await STATE.pumpSdk.fetchBuyState(mintPubkey, STATE.wallet.publicKey);
+      bondingCurveData = buyState.bondingCurve;
+    } catch (error) {
+      // Si no existe asociatedUserAccount, obtener solo la bondingCurve
+      const sellState = await STATE.pumpSdk.fetchSellState(mintPubkey, STATE.wallet.publicKey);
+      bondingCurveData = sellState.bondingCurve;
+    }
     
-    // Calcular liquidez real en SOL
-    const realSolReserves = Number(curveState.realSolReserves) / LAMPORTS_PER_SOL;
+    if (!bondingCurveData) {
+      log('DEBUG', `No se encontró bonding curve para ${mint.slice(0, 8)}`);
+      return null;
+    }
+    
+    // Calcular precio usando las reservas
+    const virtualTokenReserves = bondingCurveData.virtualTokenReserves.toNumber();
+    const virtualSolReserves = bondingCurveData.virtualSolReserves.toNumber();
+    const realTokenReserves = bondingCurveData.realTokenReserves.toNumber();
+    const realSolReserves = bondingCurveData.realSolReserves.toNumber();
+    
+    if (virtualTokenReserves <= 0 || virtualSolReserves <= 0) {
+      return null;
+    }
+    
+    // Precio = (SOL reserves / LAMPORTS_PER_SOL) / (Token reserves / 10^6)
+    const solAmount = virtualSolReserves / LAMPORTS_PER_SOL;
+    const tokenAmount = virtualTokenReserves / 1e6;
+    const priceSol = solAmount / tokenAmount;
+    
+    // Liquidez real en SOL
+    const realSolLiquidity = realSolReserves / LAMPORTS_PER_SOL;
     
     return {
       priceSol,
-      realSolReserves,
-      virtualSolReserves: Number(curveState.virtualSolReserves) / LAMPORTS_PER_SOL,
-      complete: curveState.complete
+      priceUsd: priceSol * 180, // Aprox (ajusta según precio SOL actual)
+      realSolReserves: realSolLiquidity,
+      virtualSolReserves: solAmount,
+      virtualTokenReserves: tokenAmount,
+      realTokenReserves: realTokenReserves / 1e6,
+      complete: bondingCurveData.complete || false,
+      bondingCurve: bondingCurveData,
+      marketCap: (priceSol * 180 * 1_000_000_000), // Supply fijo de pump.fun
     };
     
   } catch (error) {
-    log('DEBUG', `Error obteniendo precio RPC: ${error.message}`);
+    log('DEBUG', `Error obteniendo precio SDK para ${mint.slice(0, 8)}: ${error.message}`);
     return null;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DEXSCREENER API (SOLO PARA BUY COUNT)
+// SOLSCAN API (OPCIONAL - SOLO METADATA)
 // ═══════════════════════════════════════════════════════════════
 
+async function getSolscanMetadata(mint) {
+  if (!CONFIG.SOLSCAN_API_KEY) return null;
+  
+  try {
+    const response = await axios.get(`https://pro-api.solscan.io/v1.0/token/meta?tokenAddress=${mint}`, {
+      headers: { 'token': CONFIG.SOLSCAN_API_KEY },
+      timeout: 3000
+    });
+    
+    return {
+      holder: response.data?.holder || 0,
+      decimals: response.data?.decimals || 6,
+      supply: response.data?.supply || 0,
+      name: response.data?.name || null,
+      symbol: response.data?.symbol || null,
+    };
+  } catch (error) {
+    return null;
+  }
+}
+
+// DexScreener para buy count (backup)
 async function getTokenBuyCount(mint) {
   try {
     const response = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
-      timeout: 5000
+      timeout: 3000
     });
     
     if (!response.data?.pairs || response.data.pairs.length === 0) {
@@ -311,79 +269,183 @@ async function getTokenBuyCount(mint) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PUMPPORTAL API
+// TRADING CON SDK OFICIAL
 // ═══════════════════════════════════════════════════════════════
 
-async function buyToken(mint, solAmount) {
+async function buyTokenSDK(mint, solAmount) {
   try {
-    const response = await axios.post('https://pumpportal.fun/api/trade-local', {
-      publicKey: STATE.wallet.publicKey.toString(),
-      action: 'buy',
-      mint: mint,
-      denominatedInSol: 'true',
-      amount: solAmount,
-      slippage: CONFIG.SLIPPAGE,
-      priorityFee: CONFIG.PRIORITY_FEE,
-      pool: 'pump'
-    }, { timeout: 10000 });
+    const mintPubkey = new PublicKey(mint);
     
-    if (!response.data) {
-      throw new Error('No se recibió transacción de PumpPortal');
-    }
+    log('INFO', `[TRADE] Preparando compra de ${solAmount} SOL de ${mint.slice(0, 8)}...`);
     
-    const txData = Buffer.from(response.data, 'base64');
-    const tx = VersionedTransaction.deserialize(txData);
-    tx.sign([STATE.wallet]);
+    // Obtener estado global y de la bonding curve
+    const global = await STATE.pumpSdk.fetchGlobal();
+    const { bondingCurveAccountInfo, bondingCurve, associatedUserAccountInfo } = 
+      await STATE.pumpSdk.fetchBuyState(mintPubkey, STATE.wallet.publicKey);
     
-    const signature = await STATE.connection.sendTransaction(tx, {
-      skipPreflight: true,
-      maxRetries: 3
+    // Convertir SOL a lamports
+    const solAmountLamports = new BN(Math.floor(solAmount * LAMPORTS_PER_SOL));
+    
+    // Calcular cantidad de tokens a recibir
+    const tokenAmount = getBuyTokenAmountFromSolAmount(global, bondingCurve, solAmountLamports);
+    
+    log('INFO', `[TRADE] Calculado: ${solAmount} SOL = ${(tokenAmount.toNumber() / 1e6).toFixed(2)} tokens`);
+    
+    // Crear instrucciones de compra
+    const buyInstructions = await STATE.pumpSdk.buyInstructions({
+      global,
+      bondingCurveAccountInfo,
+      bondingCurve,
+      associatedUserAccountInfo,
+      mint: mintPubkey,
+      user: STATE.wallet.publicKey,
+      solAmount: solAmountLamports,
+      amount: tokenAmount,
+      slippage: CONFIG.SLIPPAGE
     });
     
-    await STATE.connection.confirmTransaction(signature, 'confirmed');
+    // Crear transacción
+    const transaction = new Transaction();
+    
+    // Añadir compute budget
+    const computeBudgetIx = {
+      programId: new PublicKey('ComputeBudget111111111111111111111111111111'),
+      keys: [],
+      data: Buffer.from([0, 0, 48, 117, 0, 0, 0, 0, 0]) // 300k compute units
+    };
+    transaction.add(computeBudgetIx);
+    
+    // Añadir priority fee
+    if (CONFIG.PRIORITY_FEE > 0) {
+      const priorityFeeIx = {
+        programId: new PublicKey('ComputeBudget111111111111111111111111111111'),
+        keys: [],
+        data: Buffer.from([
+          3,
+          ...new BN(Math.floor(CONFIG.PRIORITY_FEE * LAMPORTS_PER_SOL / 300000)).toArray('le', 8)
+        ])
+      };
+      transaction.add(priorityFeeIx);
+    }
+    
+    buyInstructions.forEach(ix => transaction.add(ix));
+    
+    // Enviar transacción
+    const signature = await sendAndConfirmTransaction(
+      STATE.connection,
+      transaction,
+      [STATE.wallet],
+      {
+        skipPreflight: false,
+        commitment: 'confirmed',
+        maxRetries: 3
+      }
+    );
+    
+    log('SUCCESS', `[TRADE] ✅ Compra ejecutada: https://solscan.io/tx/${signature}`);
     return signature;
+    
   } catch (error) {
-    log('ERROR', `Error comprando ${mint.slice(0, 8)}: ${error.message}`);
+    log('ERROR', `[TRADE] ❌ Error comprando: ${error.message}`);
     throw error;
   }
 }
 
-async function sellToken(mint, percentage = 100) {
+async function sellTokenSDK(mint, percentage = 100) {
   try {
-    const response = await axios.post('https://pumpportal.fun/api/trade-local', {
-      publicKey: STATE.wallet.publicKey.toString(),
-      action: 'sell',
-      mint: mint,
-      denominatedInSol: 'false',
-      amount: `${percentage}%`,
-      slippage: CONFIG.SLIPPAGE,
-      priorityFee: CONFIG.PRIORITY_FEE,
-      pool: 'pump'
-    }, { timeout: 10000 });
+    const mintPubkey = new PublicKey(mint);
     
-    if (!response.data) {
-      throw new Error('No se recibió transacción de PumpPortal');
+    log('INFO', `[TRADE] Preparando venta de ${percentage}% de ${mint.slice(0, 8)}...`);
+    
+    // Obtener estado
+    const global = await STATE.pumpSdk.fetchGlobal();
+    const { bondingCurveAccountInfo, bondingCurve } = 
+      await STATE.pumpSdk.fetchSellState(mintPubkey, STATE.wallet.publicKey);
+    
+    // Obtener balance de tokens
+    const userTokenAccounts = await STATE.connection.getTokenAccountsByOwner(
+      STATE.wallet.publicKey,
+      { mint: mintPubkey }
+    );
+    
+    if (userTokenAccounts.value.length === 0) {
+      throw new Error('No se encontró cuenta de tokens');
     }
     
-    const txData = Buffer.from(response.data, 'base64');
-    const tx = VersionedTransaction.deserialize(txData);
-    tx.sign([STATE.wallet]);
+    const tokenAccountData = userTokenAccounts.value[0].account.data;
+    const tokenBalance = new BN(tokenAccountData.slice(64, 72), 'le');
     
-    const signature = await STATE.connection.sendTransaction(tx, {
-      skipPreflight: true,
-      maxRetries: 3
+    // Calcular cantidad a vender
+    const amountToSell = tokenBalance.muln(percentage).divn(100);
+    
+    log('INFO', `[TRADE] Vendiendo ${percentage}% = ${(amountToSell.toNumber() / 1e6).toFixed(2)} tokens`);
+    
+    // Calcular SOL a recibir
+    const solAmount = getSellSolAmountFromTokenAmount(global, bondingCurve, amountToSell);
+    
+    log('INFO', `[TRADE] Recibirás ~${(solAmount.toNumber() / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+    
+    // Crear instrucciones
+    const sellInstructions = await STATE.pumpSdk.sellInstructions({
+      global,
+      bondingCurveAccountInfo,
+      bondingCurve,
+      mint: mintPubkey,
+      user: STATE.wallet.publicKey,
+      amount: amountToSell,
+      solAmount: solAmount,
+      slippage: CONFIG.SLIPPAGE
     });
     
-    await STATE.connection.confirmTransaction(signature, 'confirmed');
+    // Crear transacción
+    const transaction = new Transaction();
+    
+    // Compute budget
+    const computeBudgetIx = {
+      programId: new PublicKey('ComputeBudget111111111111111111111111111111'),
+      keys: [],
+      data: Buffer.from([0, 0, 48, 117, 0, 0, 0, 0, 0])
+    };
+    transaction.add(computeBudgetIx);
+    
+    // Priority fee
+    if (CONFIG.PRIORITY_FEE > 0) {
+      const priorityFeeIx = {
+        programId: new PublicKey('ComputeBudget111111111111111111111111111111'),
+        keys: [],
+        data: Buffer.from([
+          3,
+          ...new BN(Math.floor(CONFIG.PRIORITY_FEE * LAMPORTS_PER_SOL / 300000)).toArray('le', 8)
+        ])
+      };
+      transaction.add(priorityFeeIx);
+    }
+    
+    sellInstructions.forEach(ix => transaction.add(ix));
+    
+    // Enviar
+    const signature = await sendAndConfirmTransaction(
+      STATE.connection,
+      transaction,
+      [STATE.wallet],
+      {
+        skipPreflight: false,
+        commitment: 'confirmed',
+        maxRetries: 3
+      }
+    );
+    
+    log('SUCCESS', `[TRADE] ✅ Venta ejecutada: https://solscan.io/tx/${signature}`);
     return signature;
+    
   } catch (error) {
-    log('ERROR', `Error vendiendo ${mint.slice(0, 8)}: ${error.message}`);
+    log('ERROR', `[TRADE] ❌ Error vendiendo: ${error.message}`);
     throw error;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ANÁLISIS DE TOKENS (CON RPC)
+// ANÁLISIS DE TOKENS
 // ═══════════════════════════════════════════════════════════════
 
 async function analyzeToken(mint) {
@@ -393,7 +455,7 @@ async function analyzeToken(mint) {
   const now = Date.now();
   const elapsed = (now - watch.firstSeen) / 1000;
   
-  // Timeout de observación
+  // Timeout
   if (elapsed > CONFIG.MAX_WATCH_TIME_SEC) {
     log('INFO', `⏱️ Timeout de observación para ${watch.symbol} después de ${elapsed.toFixed(0)}s`);
     STATE.watchlist.delete(mint);
@@ -401,8 +463,8 @@ async function analyzeToken(mint) {
     return;
   }
   
-  // Obtener precio desde RPC (bonding curve)
-  const priceData = await getTokenPriceRPC(mint);
+  // Obtener precio desde SDK
+  const priceData = await getTokenPriceSDK(mint);
   
   if (!priceData || !priceData.priceSol) {
     log('DEBUG', `${watch.symbol}: Sin datos de precio aún (${elapsed.toFixed(0)}s)`);
@@ -411,40 +473,38 @@ async function analyzeToken(mint) {
   
   const priceSol = priceData.priceSol;
   const realSolLiquidity = priceData.realSolReserves;
+  const marketCap = priceData.marketCap;
   
-  // Guardar precio
   watch.priceHistory.push({ price: priceSol, time: now });
   watch.lastPrice = priceSol;
   watch.realSolLiquidity = realSolLiquidity;
+  watch.marketCap = marketCap;
+  watch.bondingCurve = priceData.bondingCurve;
   
-  // Obtener buy count de DexScreener (en background, no bloqueante)
-  if (watch.checksCount % 2 === 0) { // Cada 2 checks
+  // Buy count cada 2 checks
+  if (watch.checksCount % 2 === 0) {
     getTokenBuyCount(mint).then(count => {
       watch.buyCount = count;
     }).catch(() => {});
   }
   
-  // Calcular velocidad de precio
+  // Calcular velocidad
   const recentPrices = watch.priceHistory.filter(p => (now - p.time) <= CONFIG.EARLY_TIME_WINDOW * 1000);
   
   if (recentPrices.length < 2) {
-    log('DEBUG', `${watch.symbol}: Esperando más datos (${recentPrices.length} puntos, ${elapsed.toFixed(0)}s)`);
+    log('DEBUG', `${watch.symbol}: Esperando más datos (${recentPrices.length} puntos)`);
     return;
   }
   
   const firstPrice = recentPrices[0].price;
   const currentPrice = recentPrices[recentPrices.length - 1].price;
   
-  if (firstPrice === 0) {
-    log('DEBUG', `${watch.symbol}: Precio inicial es 0, saltando...`);
-    return;
-  }
+  if (firstPrice === 0) return;
   
   const priceChange = ((currentPrice - firstPrice) / firstPrice) * 100;
   
-  // Log detallado cada 3 checks
   if (watch.checksCount % 3 === 0) {
-    log('INFO', `[ANÁLISIS] 📊 ${watch.symbol}: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% | ${priceSol.toFixed(10)} SOL | Liq: ${realSolLiquidity.toFixed(2)} SOL | Buys: ${watch.buyCount} | ${elapsed.toFixed(0)}s`);
+    log('INFO', `[ANÁLISIS] 📊 ${watch.symbol}: ${priceChange > 0 ? '+' : ''}${priceChange.toFixed(1)}% | MC: $${(marketCap / 1000).toFixed(0)}k | Liq: ${realSolLiquidity.toFixed(2)} SOL | ${elapsed.toFixed(0)}s`);
   }
   
   watch.checksCount++;
@@ -452,25 +512,24 @@ async function analyzeToken(mint) {
   // Señal temprana
   if (!watch.earlySignal && elapsed <= CONFIG.EARLY_TIME_WINDOW && priceChange >= CONFIG.EARLY_VELOCITY_MIN) {
     watch.earlySignal = true;
-    log('SUCCESS', `[SEÑAL] ⚡ Señal temprana en ${watch.symbol}: +${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s`);
+    log('SUCCESS', `[SEÑAL] ⚡ Señal temprana: ${watch.symbol} +${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s`);
     
     await sendTelegram(
       `⚡ <b>SEÑAL TEMPRANA</b>\n\n` +
       `${watch.name} (${watch.symbol})\n` +
       `<code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n\n` +
       `📈 +${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s\n` +
-      `💰 Liq Real: ${realSolLiquidity.toFixed(2)} SOL\n` +
-      `💵 Precio: ${priceSol.toFixed(10)} SOL\n` +
-      `🛒 Buys: ${watch.buyCount}`
+      `💰 MC: $${(marketCap / 1000).toFixed(0)}k\n` +
+      `💵 Liq Real: ${realSolLiquidity.toFixed(2)} SOL\n` +
+      `🛒 Buys: ${watch.buyCount || 0}`
     );
   }
   
-  // Confirmación para comprar
+  // Confirmación
   if (watch.earlySignal && elapsed >= CONFIG.CONFIRMATION_TIME && priceChange >= CONFIG.CONFIRMATION_VELOCITY) {
     
-    // Validaciones adicionales
     if (realSolLiquidity < CONFIG.MIN_REAL_SOL) {
-      log('WARN', `[FILTRO] ❌ ${watch.symbol}: SOL real insuficiente (${realSolLiquidity.toFixed(2)} SOL)`);
+      log('WARN', `[FILTRO] ❌ ${watch.symbol}: SOL insuficiente (${realSolLiquidity.toFixed(2)})`);
       STATE.watchlist.delete(mint);
       STATE.stats.filtered++;
       return;
@@ -483,30 +542,28 @@ async function analyzeToken(mint) {
       return;
     }
     
-    log('SUCCESS', `[SEÑAL CONFIRMADA] 🚀 ${watch.symbol} | +${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s | ${watch.buyCount} buys | ${realSolLiquidity.toFixed(2)} SOL`);
+    log('SUCCESS', `[SEÑAL CONFIRMADA] 🚀 ${watch.symbol} +${priceChange.toFixed(1)}% | ${watch.buyCount} buys`);
     
     await executeBuy(mint, watch, priceChange, elapsed);
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// TRADING
-// ═══════════════════════════════════════════════════════════════
+// Resto del código igual...
+// (executeBuy, monitorPositions, executeSell, setupWebSocket, setupTelegramBot, etc.)
 
 async function executeBuy(mint, watch, priceChange, elapsed) {
   if (STATE.positions.size >= CONFIG.MAX_CONCURRENT_POSITIONS) {
-    log('WARN', `[TRADE] ⚠️ Límite de posiciones alcanzado (${STATE.positions.size})`);
+    log('WARN', `Límite de posiciones alcanzado (${STATE.positions.size})`);
     return;
   }
   
   try {
-    log('INFO', `[TRADE] 🛒 Ejecutando compra de ${CONFIG.TRADE_AMOUNT_SOL} SOL de ${watch.symbol}...`);
+    log('INFO', `🛒 Ejecutando compra de ${CONFIG.TRADE_AMOUNT_SOL} SOL de ${watch.symbol}...`);
     
     if (CONFIG.DRY_RUN) {
-      log('SUCCESS', `[DRY RUN] ✅ Compra simulada: ${watch.symbol} @ ${watch.lastPrice.toFixed(10)} SOL`);
+      log('SUCCESS', `[DRY RUN] ✅ Compra simulada`);
     } else {
-      const signature = await buyToken(mint, CONFIG.TRADE_AMOUNT_SOL);
-      log('SUCCESS', `[TRADE] ✅ Compra ejecutada: https://solscan.io/tx/${signature}`);
+      await buyTokenSDK(mint, CONFIG.TRADE_AMOUNT_SOL);
     }
     
     STATE.positions.set(mint, {
@@ -525,30 +582,24 @@ async function executeBuy(mint, watch, priceChange, elapsed) {
     });
     
     STATE.watchlist.delete(mint);
-    STATE.stats.analyzing = STATE.watchlist.size;
     STATE.stats.totalTrades++;
     
     await sendTelegram(
       `🟢 <b>POSICIÓN ABIERTA</b>\n\n` +
       `${watch.name} (${watch.symbol})\n` +
-      `<code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n\n` +
-      `💰 Inversión: ${CONFIG.TRADE_AMOUNT_SOL} SOL\n` +
-      `💵 Precio entrada: ${watch.lastPrice.toFixed(10)} SOL\n` +
-      `📈 Ganancia al entrar: +${priceChange.toFixed(1)}%\n` +
-      `⏱️ Tiempo análisis: ${elapsed.toFixed(0)}s`
+      `💰 ${CONFIG.TRADE_AMOUNT_SOL} SOL @ ${watch.lastPrice.toFixed(10)}\n` +
+      `📈 +${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s`
     );
     
-    log('SUCCESS', `[POSICIÓN] ✅ Abierta: ${watch.symbol} @ ${watch.lastPrice.toFixed(10)} SOL`);
-    
   } catch (error) {
-    log('ERROR', `[TRADE] ❌ Error ejecutando compra: ${error.message}`);
+    log('ERROR', `Error ejecutando compra: ${error.message}`);
   }
 }
 
 async function monitorPositions() {
   for (const [mint, pos] of STATE.positions.entries()) {
-    const priceData = await getTokenPriceRPC(mint);
-    if (!priceData || !priceData.priceSol) continue;
+    const priceData = await getTokenPriceSDK(mint);
+    if (!priceData) continue;
     
     const currentPrice = priceData.priceSol;
     const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
@@ -560,7 +611,7 @@ async function monitorPositions() {
     
     if (!pos.trailingActive && pnlPercent >= CONFIG.TRAILING_ACTIVATION) {
       pos.trailingActive = true;
-      log('INFO', `[POSITION] 🛡️ Trailing activado para ${pos.symbol} @ +${pnlPercent.toFixed(1)}%`);
+      log('INFO', `🛡️ Trailing activado para ${pos.symbol}`);
     }
     
     let trailingStopPrice = null;
@@ -568,8 +619,7 @@ async function monitorPositions() {
       trailingStopPrice = pos.highestPrice * (1 + CONFIG.TRAILING_PERCENT / 100);
     }
     
-    const trailingEmoji = pos.trailingActive ? '🛡️' : '';
-    log('INFO', `[POSITION] 📊 ${pos.symbol}: ${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}% | ${currentPrice.toFixed(10)} SOL | ${holdTime.toFixed(1)}min ${trailingEmoji}`);
+    log('INFO', `[POS] ${pos.symbol}: ${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}% | ${holdTime.toFixed(1)}min ${pos.trailingActive ? '🛡️' : ''}`);
     
     let shouldSell = false;
     let sellPercentage = 100;
@@ -585,7 +635,7 @@ async function monitorPositions() {
     }
     else if (pos.trailingActive && currentPrice <= trailingStopPrice) {
       shouldSell = true;
-      sellReason = `Trailing Stop (${pnlPercent.toFixed(1)}%)`;
+      sellReason = `Trailing (${pnlPercent.toFixed(1)}%)`;
     }
     else if (pnlPercent >= CONFIG.TAKE_PROFIT_3 && !pos.tp3Taken) {
       shouldSell = true;
@@ -611,7 +661,7 @@ async function monitorPositions() {
     }
     else if (holdTime >= CONFIG.STAGNANT_TIME_MIN && Math.abs(pnlPercent - pos.lastPnl) < 2) {
       shouldSell = true;
-      sellReason = `Estancado (${pnlPercent.toFixed(1)}%)`;
+      sellReason = `Estancado`;
     }
     
     if (shouldSell) {
@@ -624,13 +674,12 @@ async function monitorPositions() {
 
 async function executeSell(mint, pos, percentage, reason, pnlPercent) {
   try {
-    log('INFO', `[TRADE] 🔔 Vendiendo ${percentage}% de ${pos.symbol}: ${reason}`);
+    log('INFO', `🔔 Vendiendo ${percentage}% de ${pos.symbol}: ${reason}`);
     
     if (CONFIG.DRY_RUN) {
-      log('SUCCESS', `[DRY RUN] ✅ Venta simulada: ${percentage}% @ ${pnlPercent.toFixed(2)}%`);
+      log('SUCCESS', `[DRY RUN] ✅ Venta simulada: ${percentage}%`);
     } else {
-      const signature = await sellToken(mint, percentage);
-      log('SUCCESS', `[TRADE] ✅ Venta ejecutada: https://solscan.io/tx/${signature}`);
+      await sellTokenSDK(mint, percentage);
     }
     
     const isFullExit = percentage === 100;
@@ -645,28 +694,20 @@ async function executeSell(mint, pos, percentage, reason, pnlPercent) {
       const emoji = pnlPercent > 0 ? '🟢' : '🔴';
       await sendTelegram(
         `${emoji} <b>POSICIÓN CERRADA</b>\n\n` +
-        `${pos.name} (${pos.symbol})\n` +
-        `<code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n\n` +
+        `${pos.symbol}\n` +
         `📊 P&L: ${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(2)}%\n` +
-        `💰 Inversión: ${pos.amount} SOL\n` +
-        `🎯 Razón: ${reason}`
+        `🎯 ${reason}`
       );
-      
-      log('SUCCESS', `[POSITION] ✅ Cerrada: ${pos.symbol} @ ${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(2)}%`);
     } else {
       await sendTelegram(
         `💰 <b>VENTA PARCIAL</b>\n\n` +
-        `${pos.name} (${pos.symbol})\n` +
-        `Vendido: ${percentage}%\n` +
-        `P&L: +${pnlPercent.toFixed(2)}%\n` +
-        `Razón: ${reason}`
+        `${pos.symbol}: ${percentage}%\n` +
+        `P&L: +${pnlPercent.toFixed(2)}%`
       );
-      
-      log('SUCCESS', `[POSITION] ✅ Vendido ${percentage}% de ${pos.symbol}`);
     }
     
   } catch (error) {
-    log('ERROR', `[TRADE] ❌ Error vendiendo: ${error.message}`);
+    log('ERROR', `Error vendiendo: ${error.message}`);
   }
 }
 
@@ -679,9 +720,7 @@ function setupWebSocket() {
   
   STATE.ws.on('open', () => {
     log('SUCCESS', '✅ Conectado a PumpPortal WebSocket');
-    STATE.ws.send(JSON.stringify({
-      method: 'subscribeNewToken'
-    }));
+    STATE.ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     log('INFO', '📡 Suscrito a tokens nuevos');
   });
   
@@ -689,23 +728,17 @@ function setupWebSocket() {
     try {
       const msg = JSON.parse(data.toString());
       
-      // Filtrar solo eventos de creación
       if (msg.txType === 'create' || msg.mint) {
         const mint = msg.mint || msg.token;
         const name = msg.name || msg.tokenName || 'Unknown';
         const symbol = msg.symbol || msg.tokenSymbol || 'UNKNOWN';
         
-        // Verificar si ya está en watchlist
-        if (STATE.watchlist.has(mint)) {
-          log('DEBUG', `Token ${mint.slice(0, 8)} ya está en watchlist`);
-          return;
-        }
+        if (STATE.watchlist.has(mint)) return;
         
         STATE.stats.detected++;
         
-        log('SUCCESS', `🆕 NUEVO TOKEN: ${name} (${symbol}) - ${mint.slice(0, 8)}...`);
+        log('SUCCESS', `🆕 ${name} (${symbol}) - ${mint.slice(0, 8)}...`);
         
-        // Agregar a watchlist
         STATE.watchlist.set(mint, {
           mint,
           name,
@@ -714,17 +747,17 @@ function setupWebSocket() {
           priceHistory: [],
           buyCount: 0,
           realSolLiquidity: 0,
+          marketCap: 0,
           lastPrice: 0,
           earlySignal: false,
-          checksCount: 0
+          checksCount: 0,
+          bondingCurve: null
         });
         
         STATE.stats.analyzing = STATE.watchlist.size;
-        
-        log('INFO', `📊 Total en watchlist: ${STATE.watchlist.size}`);
       }
     } catch (error) {
-      log('ERROR', `Error procesando mensaje WS: ${error.message}`);
+      log('ERROR', `Error WS: ${error.message}`);
     }
   });
   
@@ -733,7 +766,7 @@ function setupWebSocket() {
   });
   
   STATE.ws.on('close', () => {
-    log('WARN', '⚠️ WebSocket cerrado. Reconectando en 5s...');
+    log('WARN', '⚠️ WebSocket cerrado. Reconectando...');
     setTimeout(setupWebSocket, 5000);
   });
 }
@@ -752,15 +785,13 @@ function setupTelegramBot() {
   
   STATE.bot.onText(/\/start/, (msg) => {
     STATE.bot.sendMessage(msg.chat.id,
-      `🤖 <b>Pump.fun Trading Bot RPC</b>\n\n` +
-      `Bot con precios en tiempo real desde blockchain\n\n` +
+      `🤖 <b>Pump.fun Trading Bot - SDK</b>\n\n` +
       `<b>Comandos:</b>\n` +
-      `/status - Estado del bot\n` +
-      `/stats - Estadísticas de trading\n` +
-      `/positions - Posiciones abiertas\n` +
-      `/watchlist - Tokens en análisis\n` +
-      `/balance - Balance de wallet\n` +
-      `/config - Ver configuración`,
+      `/status - Estado\n` +
+      `/stats - Estadísticas\n` +
+      `/positions - Posiciones\n` +
+      `/watchlist - Análisis\n` +
+      `/balance - Balance`,
       { parse_mode: 'HTML' }
     );
   });
@@ -768,23 +799,21 @@ function setupTelegramBot() {
   STATE.bot.onText(/\/status/, async (msg) => {
     try {
       const balance = await STATE.connection.getBalance(STATE.wallet.publicKey) / LAMPORTS_PER_SOL;
-      const wsStatus = STATE.ws && STATE.ws.readyState === WebSocket.OPEN ? '✅ Conectado' : '❌ Desconectado';
+      const wsStatus = STATE.ws?.readyState === WebSocket.OPEN ? '✅' : '❌';
       
       STATE.bot.sendMessage(msg.chat.id,
-        `📊 <b>Estado del Bot</b>\n\n` +
+        `📊 <b>Estado</b>\n\n` +
         `💰 Balance: ${balance.toFixed(4)} SOL\n` +
-        `📈 Posiciones abiertas: ${STATE.positions.size}\n` +
-        `👀 Tokens analizando: ${STATE.watchlist.size}\n` +
-        `🌐 WebSocket: ${wsStatus}\n` +
-        `🎯 Modo: ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}\n\n` +
-        `<b>Detección:</b>\n` +
+        `📈 Posiciones: ${STATE.positions.size}\n` +
+        `👀 Analizando: ${STATE.watchlist.size}\n` +
+        `🌐 WS: ${wsStatus}\n` +
+        `🎯 ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}\n\n` +
         `🆕 Detectados: ${STATE.stats.detected}\n` +
-        `📊 Analizando: ${STATE.stats.analyzing}\n` +
         `🚫 Filtrados: ${STATE.stats.filtered}`,
         { parse_mode: 'HTML' }
       );
     } catch (error) {
-      log('ERROR', `Error en /status: ${error.message}`);
+      log('ERROR', `Error /status: ${error.message}`);
     }
   });
   
@@ -794,34 +823,29 @@ function setupTelegramBot() {
       : '0.0';
     
     STATE.bot.sendMessage(msg.chat.id,
-      `📊 <b>Estadísticas de Trading</b>\n\n` +
-      `📈 Trades totales: ${STATE.stats.totalTrades}\n` +
+      `📊 <b>Estadísticas</b>\n\n` +
+      `📈 Trades: ${STATE.stats.totalTrades}\n` +
       `✅ Wins: ${STATE.stats.wins}\n` +
       `❌ Losses: ${STATE.stats.losses}\n` +
       `💹 Win Rate: ${winRate}%\n` +
-      `💰 P&L Total: ${STATE.stats.totalPnl > 0 ? '+' : ''}${STATE.stats.totalPnl.toFixed(2)}%\n\n` +
-      `<b>Rendimiento promedio:</b>\n` +
-      `📊 Por trade: ${STATE.stats.totalTrades > 0 ? (STATE.stats.totalPnl / STATE.stats.totalTrades).toFixed(2) : '0.00'}%`,
+      `💰 P&L: ${STATE.stats.totalPnl > 0 ? '+' : ''}${STATE.stats.totalPnl.toFixed(2)}%`,
       { parse_mode: 'HTML' }
     );
   });
   
   STATE.bot.onText(/\/positions/, (msg) => {
     if (STATE.positions.size === 0) {
-      STATE.bot.sendMessage(msg.chat.id, '📊 No hay posiciones abiertas');
+      STATE.bot.sendMessage(msg.chat.id, '📊 No hay posiciones');
       return;
     }
     
-    let text = '📊 <b>Posiciones Abiertas</b>\n\n';
+    let text = '📊 <b>Posiciones</b>\n\n';
     
     for (const [mint, pos] of STATE.positions.entries()) {
-      const holdTime = ((Date.now() - pos.entryTime) / 1000 / 60).toFixed(1);
+      const holdTime = ((Date.now() - pos.entryTime) / 60000).toFixed(1);
       text += `<b>${pos.symbol}</b>\n`;
-      text += `<code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n`;
-      text += `💰 ${pos.amount} SOL @ ${pos.entryPrice.toFixed(10)} SOL\n`;
-      text += `⏱️ ${holdTime} min\n`;
-      text += `${pos.trailingActive ? '🛡️ Trailing activo\n' : ''}`;
-      text += `\n`;
+      text += `💰 ${pos.amount} SOL\n`;
+      text += `⏱️ ${holdTime}min\n\n`;
     }
     
     STATE.bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
@@ -829,22 +853,17 @@ function setupTelegramBot() {
   
   STATE.bot.onText(/\/watchlist/, (msg) => {
     if (STATE.watchlist.size === 0) {
-      STATE.bot.sendMessage(msg.chat.id, '👀 No hay tokens en análisis');
+      STATE.bot.sendMessage(msg.chat.id, '👀 No hay tokens');
       return;
     }
     
-    let text = '👀 <b>Tokens en Análisis</b>\n\n';
+    let text = '👀 <b>Análisis</b>\n\n';
     
     const tokens = Array.from(STATE.watchlist.entries()).slice(0, 10);
     for (const [mint, watch] of tokens) {
       const elapsed = ((Date.now() - watch.firstSeen) / 1000).toFixed(0);
-      text += `<b>${watch.symbol}</b> ${watch.earlySignal ? '⚡' : ''}\n`;
-      text += `<code>${mint.slice(0, 8)}...${mint.slice(-4)}</code>\n`;
-      text += `⏱️ ${elapsed}s | 🛒 ${watch.buyCount} buys | ${watch.lastPrice.toFixed(10)} SOL\n\n`;
-    }
-    
-    if (STATE.watchlist.size > 10) {
-      text += `\n... y ${STATE.watchlist.size - 10} más`;
+      text += `${watch.symbol} ${watch.earlySignal ? '⚡' : ''}\n`;
+      text += `⏱️ ${elapsed}s | 🛒 ${watch.buyCount}\n\n`;
     }
     
     STATE.bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
@@ -854,58 +873,36 @@ function setupTelegramBot() {
     try {
       const balance = await STATE.connection.getBalance(STATE.wallet.publicKey) / LAMPORTS_PER_SOL;
       STATE.bot.sendMessage(msg.chat.id,
-        `💰 <b>Balance de Wallet</b>\n\n` +
-        `${balance.toFixed(4)} SOL\n\n` +
-        `<code>${STATE.wallet.publicKey.toString()}</code>`,
+        `💰 <b>Balance</b>\n\n${balance.toFixed(4)} SOL`,
         { parse_mode: 'HTML' }
       );
     } catch (error) {
-      log('ERROR', `Error en /balance: ${error.message}`);
+      log('ERROR', `Error /balance: ${error.message}`);
     }
   });
   
-  STATE.bot.onText(/\/config/, (msg) => {
-    STATE.bot.sendMessage(msg.chat.id,
-      `⚙️ <b>Configuración</b>\n\n` +
-      `<b>Trading:</b>\n` +
-      `💰 Monto: ${CONFIG.TRADE_AMOUNT_SOL} SOL\n` +
-      `📊 Slippage: ${CONFIG.SLIPPAGE}%\n` +
-      `🎯 Modo: ${CONFIG.DRY_RUN ? 'DRY RUN' : 'REAL'}\n\n` +
-      `<b>Señales:</b>\n` +
-      `⚡ Velocidad temprana: +${CONFIG.EARLY_VELOCITY_MIN}%\n` +
-      `✅ Confirmación: +${CONFIG.CONFIRMATION_VELOCITY}%\n` +
-      `⏱️ Ventana: ${CONFIG.EARLY_TIME_WINDOW}s\n` +
-      `💰 SOL mínimo: ${CONFIG.MIN_REAL_SOL}\n\n` +
-      `<b>Take Profit:</b>\n` +
-      `🎯 TP1: +${CONFIG.TAKE_PROFIT_1}%\n` +
-      `🎯 TP2: +${CONFIG.TAKE_PROFIT_2}%\n` +
-      `🎯 TP3: +${CONFIG.TAKE_PROFIT_3}%\n\n` +
-      `<b>Stop Loss:</b>\n` +
-      `🛑 Hard Stop: ${CONFIG.HARD_STOP_LOSS}%\n` +
-      `🛡️ Trailing: ${CONFIG.TRAILING_PERCENT}%`,
-      { parse_mode: 'HTML' }
-    );
-  });
-  
-  log('SUCCESS', '✅ Telegram bot configurado');
+  log('SUCCESS', '✅ Telegram configurado');
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SETUP WALLET
+// SETUP WALLET Y SDK
 // ═══════════════════════════════════════════════════════════════
 
 async function setupWallet() {
   try {
     if (!CONFIG.WALLET_PRIVATE_KEY) {
-      throw new Error('WALLET_PRIVATE_KEY no configurada en .env');
+      throw new Error('WALLET_PRIVATE_KEY no configurada');
     }
     
     const privateKeyBytes = decodeBase58(CONFIG.WALLET_PRIVATE_KEY);
     STATE.wallet = Keypair.fromSecretKey(new Uint8Array(privateKeyBytes));
     log('SUCCESS', `✅ Wallet: ${STATE.wallet.publicKey.toString().slice(0, 8)}...`);
     
-    STATE.connection = new Connection(CONFIG.RPC_ENDPOINTS[0], 'confirmed');
-    log('INFO', `🌐 Conectado a RPC: ${CONFIG.RPC_ENDPOINTS[0]}`);
+    STATE.connection = new Connection(CONFIG.RPC_ENDPOINT, 'confirmed');
+    log('INFO', `🌐 RPC: ${CONFIG.RPC_ENDPOINT}`);
+    
+    STATE.pumpSdk = new PumpSdk(STATE.connection);
+    log('SUCCESS', '✅ Pump SDK inicializado');
     
     try {
       const balance = await STATE.connection.getBalance(STATE.wallet.publicKey);
@@ -916,7 +913,7 @@ async function setupWallet() {
     
     return true;
   } catch (error) {
-    log('ERROR', `❌ Error configurando wallet: ${error.message}`);
+    log('ERROR', `❌ Error setup wallet: ${error.message}`);
     return false;
   }
 }
@@ -926,18 +923,18 @@ async function setupWallet() {
 // ═══════════════════════════════════════════════════════════════
 
 async function watchlistLoop() {
-  log('INFO', '🔄 Iniciando loop de análisis...');
+  log('INFO', '🔄 Loop de análisis iniciado');
   
   while (true) {
     try {
       if (STATE.watchlist.size > 0) {
         for (const mint of STATE.watchlist.keys()) {
           await analyzeToken(mint);
-          await sleep(500); // 0.5 segundos entre análisis
+          await sleep(500);
         }
       }
     } catch (error) {
-      log('ERROR', `Error en watchlist loop: ${error.message}`);
+      log('ERROR', `Error watchlist: ${error.message}`);
     }
     
     await sleep(CONFIG.PRICE_CHECK_INTERVAL_SEC * 1000);
@@ -945,7 +942,7 @@ async function watchlistLoop() {
 }
 
 async function positionsLoop() {
-  log('INFO', '🔄 Iniciando loop de posiciones...');
+  log('INFO', '🔄 Loop de posiciones iniciado');
   
   while (true) {
     try {
@@ -953,10 +950,10 @@ async function positionsLoop() {
         await monitorPositions();
       }
     } catch (error) {
-      log('ERROR', `Error en positions loop: ${error.message}`);
+      log('ERROR', `Error positions: ${error.message}`);
     }
     
-    await sleep(5000); // 5 segundos
+    await sleep(5000);
   }
 }
 
@@ -967,87 +964,71 @@ async function positionsLoop() {
 async function main() {
   console.log('\n');
   log('INFO', '═══════════════════════════════════════════════════════════════');
-  log('INFO', '🚀 PUMP.FUN TRADING BOT v3.0 - RPC EDITION');
+  log('INFO', '🚀 PUMP.FUN TRADING BOT v4.0 - SDK EDITION');
   log('INFO', '═══════════════════════════════════════════════════════════════');
   console.log('\n');
   
-  // Setup wallet
-  log('INFO', '💼 Configurando wallet...');
   const walletOk = await setupWallet();
   if (!walletOk) {
-    log('ERROR', '❌ No se pudo configurar wallet. Abortando.');
+    log('ERROR', '❌ Error fatal. Abortando.');
     process.exit(1);
   }
   
   console.log('\n');
   
-  // Setup Telegram
-  log('INFO', '💬 Configurando Telegram...');
   setupTelegramBot();
-  
-  console.log('\n');
-  
-  // Setup WebSocket
-  log('INFO', '🌐 Conectando a PumpPortal...');
   setupWebSocket();
   
-  // Esperar conexión
   await sleep(3000);
   
   console.log('\n');
   log('SUCCESS', '═══════════════════════════════════════════════════════════════');
-  log('SUCCESS', `✅ BOT INICIADO - MODO ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}`);
+  log('SUCCESS', `✅ BOT INICIADO - ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}`);
   log('SUCCESS', '═══════════════════════════════════════════════════════════════');
   console.log('\n');
   
-  log('INFO', `📊 Configuración de señales:`);
-  log('INFO', `   ⚡ Velocidad temprana: +${CONFIG.EARLY_VELOCITY_MIN}% en ${CONFIG.EARLY_TIME_WINDOW}s`);
-  log('INFO', `   ✅ Confirmación: +${CONFIG.CONFIRMATION_VELOCITY}% en ${CONFIG.CONFIRMATION_TIME}s`);
-  log('INFO', `   💰 SOL real mínimo: ${CONFIG.MIN_REAL_SOL} SOL`);
-  log('INFO', `   🛒 Compras mínimas: ${CONFIG.MIN_BUY_COUNT}`);
-  log('INFO', `   🔬 Fuente de precios: BLOCKCHAIN RPC (bonding curve)`);
+  log('INFO', `⚡ Velocidad: +${CONFIG.EARLY_VELOCITY_MIN}% en ${CONFIG.EARLY_TIME_WINDOW}s`);
+  log('INFO', `✅ Confirmación: +${CONFIG.CONFIRMATION_VELOCITY}% en ${CONFIG.CONFIRMATION_TIME}s`);
+  log('INFO', `💰 SOL mínimo: ${CONFIG.MIN_REAL_SOL}`);
+  log('INFO', `🔬 Precios: SDK Pump.fun oficial`);
   console.log('\n');
   
   await sendTelegram(
-    `🚀 <b>Bot Iniciado - RPC Edition</b>\n\n` +
-    `Modo: ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}\n` +
-    `💰 Inversión: ${CONFIG.TRADE_AMOUNT_SOL} SOL\n` +
-    `📊 Max Posiciones: ${CONFIG.MAX_CONCURRENT_POSITIONS}\n\n` +
-    `<b>Señales:</b>\n` +
-    `⚡ Temprana: +${CONFIG.EARLY_VELOCITY_MIN}%\n` +
-    `✅ Confirmación: +${CONFIG.CONFIRMATION_VELOCITY}%\n` +
-    `💰 SOL mínimo: ${CONFIG.MIN_REAL_SOL}\n\n` +
-    `<b>Stop Loss:</b>\n` +
-    `🛑 Hard: ${CONFIG.HARD_STOP_LOSS}%\n` +
+    `🚀 <b>Bot Iniciado</b>\n\n` +
+    `${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}\n` +
+    `💰 ${CONFIG.TRADE_AMOUNT_SOL} SOL por trade\n` +
+    `📊 Max: ${CONFIG.MAX_CONCURRENT_POSITIONS} posiciones\n\n` +
+    `⚡ +${CONFIG.EARLY_VELOCITY_MIN}% / ${CONFIG.EARLY_TIME_WINDOW}s\n` +
+    `✅ +${CONFIG.CONFIRMATION_VELOCITY}% / ${CONFIG.CONFIRMATION_TIME}s\n\n` +
+    `🛑 Stop: ${CONFIG.HARD_STOP_LOSS}%\n` +
     `🛡️ Trailing: ${CONFIG.TRAILING_PERCENT}%\n\n` +
-    `🔬 Precios desde: Blockchain RPC`
+    `🔧 SDK oficial Pump.fun`
   );
   
-  // Iniciar loops
   watchlistLoop();
   positionsLoop();
 }
 
 // ═══════════════════════════════════════════════════════════════
-// GRACEFUL SHUTDOWN
+// SHUTDOWN
 // ═══════════════════════════════════════════════════════════════
 
 process.on('SIGTERM', async () => {
-  log('WARN', '🛑 SIGTERM recibido, cerrando...');
+  log('WARN', '🛑 SIGTERM');
   if (STATE.ws) STATE.ws.close();
-  await sendTelegram('🛑 <b>Bot Detenido</b>\n\nSIGTERM recibido');
+  await sendTelegram('🛑 <b>Bot Detenido</b>');
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
-  log('WARN', '🛑 SIGINT recibido, cerrando...');
+  log('WARN', '🛑 SIGINT');
   if (STATE.ws) STATE.ws.close();
-  await sendTelegram('🛑 <b>Bot Detenido</b>\n\nSIGINT recibido');
+  await sendTelegram('🛑 <b>Bot Detenido</b>');
   process.exit(0);
 });
 
 // ═══════════════════════════════════════════════════════════════
-// INICIO
+// START
 // ═══════════════════════════════════════════════════════════════
 
 main().catch(error => {
