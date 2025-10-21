@@ -832,8 +832,25 @@ function setupTelegramBot() {
     
     STATE.bot.onText(/\/refresh/, async (msg) => {
       try {
-        STATE.globalData = await STATE.pumpSdk.fetchGlobal();
-        STATE.bot.sendMessage(msg.chat.id, '✅ Global data actualizado');
+        const GLOBAL_STATE_ADDRESS = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
+        const accountInfo = await STATE.connection.getAccountInfo(GLOBAL_STATE_ADDRESS);
+        
+        if (accountInfo) {
+          const data = accountInfo.data;
+          STATE.globalData = {
+            initialized: data[0] === 1,
+            authority: new PublicKey(data.slice(1, 33)),
+            feeRecipient: new PublicKey(data.slice(33, 65)),
+            initialVirtualTokenReserves: new BN(data.slice(65, 73), 10, 'le'),
+            initialVirtualSolReserves: new BN(data.slice(73, 81), 10, 'le'),
+            initialRealTokenReserves: new BN(data.slice(81, 89), 10, 'le'),
+            tokenTotalSupply: new BN(data.slice(89, 97), 10, 'le'),
+            feeBasisPoints: new BN(data.slice(97, 105), 10, 'le')
+          };
+          STATE.bot.sendMessage(msg.chat.id, `✅ Global data actualizado (fee: ${STATE.globalData.feeBasisPoints.toNumber()} bps)`);
+        } else {
+          STATE.bot.sendMessage(msg.chat.id, '❌ No se encontró global state');
+        }
       } catch (e) {
         STATE.bot.sendMessage(msg.chat.id, `❌ Error: ${e.message}`);
       }
@@ -953,8 +970,39 @@ async function setupWallet() {
     
     // Fetch global data inicial
     try {
-      STATE.globalData = await STATE.pumpSdk.fetchGlobal();
-      log('SUCCESS', '✅ Global data cargado');
+      // Global PDA: 4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf
+      const GLOBAL_STATE_ADDRESS = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
+      
+      const accountInfo = await STATE.connection.getAccountInfo(GLOBAL_STATE_ADDRESS);
+      
+      if (accountInfo) {
+        const data = accountInfo.data;
+        
+        // Parsear según estructura oficial:
+        // 0: initialized (bool - 1 byte)
+        // 1-32: authority (pubkey - 32 bytes)
+        // 33-64: fee_recipient (pubkey - 32 bytes)
+        // 65-72: initial_virtual_token_reserves (u64 - 8 bytes)
+        // 73-80: initial_virtual_sol_reserves (u64 - 8 bytes)
+        // 81-88: initial_real_token_reserves (u64 - 8 bytes)
+        // 89-96: token_total_supply (u64 - 8 bytes)
+        // 97-104: fee_basis_points (u64 - 8 bytes)
+        
+        STATE.globalData = {
+          initialized: data[0] === 1,
+          authority: new PublicKey(data.slice(1, 33)),
+          feeRecipient: new PublicKey(data.slice(33, 65)),
+          initialVirtualTokenReserves: new BN(data.slice(65, 73), 10, 'le'),
+          initialVirtualSolReserves: new BN(data.slice(73, 81), 10, 'le'),
+          initialRealTokenReserves: new BN(data.slice(81, 89), 10, 'le'),
+          tokenTotalSupply: new BN(data.slice(89, 97), 10, 'le'),
+          feeBasisPoints: new BN(data.slice(97, 105), 10, 'le')
+        };
+        
+        log('SUCCESS', `✅ Global data cargado (fee: ${STATE.globalData.feeBasisPoints.toNumber()} bps)`);
+      } else {
+        log('WARN', '⚠️ No se encontró global state');
+      }
     } catch (e) {
       log('WARN', `⚠️ No se pudo cargar global data: ${e.message}`);
     }
@@ -1058,8 +1106,23 @@ async function healthCheckLoop() {
       // Refrescar global data cada hora
       if (Date.now() % 3600000 < 60000) {
         try {
-          STATE.globalData = await STATE.pumpSdk.fetchGlobal();
-          log('DEBUG', 'Global data actualizado');
+          const GLOBAL_STATE_ADDRESS = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
+          const accountInfo = await STATE.connection.getAccountInfo(GLOBAL_STATE_ADDRESS);
+          
+          if (accountInfo) {
+            const data = accountInfo.data;
+            STATE.globalData = {
+              initialized: data[0] === 1,
+              authority: new PublicKey(data.slice(1, 33)),
+              feeRecipient: new PublicKey(data.slice(33, 65)),
+              initialVirtualTokenReserves: new BN(data.slice(65, 73), 10, 'le'),
+              initialVirtualSolReserves: new BN(data.slice(73, 81), 10, 'le'),
+              initialRealTokenReserves: new BN(data.slice(81, 89), 10, 'le'),
+              tokenTotalSupply: new BN(data.slice(89, 97), 10, 'le'),
+              feeBasisPoints: new BN(data.slice(97, 105), 10, 'le')
+            };
+            log('DEBUG', 'Global data actualizado');
+          }
         } catch (e) {
           log('WARN', `No se pudo actualizar global data: ${e.message}`);
         }
