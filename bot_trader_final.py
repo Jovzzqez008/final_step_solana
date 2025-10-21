@@ -117,7 +117,7 @@ class Config:
     # ═══ JUPITER API ═══
     JUPITER_QUOTE_API: str = 'https://quote-api.jup.ag/v6/quote'
     JUPITER_SWAP_API: str = 'https://quote-api.jup.ag/v6/swap'
-    JUPITER_PRICE_API: str = 'https://api.jup.ag/price/v2'
+    JUPITER_PRICE_API: str = 'https://lite-api.jup.ag/price/v3'  # V3 actualizado
     JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
     
     # Categorías disponibles: toporganicscore, toptraded, toptrending
@@ -380,27 +380,31 @@ async def send_telegram(message: str):
 async def get_jupiter_quote(input_mint: str, output_mint: str, amount_lamports: int) -> Optional[dict]:
     """Obtener quote de Jupiter V6"""
     try:
+        # Asegurar que todos los parámetros sean strings o números, no booleanos
         params = {
-            'inputMint': input_mint,
-            'outputMint': output_mint,
-            'amount': str(amount_lamports),  # Convertir a string
-            'slippageBps': str(config.SLIPPAGE_BPS),  # Convertir a string
-            'onlyDirectRoutes': 'false',  # String en minúscula
-            'maxAccounts': '64'  # String
+            'inputMint': str(input_mint),
+            'outputMint': str(output_mint),
+            'amount': str(int(amount_lamports)),
+            'slippageBps': str(int(config.SLIPPAGE_BPS))
         }
         
+        # NO incluir parámetros opcionales que puedan causar problemas
+        # Jupiter V6 usará valores por defecto
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(config.JUPITER_QUOTE_API, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            async with session.get(config.JUPITER_QUOTE_API, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 if resp.status == 200:
-                    return await resp.json()
+                    quote = await resp.json()
+                    logger.debug(f"Quote OK: {quote.get('inAmount')} -> {quote.get('outAmount')}")
+                    return quote
                 
                 # Log error details
                 error_text = await resp.text()
-                logger.warning(f"Jupiter quote error {resp.status}: {error_text[:200]}")
+                logger.error(f"Jupiter quote error {resp.status}: {error_text[:300]}")
                 state.stats['api_errors'] += 1
                 return None
     except Exception as e:
-        logger.error(f"Error get_jupiter_quote: {e}")
+        logger.error(f"Error get_jupiter_quote: {e}", exc_info=True)
         state.stats['api_errors'] += 1
         return None
 
@@ -427,7 +431,7 @@ async def get_jupiter_swap_tx(quote: dict) -> Optional[str]:
         return None
 
 async def get_token_price(mint: str) -> Optional[float]:
-    """Obtener precio actual de token vía Jupiter"""
+    """Obtener precio actual de token vía Jupiter Price API V3"""
     try:
         url = f"{config.JUPITER_PRICE_API}?ids={mint}"
         
@@ -435,12 +439,51 @@ async def get_token_price(mint: str) -> Optional[float]:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if 'data' in data and mint in data['data']:
-                        return float(data['data'][mint].get('price', 0))
+                    
+                    # V3 response format
+                    if mint in data and 'usdPrice' in data[mint]:
+                        price = float(data[mint]['usdPrice'])
+                        
+                        # Log si hay cambio significativo en 24h
+                        change_24h = data[mint].get('priceChange24h', 0)
+                        if abs(change_24h) > 20:
+                            logger.debug(f"{mint[:8]}: ${price:.8f} (24h: {change_24h:+.1f}%)")
+                        
+                        return price
+                    
+                    # Token no encontrado o sin precio confiable
+                    logger.debug(f"No price available for {mint[:8]}... (might be illiquid or suspicious)")
+                    return None
+                    
         return None
     except Exception as e:
         logger.debug(f"Error get_token_price: {e}")
         return None
+
+async def get_multiple_token_prices(mints: List[str]) -> Dict[str, float]:
+    """Obtener precios de múltiples tokens de una vez (hasta 50)"""
+    try:
+        # Jupiter permite hasta 50 IDs
+        mints_batch = mints[:50]
+        ids_param = ','.join(mints_batch)
+        url = f"{config.JUPITER_PRICE_API}?ids={ids_param}"
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    prices = {}
+                    for mint, info in data.items():
+                        if 'usdPrice' in info:
+                            prices[mint] = float(info['usdPrice'])
+                    
+                    return prices
+        
+        return {}
+    except Exception as e:
+        logger.debug(f"Error get_multiple_token_prices: {e}")
+        return {}
 
 # ═══════════════════════════════════════════════════════════════
 # JITO BUNDLES
@@ -501,66 +544,89 @@ async def send_jito_bundle(swap_tx_b64: str) -> Optional[str]:
         return None
 
 async def execute_swap(input_mint: str, output_mint: str, amount_lamports: int) -> Optional[str]:
-    """Ejecutar swap con Jupiter + Jito"""
+    """Ejecutar swap con Jupiter + Jito (con retry)"""
     
-    try:
-        # 1. Obtener quote
-        logger.debug(f"Requesting quote: {input_mint[:8]}... -> {output_mint[:8]}... ({amount_lamports} lamports)")
-        
-        quote = await get_jupiter_quote(input_mint, output_mint, amount_lamports)
-        if not quote:
-            logger.error("❌ No se pudo obtener quote")
-            return None
-        
-        logger.debug(f"Quote received: inAmount={quote.get('inAmount')}, outAmount={quote.get('outAmount')}")
-        
-        # 2. Obtener transacción
-        swap_tx = await get_jupiter_swap_tx(quote)
-        if not swap_tx:
-            logger.error("❌ No se pudo obtener swap transaction")
-            return None
-        
-        logger.debug("Swap transaction received")
-        
-        # 3. DRY RUN check
-        if config.DRY_RUN:
-            logger.info("🧪 [DRY RUN] Swap simulado exitosamente")
-            return f"dry-run-{int(time.time())}"
-        
-        # 4. Enviar con Jito o método estándar
-        if config.USE_JITO:
-            logger.debug("Attempting Jito bundle...")
-            bundle_id = await send_jito_bundle(swap_tx)
-            if bundle_id:
-                return bundle_id
-            logger.warning("⚠️ Jito falló, usando método estándar")
-        
-        # 5. Método estándar (fallback)
-        logger.debug("Using standard transaction method...")
+    max_retries = 2
+    
+    for attempt in range(max_retries):
         try:
-            tx_bytes = base64.b64decode(swap_tx)
-            tx = VersionedTransaction.from_bytes(tx_bytes)
+            # 1. Obtener quote
+            if attempt > 0:
+                logger.info(f"🔄 Retry {attempt + 1}/{max_retries}")
+                await asyncio.sleep(2)
             
-            signature = state.wallet.sign_message(bytes(tx.message))
-            signed_tx = VersionedTransaction.populate(tx.message, [signature])
+            logger.debug(f"Requesting quote: {amount_lamports} lamports")
             
-            result = await state.solana_client.send_raw_transaction(
-                bytes(signed_tx),
-                opts=TxOpts(skip_preflight=False, preflight_commitment=Processed)
-            )
+            quote = await get_jupiter_quote(input_mint, output_mint, amount_lamports)
+            if not quote:
+                if attempt < max_retries - 1:
+                    continue
+                logger.error("❌ No se pudo obtener quote después de reintentos")
+                return None
             
-            sig = result.value
-            logger.info(f"✅ Swap estándar: {sig}")
-            return str(sig)
+            out_amount = quote.get('outAmount', 'unknown')
+            logger.info(f"📊 Quote: {amount_lamports} lamports -> {out_amount} tokens")
             
+            # 2. Obtener transacción
+            swap_tx = await get_jupiter_swap_tx(quote)
+            if not swap_tx:
+                if attempt < max_retries - 1:
+                    continue
+                logger.error("❌ No se pudo obtener swap transaction")
+                return None
+            
+            # 3. DRY RUN check
+            if config.DRY_RUN:
+                logger.info("🧪 [DRY RUN] Swap simulado exitosamente")
+                await send_telegram(
+                    f"🧪 <b>[DRY RUN] Trade Simulado</b>\n\n"
+                    f"Input: {amount_lamports} lamports\n"
+                    f"Output: {out_amount} tokens\n"
+                    f"Slippage: {config.SLIPPAGE_BPS} BPS\n\n"
+                    f"✅ Quote obtenido correctamente"
+                )
+                return f"dry-run-{int(time.time())}"
+            
+            # 4. Enviar con Jito o método estándar
+            if config.USE_JITO:
+                logger.debug("Attempting Jito bundle...")
+                bundle_id = await send_jito_bundle(swap_tx)
+                if bundle_id:
+                    return bundle_id
+                logger.warning("⚠️ Jito falló, usando método estándar")
+            
+            # 5. Método estándar (fallback)
+            logger.debug("Using standard transaction method...")
+            try:
+                tx_bytes = base64.b64decode(swap_tx)
+                tx = VersionedTransaction.from_bytes(tx_bytes)
+                
+                signature = state.wallet.sign_message(bytes(tx.message))
+                signed_tx = VersionedTransaction.populate(tx.message, [signature])
+                
+                result = await state.solana_client.send_raw_transaction(
+                    bytes(signed_tx),
+                    opts=TxOpts(skip_preflight=False, preflight_commitment=Processed)
+                )
+                
+                sig = result.value
+                logger.info(f"✅ Swap estándar: {sig}")
+                return str(sig)
+                
+            except Exception as e:
+                logger.error(f"❌ Error swap estándar: {e}")
+                state.stats['rpc_errors'] += 1
+                if attempt < max_retries - 1:
+                    continue
+                return None
+                
         except Exception as e:
-            logger.error(f"❌ Error swap estándar: {e}")
-            state.stats['rpc_errors'] += 1
+            logger.error(f"❌ Error en execute_swap (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                continue
             return None
-            
-    except Exception as e:
-        logger.error(f"❌ Error general en execute_swap: {e}")
-        return None
+    
+    return None
 
 # ═══════════════════════════════════════════════════════════════
 # TRADING LOGIC
@@ -665,26 +731,59 @@ def has_buy_signal(token: TokenData) -> Tuple[bool, float]:
     """
     score = 0
     
-    # Filtros básicos
+    # Filtros básicos CRÍTICOS
     if token.liquidity < config.MIN_LIQUIDITY_USD:
         return False, 0
     
     if token.volume_24h < config.MIN_VOLUME_24H_USD:
         return False, 0
     
-    # Señales de momentum
-    if token.price_change_5m >= config.MIN_PRICE_CHANGE_5M:
-        score += 30
-    
-    if token.price_change_1h >= config.MIN_PRICE_CHANGE_1H:
-        score += 30
-    
-    # Evitar pumps excesivos
-    if token.price_change_1h > config.MAX_PRICE_CHANGE_1H:
+    # Validar que tenga precio válido
+    if token.price_usd <= 0:
         return False, 0
     
+    # Evitar tokens con liquidez muy baja vs volumen (posible pump dump)
+    if token.volume_24h > 0 and token.liquidity > 0:
+        volume_to_liq_ratio = token.volume_24h / token.liquidity
+        if volume_to_liq_ratio > 50:  # Volumen 50x mayor que liquidez = riesgo
+            logger.debug(f"{token.symbol}: Volume/Liq ratio too high ({volume_to_liq_ratio:.1f})")
+            return False, 0
+    
+    # Señales de momentum
+    if token.price_change_5m >= config.MIN_PRICE_CHANGE_5M:
+        score += min(30, token.price_change_5m * 3)
+    else:
+        return False, 0  # Momentum 5m es obligatorio
+    
+    if token.price_change_1h >= config.MIN_PRICE_CHANGE_1H:
+        score += min(30, token.price_change_1h * 2)
+    else:
+        return False, 0  # Momentum 1h es obligatorio
+    
+    # Evitar pumps excesivos (probablemente tarde para entrar)
+    if token.price_change_1h > config.MAX_PRICE_CHANGE_1H:
+        logger.debug(f"{token.symbol}: Price change too high ({token.price_change_1h:.1f}%)")
+        return False, 0
+    
+    # Bonus por buena liquidez
+    if token.liquidity > config.MIN_LIQUIDITY_USD * 2:
+        score += 10
+    
+    # Bonus por alto volumen
+    if token.volume_24h > config.MIN_VOLUME_24H_USD * 2:
+        score += 10
+    
+    # Bonus por tendencia 24h positiva
+    if token.price_change_24h > 0:
+        score += 10
+    
     # Score mínimo para señal
-    return score >= 40, score
+    min_score = 50
+    
+    if score >= min_score:
+        logger.debug(f"{token.symbol}: BUY SIGNAL | Score: {score:.0f} | 5m: {token.price_change_5m:+.1f}% | 1h: {token.price_change_1h:+.1f}%")
+    
+    return score >= min_score, score
 
 async def buy_token(token: TokenData):
     """Ejecutar compra de token"""
@@ -798,14 +897,12 @@ async def sell_token(position: Position, current_price: float, reason: str, exit
     await send_telegram(message)
     logger.info(f"✅ Venta completada: {position.symbol} ({pnl:+.2f}%)")
 
-async def monitor_position(position: Position):
+async def monitor_position(position: Position, current_price: float):
     """Monitorear y gestionar una posición abierta"""
     
-    # Obtener precio actual
-    current_price = await get_token_price(position.mint)
-    
+    # Validar precio
     if not current_price or current_price <= 0:
-        logger.debug(f"⚠️ No se pudo obtener precio de {position.symbol}")
+        logger.debug(f"⚠️ Precio inválido para {position.symbol}")
         return
     
     # Actualizar precio
@@ -813,6 +910,10 @@ async def monitor_position(position: Position):
     
     pnl = position.current_pnl(current_price)
     hold_time = position.hold_time_minutes()
+    
+    # Log cada minuto
+    if int(hold_time) % 1 == 0:
+        logger.debug(f"{position.symbol}: ${current_price:.8f} | P&L: {pnl:+.1f}% | Hold: {hold_time:.1f}m")
     
     # ═══ EMERGENCY STOP LOSS ═══
     if pnl <= config.EMERGENCY_STOP_LOSS:
@@ -827,6 +928,8 @@ async def monitor_position(position: Position):
     
     # ═══ STOP LOSS ═══
     if pnl <= config.STOP_LOSS_PERCENT:
+        logger.info(f"🛑 Stop Loss: {position.symbol} ({pnl:.1f}%)")
+        
         SOL_MINT = 'So11111111111111111111111111111111111111112'
         amount_lamports = int(position.amount_sol * 1e9)
         
@@ -836,6 +939,8 @@ async def monitor_position(position: Position):
     
     # ═══ MAX HOLD TIME ═══
     if hold_time >= config.MAX_HOLD_TIME_MIN:
+        logger.info(f"⏰ Max Hold Time: {position.symbol} ({hold_time:.0f}min, {pnl:+.1f}%)")
+        
         SOL_MINT = 'So11111111111111111111111111111111111111112'
         amount_lamports = int(position.amount_sol * 1e9)
         
@@ -856,6 +961,8 @@ async def monitor_position(position: Position):
     if position.trailing_active:
         trailing_stop_price = position.highest_price * (1 + config.TRAILING_PERCENT / 100)
         if current_price <= trailing_stop_price:
+            logger.info(f"📉 Trailing Stop: {position.symbol} ({pnl:.1f}%)")
+            
             SOL_MINT = 'So11111111111111111111111111111111111111112'
             amount_lamports = int(position.amount_sol * 1e9)
             
@@ -865,6 +972,8 @@ async def monitor_position(position: Position):
     
     # ═══ TAKE PROFITS ═══
     if pnl >= config.TAKE_PROFIT_3 and not position.tp3_taken:
+        logger.info(f"🎯 TP3: {position.symbol} (+{pnl:.1f}%)")
+        
         SOL_MINT = 'So11111111111111111111111111111111111111112'
         amount_lamports = int(position.amount_sol * 1e9)
         
@@ -946,18 +1055,37 @@ async def scanner_loop():
             await asyncio.sleep(10)
 
 async def position_monitor_loop():
-    """Loop de monitoreo de posiciones"""
+    """Loop de monitoreo de posiciones (optimizado con batch pricing)"""
     logger.info("🔄 Position monitor iniciado")
     
     while state.running:
         try:
             if state.positions:
-                logger.debug(f"📊 Monitoreando {len(state.positions)} posiciones")
+                # Obtener todos los mints de posiciones activas
+                mints = list(state.positions.keys())
                 
-                for mint in list(state.positions.keys()):
-                    if mint in state.positions:
-                        await monitor_position(state.positions[mint])
-                        await asyncio.sleep(2)
+                if len(mints) > 0:
+                    logger.debug(f"📊 Monitoreando {len(mints)} posiciones...")
+                    
+                    # Obtener precios en batch (más eficiente)
+                    prices = await get_multiple_token_prices(mints)
+                    
+                    # Monitorear cada posición con su precio actualizado
+                    for mint in list(state.positions.keys()):
+                        if mint in state.positions:
+                            current_price = prices.get(mint)
+                            
+                            if current_price and current_price > 0:
+                                await monitor_position(state.positions[mint], current_price)
+                            else:
+                                # Fallback: obtener precio individual
+                                current_price = await get_token_price(mint)
+                                if current_price and current_price > 0:
+                                    await monitor_position(state.positions[mint], current_price)
+                                else:
+                                    logger.warning(f"⚠️ No se pudo obtener precio de {state.positions[mint].symbol}")
+                            
+                            await asyncio.sleep(1)
             
             await asyncio.sleep(config.POSITION_CHECK_SEC)
             
