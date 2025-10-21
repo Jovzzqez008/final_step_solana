@@ -1,1 +1,1 @@
-web: .py
+web: jupiter_momentum_bot.py
