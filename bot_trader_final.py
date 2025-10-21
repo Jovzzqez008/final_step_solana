@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 Forzar redeploy
 # -*- coding: utf-8 -*-
 """
 🚀 SOLANA ELITE TRADING BOT - PRODUCTION READY
