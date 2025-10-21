@@ -383,17 +383,20 @@ async def get_jupiter_quote(input_mint: str, output_mint: str, amount_lamports: 
         params = {
             'inputMint': input_mint,
             'outputMint': output_mint,
-            'amount': amount_lamports,
-            'slippageBps': config.SLIPPAGE_BPS,
-            'onlyDirectRoutes': False,
-            'maxAccounts': 64
+            'amount': str(amount_lamports),  # Convertir a string
+            'slippageBps': str(config.SLIPPAGE_BPS),  # Convertir a string
+            'onlyDirectRoutes': 'false',  # String en minúscula
+            'maxAccounts': '64'  # String
         }
         
         async with aiohttp.ClientSession() as session:
             async with session.get(config.JUPITER_QUOTE_API, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     return await resp.json()
-                logger.warning(f"Jupiter quote error: {resp.status}")
+                
+                # Log error details
+                error_text = await resp.text()
+                logger.warning(f"Jupiter quote error {resp.status}: {error_text[:200]}")
                 state.stats['api_errors'] += 1
                 return None
     except Exception as e:
@@ -500,49 +503,63 @@ async def send_jito_bundle(swap_tx_b64: str) -> Optional[str]:
 async def execute_swap(input_mint: str, output_mint: str, amount_lamports: int) -> Optional[str]:
     """Ejecutar swap con Jupiter + Jito"""
     
-    # 1. Obtener quote
-    quote = await get_jupiter_quote(input_mint, output_mint, amount_lamports)
-    if not quote:
-        logger.error("❌ No se pudo obtener quote")
-        return None
-    
-    # 2. Obtener transacción
-    swap_tx = await get_jupiter_swap_tx(quote)
-    if not swap_tx:
-        logger.error("❌ No se pudo obtener swap transaction")
-        return None
-    
-    # 3. DRY RUN check
-    if config.DRY_RUN:
-        logger.info("🧪 [DRY RUN] Swap simulado")
-        return f"dry-run-{int(time.time())}"
-    
-    # 4. Enviar con Jito o método estándar
-    if config.USE_JITO:
-        bundle_id = await send_jito_bundle(swap_tx)
-        if bundle_id:
-            return bundle_id
-        logger.warning("⚠️ Jito falló, usando método estándar")
-    
-    # 5. Método estándar (fallback)
     try:
-        tx_bytes = base64.b64decode(swap_tx)
-        tx = VersionedTransaction.from_bytes(tx_bytes)
+        # 1. Obtener quote
+        logger.debug(f"Requesting quote: {input_mint[:8]}... -> {output_mint[:8]}... ({amount_lamports} lamports)")
         
-        signature = state.wallet.sign_message(bytes(tx.message))
-        signed_tx = VersionedTransaction.populate(tx.message, [signature])
+        quote = await get_jupiter_quote(input_mint, output_mint, amount_lamports)
+        if not quote:
+            logger.error("❌ No se pudo obtener quote")
+            return None
         
-        result = await state.solana_client.send_raw_transaction(
-            bytes(signed_tx),
-            opts=TxOpts(skip_preflight=False, preflight_commitment=Processed)
-        )
+        logger.debug(f"Quote received: inAmount={quote.get('inAmount')}, outAmount={quote.get('outAmount')}")
         
-        sig = result.value
-        logger.info(f"✅ Swap estándar: {sig}")
-        return str(sig)
+        # 2. Obtener transacción
+        swap_tx = await get_jupiter_swap_tx(quote)
+        if not swap_tx:
+            logger.error("❌ No se pudo obtener swap transaction")
+            return None
         
+        logger.debug("Swap transaction received")
+        
+        # 3. DRY RUN check
+        if config.DRY_RUN:
+            logger.info("🧪 [DRY RUN] Swap simulado exitosamente")
+            return f"dry-run-{int(time.time())}"
+        
+        # 4. Enviar con Jito o método estándar
+        if config.USE_JITO:
+            logger.debug("Attempting Jito bundle...")
+            bundle_id = await send_jito_bundle(swap_tx)
+            if bundle_id:
+                return bundle_id
+            logger.warning("⚠️ Jito falló, usando método estándar")
+        
+        # 5. Método estándar (fallback)
+        logger.debug("Using standard transaction method...")
+        try:
+            tx_bytes = base64.b64decode(swap_tx)
+            tx = VersionedTransaction.from_bytes(tx_bytes)
+            
+            signature = state.wallet.sign_message(bytes(tx.message))
+            signed_tx = VersionedTransaction.populate(tx.message, [signature])
+            
+            result = await state.solana_client.send_raw_transaction(
+                bytes(signed_tx),
+                opts=TxOpts(skip_preflight=False, preflight_commitment=Processed)
+            )
+            
+            sig = result.value
+            logger.info(f"✅ Swap estándar: {sig}")
+            return str(sig)
+            
+        except Exception as e:
+            logger.error(f"❌ Error swap estándar: {e}")
+            state.stats['rpc_errors'] += 1
+            return None
+            
     except Exception as e:
-        logger.error(f"❌ Error swap estándar: {e}")
+        logger.error(f"❌ Error general en execute_swap: {e}")
         return None
 
 # ═══════════════════════════════════════════════════════════════
@@ -683,13 +700,18 @@ async def buy_token(token: TokenData):
         return
     
     # Cooldown entre trades
-    if time.time() - state.last_trade_time < 15:
+    time_since_last = time.time() - state.last_trade_time
+    if time_since_last < 15:
+        logger.debug(f"⏳ Cooldown activo ({15 - time_since_last:.0f}s restantes)")
         return
     
     logger.info(f"💰 Comprando {token.symbol} @ ${token.price_usd:.8f}")
     
     SOL_MINT = 'So11111111111111111111111111111111111111112'
     amount_lamports = int(config.TRADE_AMOUNT_SOL * 1e9)
+    
+    # Log detalles del trade
+    logger.debug(f"Trade details: {token.mint} | Amount: {amount_lamports} lamports ({config.TRADE_AMOUNT_SOL} SOL)")
     
     # Ejecutar swap
     tx_sig = await execute_swap(SOL_MINT, token.mint, amount_lamports)
@@ -721,9 +743,11 @@ async def buy_token(token: TokenData):
         f"<b>{token.name}</b> ({token.symbol})\n"
         f"💰 {config.TRADE_AMOUNT_SOL} SOL @ ${token.price_usd:.8f}\n"
         f"📊 Liq: ${token.liquidity:,.0f} | Vol24h: ${token.volume_24h:,.0f}\n"
-        f"📈 5m: {token.price_change_5m:+.1f}% | 1h: {token.price_change_1h:+.1f}%\n\n"
+        f"📈 5m: {token.price_change_5m:+.1f}% | 1h: {token.price_change_1h:+.1f}%\n"
+        f"💵 MC: ${token.market_cap:,.0f}\n\n"
         f"{'🚀 Jito' if config.USE_JITO else '⚡ Standard'}\n"
-        f"Tx: https://solscan.io/tx/{tx_sig}"
+        f"Tx: https://solscan.io/tx/{tx_sig}\n"
+        f"Token: https://solscan.io/token/{token.mint}"
     )
     
     await send_telegram(message)
