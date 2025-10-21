@@ -1,14 +1,16 @@
-// trading-bot-robust.js - PUMP.FUN BOT ESTABLE
-// ✅ Sin crashes después de despliegue
+// trading-bot-v7-SDK.js - PUMP.FUN BOT CON SDK OFICIAL
+// ✅ Usa @pump-fun/pump-sdk oficial
+// ✅ Cálculos de precio nativos y precisos
+// ✅ Trading directo sin intermediarios
+// ✅ WebSocket robusto con reconexión inteligente
 // ✅ Memory leak corregido
-// ✅ Rate limiting implementado
-// ✅ Error handling robusto
 
 require('dotenv').config();
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
-const { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, VersionedTransaction } = require('@solana/web3.js');
+const { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { PumpSdk, getBuyTokenAmountFromSolAmount, getSellSolAmountFromTokenAmount } = require('@pump-fun/pump-sdk');
 const BN = require('bn.js');
 
 // Importar bs58
@@ -33,19 +35,19 @@ const CONFIG = {
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
   DRY_RUN: process.env.DRY_RUN === 'true',
   TRADE_AMOUNT_SOL: parseFloat(process.env.TRADE_AMOUNT_SOL || '0.007'),
-  SLIPPAGE: parseFloat(process.env.SLIPPAGE || '5'),
+  SLIPPAGE: parseFloat(process.env.SLIPPAGE || '5'), // % slippage
   PRIORITY_FEE: parseFloat(process.env.PRIORITY_FEE || '0.0005'),
   
   // Filtros
   MIN_REAL_SOL: parseFloat(process.env.MIN_REAL_SOL || '0.05'),
   MIN_BUY_COUNT: parseInt(process.env.MIN_BUY_COUNT || '0'),
   MIN_K_GROWTH_PERCENT: parseFloat(process.env.MIN_K_GROWTH_PERCENT || '3'),
-  MIN_PRICE_CHANGE_PERCENT: parseFloat(process.env.MIN_PRICE_CHANGE_PERCENT || '12'),
+  MIN_PRICE_CHANGE_PERCENT: parseFloat(process.env.MIN_PRICE_CHANGE_PERCENT || '8'),
   EARLY_TIME_WINDOW: parseInt(process.env.EARLY_TIME_WINDOW || '30'),
   CONFIRMATION_TIME: parseInt(process.env.CONFIRMATION_TIME || '45'),
   
   // Timing
-  MAX_WATCH_TIME_SEC: parseInt(process.env.MAX_WATCH_TIME_SEC || '180'),
+  MAX_WATCH_TIME_SEC: parseInt(process.env.MAX_WATCH_TIME_SEC || '120'),
   MAX_CONCURRENT_POSITIONS: parseInt(process.env.MAX_CONCURRENT_POSITIONS || '3'),
   PRICE_CHECK_INTERVAL_SEC: parseInt(process.env.PRICE_CHECK_INTERVAL_SEC || '3'),
   
@@ -58,13 +60,12 @@ const CONFIG = {
   
   // RPC
   RPC_ENDPOINT: process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com',
-  PUMPPORTAL_URL: process.env.PUMPPORTAL_URL || 'https://pumpportal.fun',
-  PUMPPORTAL_API_KEY: process.env.PUMPPORTAL_API_KEY || '',
   
-  // Rate Limiting
-  MAX_WATCHLIST_SIZE: 50, // Prevenir memory leak
-  MAX_PRICE_HISTORY: 40,  // Reducido de 60
-  RPC_REQUEST_DELAY: 100, // ms entre requests
+  // Memory management
+  MAX_WATCHLIST_SIZE: 30,
+  MAX_PRICE_HISTORY: 25,
+  MIN_CHECKS_BEFORE_FILTER: 3,
+  RPC_REQUEST_DELAY: 150,
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -74,6 +75,8 @@ const CONFIG = {
 const STATE = {
   wallet: null,
   connection: null,
+  pumpSdk: null,
+  globalData: null, // Cache de global data
   bot: null,
   ws: null,
   wsReconnecting: false,
@@ -93,21 +96,11 @@ const STATE = {
 };
 
 // ═══════════════════════════════════════════════════════════════
-// LOGGER CON ROTACIÓN
+// LOGGER
 // ═══════════════════════════════════════════════════════════════
-
-const LOG_BUFFER = [];
-const MAX_LOG_BUFFER = 100;
 
 function log(level, message) {
   const timestamp = new Date().toISOString();
-  const colors = {
-    'INFO': '\x1b[36m',
-    'SUCCESS': '\x1b[32m',
-    'WARN': '\x1b[33m',
-    'ERROR': '\x1b[31m',
-    'DEBUG': '\x1b[90m'
-  };
   const emoji = {
     'INFO': 'ℹ️',
     'SUCCESS': '✅',
@@ -116,21 +109,11 @@ function log(level, message) {
     'DEBUG': '🔍'
   }[level] || 'ℹ️';
   
-  const logEntry = `[${level}] ${timestamp} ${emoji} ${message}`;
-  const color = colors[level] || '';
-  const reset = '\x1b[0m';
-  
-  console.log(`${color}${logEntry}${reset}`);
-  
-  // Buffer para debugging
-  LOG_BUFFER.push(logEntry);
-  if (LOG_BUFFER.length > MAX_LOG_BUFFER) {
-    LOG_BUFFER.shift();
-  }
+  console.log(`[${level}] ${timestamp} ${emoji} ${message}`);
 }
 
 // ═══════════════════════════════════════════════════════════════
-// UTILIDADES SEGURAS
+// UTILIDADES
 // ═══════════════════════════════════════════════════════════════
 
 function decodeBase58(str) {
@@ -139,9 +122,8 @@ function decodeBase58(str) {
       return bs58(str);
     } else if (bs58.decode) {
       return bs58.decode(str);
-    } else {
-      throw new Error('bs58 no disponible');
     }
+    throw new Error('bs58 no disponible');
   } catch (e) {
     log('ERROR', `Error decodificando base58: ${e.message}`);
     throw e;
@@ -152,7 +134,6 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// Rate limiting para RPC
 async function rateLimitedRpcCall(fn) {
   const now = Date.now();
   const timeSinceLastCall = now - STATE.lastRpcCall;
@@ -176,38 +157,33 @@ async function sendTelegram(message) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// OBTENER PRECIO CON ERROR HANDLING MEJORADO
+// PUMP SDK - OBTENER PRECIO Y DATOS DE BONDING CURVE
 // ═══════════════════════════════════════════════════════════════
 
-async function getTokenPriceFromChain(mint) {
+async function fetchBondingCurveData(mint) {
   try {
     return await rateLimitedRpcCall(async () => {
       const mintPubkey = new PublicKey(mint);
-      const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
       
-      const [bondingCurvePDA] = PublicKey.findProgramAddressSync(
-        [Buffer.from('bonding-curve'), mintPubkey.toBuffer()],
-        PUMP_PROGRAM
-      );
+      // Fetch bonding curve state
+      const { bondingCurve, bondingCurveAccountInfo } = await STATE.pumpSdk.fetchBondingCurve(mintPubkey);
       
-      const accountInfo = await STATE.connection.getAccountInfo(bondingCurvePDA);
-      
-      if (!accountInfo) {
+      if (!bondingCurve || !bondingCurveAccountInfo) {
         return null;
       }
       
-      const data = accountInfo.data;
-      
-      const virtualTokenReserves = new BN(data.slice(8, 16), 'le').toNumber();
-      const virtualSolReserves = new BN(data.slice(16, 24), 'le').toNumber();
-      const realTokenReserves = new BN(data.slice(24, 32), 'le').toNumber();
-      const realSolReserves = new BN(data.slice(32, 40), 'le').toNumber();
-      const complete = data[48] === 1;
+      // Extraer datos de la bonding curve
+      const virtualTokenReserves = bondingCurve.virtualTokenReserves.toNumber();
+      const virtualSolReserves = bondingCurve.virtualSolReserves.toNumber();
+      const realTokenReserves = bondingCurve.realTokenReserves.toNumber();
+      const realSolReserves = bondingCurve.realSolReserves.toNumber();
+      const complete = bondingCurve.complete;
       
       if (virtualTokenReserves <= 0 || virtualSolReserves <= 0) {
         return null;
       }
       
+      // Calcular precio
       const solAmount = virtualSolReserves / LAMPORTS_PER_SOL;
       const tokenAmount = virtualTokenReserves / 1e6;
       const priceSol = solAmount / tokenAmount;
@@ -224,78 +200,25 @@ async function getTokenPriceFromChain(mint) {
         complete,
         K,
         marketCap: (priceSol * 180 * 1_000_000_000),
+        bondingCurve, // Guardar para trading
+        bondingCurveAccountInfo
       };
     });
     
   } catch (error) {
     if (error.message.includes('429')) {
-      log('WARN', 'Rate limit RPC - esperando...');
-      await sleep(1000);
+      log('WARN', 'Rate limit RPC');
+      await sleep(2000);
     }
     return null;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PUMPPORTAL TRANSACTIONS CON RETRY
+// PUMP SDK - TRADING DIRECTO
 // ═══════════════════════════════════════════════════════════════
 
-async function sendPortalTransaction({ action = 'buy', mint, amount, denominatedInSol = true }, retries = 3) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const url = `${CONFIG.PUMPPORTAL_URL}/api/trade-local`;
-      const headers = { 'Content-Type': 'application/json' };
-      
-      if (CONFIG.PUMPPORTAL_API_KEY) {
-        headers['x-api-key'] = CONFIG.PUMPPORTAL_API_KEY;
-      }
-      
-      const body = {
-        publicKey: STATE.wallet.publicKey.toString(),
-        action,
-        mint,
-        denominatedInSol: denominatedInSol ? "true" : "false",
-        amount,
-        slippage: CONFIG.SLIPPAGE,
-        priorityFee: CONFIG.PRIORITY_FEE,
-        pool: 'pump'
-      };
-      
-      const response = await axios.post(url, body, {
-        headers,
-        responseType: 'arraybuffer',
-        timeout: 20000 // Aumentado de 15s
-      });
-      
-      if (response.status !== 200) {
-        throw new Error('Portal falló al generar transacción');
-      }
-      
-      const txBuf = Buffer.from(response.data);
-      const tx = VersionedTransaction.deserialize(txBuf);
-      
-      tx.sign([STATE.wallet]);
-      
-      const signature = await STATE.connection.sendRawTransaction(tx.serialize(), {
-        skipPreflight: false,
-        maxRetries: 2
-      });
-      
-      await STATE.connection.confirmTransaction(signature, 'confirmed');
-      
-      return signature;
-      
-    } catch (error) {
-      if (attempt === retries) {
-        throw error;
-      }
-      log('WARN', `Reintento ${attempt}/${retries} para ${action}: ${error.message}`);
-      await sleep(2000 * attempt);
-    }
-  }
-}
-
-async function buyToken(mint, solAmount) {
+async function buyTokenWithSDK(mint, solAmount) {
   log('INFO', `💰 Comprando ${solAmount} SOL de ${mint.slice(0, 8)}...`);
   
   if (CONFIG.DRY_RUN) {
@@ -304,23 +227,57 @@ async function buyToken(mint, solAmount) {
   }
   
   try {
-    const signature = await sendPortalTransaction({
-      action: 'buy',
-      mint,
-      amount: solAmount,
-      denominatedInSol: true
+    const mintPubkey = new PublicKey(mint);
+    const solAmountLamports = new BN(solAmount * LAMPORTS_PER_SOL);
+    
+    // Fetch global data (cache)
+    if (!STATE.globalData) {
+      STATE.globalData = await STATE.pumpSdk.fetchGlobal();
+    }
+    
+    // Fetch buy state
+    const { bondingCurveAccountInfo, bondingCurve, associatedUserAccountInfo } = 
+      await STATE.pumpSdk.fetchBuyState(mintPubkey, STATE.wallet.publicKey);
+    
+    // Calcular cantidad de tokens
+    const tokenAmount = getBuyTokenAmountFromSolAmount(
+      STATE.globalData,
+      bondingCurve,
+      solAmountLamports
+    );
+    
+    // Crear instrucciones de compra
+    const instructions = await STATE.pumpSdk.buyInstructions({
+      global: STATE.globalData,
+      bondingCurveAccountInfo,
+      bondingCurve,
+      associatedUserAccountInfo,
+      mint: mintPubkey,
+      user: STATE.wallet.publicKey,
+      solAmount: solAmountLamports,
+      amount: tokenAmount,
+      slippage: CONFIG.SLIPPAGE
     });
+    
+    // Crear y enviar transacción
+    const transaction = new Transaction().add(...instructions);
+    const signature = await sendAndConfirmTransaction(
+      STATE.connection,
+      transaction,
+      [STATE.wallet],
+      { commitment: 'confirmed' }
+    );
     
     log('SUCCESS', `✅ Compra: https://solscan.io/tx/${signature}`);
     return signature;
     
   } catch (error) {
-    log('ERROR', `❌ Error comprando: ${error.message}`);
+    log('ERROR', `Error comprando: ${error.message}`);
     throw error;
   }
 }
 
-async function sellToken(mint, percentage = 100) {
+async function sellTokenWithSDK(mint, percentage = 100) {
   log('INFO', `💸 Vendiendo ${percentage}% de ${mint.slice(0, 8)}...`);
   
   if (CONFIG.DRY_RUN) {
@@ -329,38 +286,83 @@ async function sellToken(mint, percentage = 100) {
   }
   
   try {
-    const signature = await sendPortalTransaction({
-      action: 'sell',
-      mint,
-      amount: `${percentage}%`,
-      denominatedInSol: false
+    const mintPubkey = new PublicKey(mint);
+    
+    // Fetch global data
+    if (!STATE.globalData) {
+      STATE.globalData = await STATE.pumpSdk.fetchGlobal();
+    }
+    
+    // Fetch sell state
+    const { bondingCurveAccountInfo, bondingCurve } = 
+      await STATE.pumpSdk.fetchSellState(mintPubkey, STATE.wallet.publicKey);
+    
+    // Obtener balance de tokens del usuario
+    const userTokenAccount = await STATE.connection.getTokenAccountsByOwner(
+      STATE.wallet.publicKey,
+      { mint: mintPubkey }
+    );
+    
+    if (userTokenAccount.value.length === 0) {
+      throw new Error('No token account found');
+    }
+    
+    const accountInfo = await STATE.connection.getTokenAccountBalance(
+      userTokenAccount.value[0].pubkey
+    );
+    
+    const userBalance = new BN(accountInfo.value.amount);
+    const amountToSell = userBalance.mul(new BN(percentage)).div(new BN(100));
+    
+    // Calcular SOL output
+    const solOutput = getSellSolAmountFromTokenAmount(
+      STATE.globalData,
+      bondingCurve,
+      amountToSell
+    );
+    
+    // Crear instrucciones de venta
+    const instructions = await STATE.pumpSdk.sellInstructions({
+      global: STATE.globalData,
+      bondingCurveAccountInfo,
+      bondingCurve,
+      mint: mintPubkey,
+      user: STATE.wallet.publicKey,
+      amount: amountToSell,
+      solAmount: solOutput,
+      slippage: CONFIG.SLIPPAGE
     });
+    
+    // Crear y enviar transacción
+    const transaction = new Transaction().add(...instructions);
+    const signature = await sendAndConfirmTransaction(
+      STATE.connection,
+      transaction,
+      [STATE.wallet],
+      { commitment: 'confirmed' }
+    );
     
     log('SUCCESS', `✅ Venta: https://solscan.io/tx/${signature}`);
     return signature;
     
   } catch (error) {
-    log('ERROR', `❌ Error vendiendo: ${error.message}`);
+    log('ERROR', `Error vendiendo: ${error.message}`);
     throw error;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// BUY COUNT CON TIMEOUT
+// BUY COUNT (OPCIONAL - DEXSCREENER)
 // ═══════════════════════════════════════════════════════════════
 
 async function getTokenBuyCount(mint) {
   try {
     const response = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, {
-      timeout: 5000 // Aumentado de 3s
+      timeout: 5000
     });
     
-    if (!response.data?.pairs || response.data.pairs.length === 0) {
-      return 0;
-    }
-    
-    const pair = response.data.pairs[0];
-    return pair.txns?.m5?.buys || 0;
+    if (!response.data?.pairs || response.data.pairs.length === 0) return 0;
+    return response.data.pairs[0].txns?.m5?.buys || 0;
     
   } catch (error) {
     return 0;
@@ -368,7 +370,7 @@ async function getTokenBuyCount(mint) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ANÁLISIS DE TOKENS CON MEMORY LEAK FIX
+// ANÁLISIS DE TOKENS
 // ═══════════════════════════════════════════════════════════════
 
 async function analyzeToken(mint) {
@@ -386,10 +388,10 @@ async function analyzeToken(mint) {
       return;
     }
     
-    // Obtener precio
-    const priceData = await getTokenPriceFromChain(mint);
+    // Obtener datos de bonding curve
+    const curveData = await fetchBondingCurveData(mint);
     
-    if (!priceData || !priceData.priceSol) {
+    if (!curveData || !curveData.priceSol) {
       if (watch.checksCount % 5 === 0) {
         log('DEBUG', `${watch.symbol}: Esperando datos (${elapsed.toFixed(0)}s)`);
       }
@@ -397,11 +399,18 @@ async function analyzeToken(mint) {
       return;
     }
     
-    const priceSol = priceData.priceSol;
-    const realSolLiquidity = priceData.realSolReserves || 0;
-    const K = priceData.K || 0;
+    // Si la curva está completa, ignorar
+    if (curveData.complete) {
+      log('WARN', `${watch.symbol}: Bonding curve completa - migrado a PumpSwap`);
+      STATE.watchlist.delete(mint);
+      return;
+    }
     
-    // MEMORY LEAK FIX: Limitar tamaño de historial
+    const priceSol = curveData.priceSol;
+    const realSolLiquidity = curveData.realSolReserves || 0;
+    const K = curveData.K || 0;
+    
+    // Guardar historial
     watch.priceHistory.push({ price: priceSol, K, time: now });
     if (watch.priceHistory.length > CONFIG.MAX_PRICE_HISTORY) {
       watch.priceHistory.shift();
@@ -410,15 +419,15 @@ async function analyzeToken(mint) {
     watch.lastPrice = priceSol;
     watch.realSolLiquidity = realSolLiquidity;
     watch.K = K;
+    watch.bondingCurve = curveData.bondingCurve; // Guardar para trading
+    watch.checksCount = (watch.checksCount || 0) + 1;
     
-    // Buy count con rate limiting
+    // Buy count (opcional)
     if (watch.checksCount % 3 === 0 && !watch.buyCount) {
       getTokenBuyCount(mint).then(count => {
         watch.buyCount = count;
       }).catch(() => {});
     }
-    
-    watch.checksCount = (watch.checksCount || 0) + 1;
     
     // Calcular velocidad
     const windowStart = now - CONFIG.EARLY_TIME_WINDOW * 1000;
@@ -445,7 +454,9 @@ async function analyzeToken(mint) {
     
     if (!watch.earlySignal && elapsed <= CONFIG.EARLY_TIME_WINDOW && (hasKSignal || hasPriceSignal)) {
       watch.earlySignal = true;
+      watch.signalTime = now;
       const signalType = hasKSignal ? 'K' : 'Precio';
+      
       log('SUCCESS', `[⚡ SEÑAL ${signalType}] ${watch.symbol} K+${kGrowth.toFixed(1)}% | P+${priceChange.toFixed(1)}% en ${elapsed.toFixed(0)}s`);
       
       await sendTelegram(
@@ -460,10 +471,22 @@ async function analyzeToken(mint) {
     }
     
     // Confirmación
-    const confirmKGrowth = kGrowth >= (CONFIG.MIN_K_GROWTH_PERCENT / 2);
-    const confirmPrice = priceChange >= (CONFIG.MIN_PRICE_CHANGE_PERCENT * 0.7);
-    
-    if (watch.earlySignal && elapsed >= CONFIG.CONFIRMATION_TIME && (confirmKGrowth || confirmPrice)) {
+    if (watch.earlySignal && elapsed >= CONFIG.CONFIRMATION_TIME) {
+      
+      if (watch.checksCount < CONFIG.MIN_CHECKS_BEFORE_FILTER) {
+        log('DEBUG', `${watch.symbol}: Esperando más checks (${watch.checksCount}/${CONFIG.MIN_CHECKS_BEFORE_FILTER})`);
+        return;
+      }
+      
+      const confirmKGrowth = kGrowth >= (CONFIG.MIN_K_GROWTH_PERCENT * 0.5);
+      const confirmPrice = priceChange >= (CONFIG.MIN_PRICE_CHANGE_PERCENT * 0.7);
+      
+      if (!confirmKGrowth && !confirmPrice) {
+        log('WARN', `[FILTRO] ❌ ${watch.symbol}: Perdió momentum`);
+        STATE.watchlist.delete(mint);
+        STATE.stats.filtered++;
+        return;
+      }
       
       if (realSolLiquidity < CONFIG.MIN_REAL_SOL) {
         log('WARN', `[FILTRO] ❌ ${watch.symbol}: SOL bajo (${realSolLiquidity.toFixed(2)})`);
@@ -472,7 +495,7 @@ async function analyzeToken(mint) {
         return;
       }
       
-      if ((watch.buyCount || 0) < CONFIG.MIN_BUY_COUNT) {
+      if (CONFIG.MIN_BUY_COUNT > 0 && (watch.buyCount || 0) < CONFIG.MIN_BUY_COUNT) {
         log('WARN', `[FILTRO] ❌ ${watch.symbol}: Pocas compras (${watch.buyCount || 0})`);
         STATE.watchlist.delete(mint);
         STATE.stats.filtered++;
@@ -491,12 +514,13 @@ async function analyzeToken(mint) {
     
   } catch (error) {
     log('ERROR', `Error analizando ${mint.slice(0, 8)}: ${error.message}`);
+    STATE.stats.crashes++;
   }
 }
 
 async function executeBuy(mint, watch, priceChange, elapsed) {
   try {
-    const signature = await buyToken(mint, CONFIG.TRADE_AMOUNT_SOL);
+    const signature = await buyTokenWithSDK(mint, CONFIG.TRADE_AMOUNT_SOL);
     
     STATE.positions.set(mint, {
       mint,
@@ -523,7 +547,7 @@ async function executeBuy(mint, watch, priceChange, elapsed) {
     );
     
   } catch (error) {
-    log('ERROR', `❌ Error ejecutando compra: ${error.message}`);
+    log('ERROR', `Error ejecutando compra: ${error.message}`);
   }
 }
 
@@ -534,11 +558,10 @@ async function executeBuy(mint, watch, priceChange, elapsed) {
 async function monitorPositions() {
   for (const [mint, pos] of STATE.positions.entries()) {
     try {
-      const priceData = await getTokenPriceFromChain(mint);
+      const curveData = await fetchBondingCurveData(mint);
+      if (!curveData) continue;
       
-      if (!priceData) continue;
-      
-      const currentPrice = priceData.priceSol;
+      const currentPrice = curveData.priceSol;
       const pnlPercent = ((currentPrice - pos.entryPrice) / pos.entryPrice) * 100;
       const holdTime = (Date.now() - pos.entryTime) / 1000 / 60;
       
@@ -548,7 +571,7 @@ async function monitorPositions() {
       
       if (!pos.trailingActive && pnlPercent >= CONFIG.TRAILING_ACTIVATION) {
         pos.trailingActive = true;
-        log('INFO', `🛡️ Trailing activado ${pos.symbol}`);
+        log('INFO', `🛡️ Trailing activado ${pos.symbol} (+${pnlPercent.toFixed(1)}%)`);
       }
       
       let shouldSell = false;
@@ -591,7 +614,7 @@ async function monitorPositions() {
 
 async function executeSell(mint, pos, percentage, reason, pnlPercent) {
   try {
-    const signature = await sellToken(mint, percentage);
+    const signature = await sellTokenWithSDK(mint, percentage);
     
     const isFullExit = percentage === 100;
     
@@ -613,94 +636,156 @@ async function executeSell(mint, pos, percentage, reason, pnlPercent) {
     }
     
   } catch (error) {
-    log('ERROR', `❌ Error vendiendo: ${error.message}`);
+    log('ERROR', `Error vendiendo: ${error.message}`);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// WEBSOCKET CON RECONEXIÓN SEGURA
+// WEBSOCKET
 // ═══════════════════════════════════════════════════════════════
 
+let wsReconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+
 function setupWebSocket() {
-  if (STATE.wsReconnecting) {
-    log('WARN', 'Ya hay reconexión en progreso');
-    return;
-  }
-  
   if (STATE.ws) {
     try {
+      STATE.ws.removeAllListeners();
       STATE.ws.close();
+      STATE.ws = null;
     } catch (e) {}
   }
   
-  STATE.ws = new WebSocket('wss://pumpportal.fun/api/data');
+  if (STATE.wsReconnecting) {
+    setTimeout(() => {
+      STATE.wsReconnecting = false;
+    }, 30000);
+  }
   
-  STATE.ws.on('open', () => {
-    log('SUCCESS', '✅ WebSocket conectado');
-    STATE.wsReconnecting = false;
-    STATE.ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
-    log('INFO', '📡 Suscrito a tokens nuevos');
-  });
+  log('INFO', `📡 Conectando WebSocket... (intento ${wsReconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})`);
   
-  STATE.ws.on('message', async (data) => {
-    try {
-      const msg = JSON.parse(data.toString());
-      
-      if (msg.txType === 'create' || msg.mint) {
-        const mint = msg.mint || msg.token;
-        const name = msg.name || msg.tokenName || 'Unknown';
-        const symbol = msg.symbol || msg.tokenSymbol || 'UNKNOWN';
-        
-        if (STATE.watchlist.has(mint)) return;
-        
-        // MEMORY LEAK FIX: Limitar watchlist
-        if (STATE.watchlist.size >= CONFIG.MAX_WATCHLIST_SIZE) {
-          // Eliminar el más antiguo
-          const oldestMint = STATE.watchlist.keys().next().value;
-          STATE.watchlist.delete(oldestMint);
-          log('DEBUG', `Watchlist llena - eliminando ${oldestMint.slice(0, 8)}`);
-        }
-        
-        STATE.stats.detected++;
-        
-        log('SUCCESS', `🆕 ${name} (${symbol}) - ${mint.slice(0, 8)}...`);
-        
-        STATE.watchlist.set(mint, {
-          mint,
-          name,
-          symbol,
-          firstSeen: Date.now(),
-          priceHistory: [],
-          buyCount: 0,
-          realSolLiquidity: 0,
-          K: 0,
-          lastPrice: 0,
-          earlySignal: false,
-          checksCount: 0
-        });
-        
-        STATE.stats.analyzing = STATE.watchlist.size;
-      }
-    } catch (error) {
-      log('ERROR', `Error WS message: ${error.message}`);
-    }
-  });
-  
-  STATE.ws.on('error', (error) => {
-    log('ERROR', `WebSocket error: ${error.message}`);
-  });
-  
-  STATE.ws.on('close', () => {
-    log('WARN', '⚠️ WebSocket cerrado');
+  try {
+    STATE.ws = new WebSocket('wss://pumpportal.fun/api/data');
     
-    if (!STATE.wsReconnecting) {
-      STATE.wsReconnecting = true;
-      log('INFO', '🔄 Reconectando en 5s...');
-      setTimeout(() => {
-        setupWebSocket();
-      }, 5000);
+    const connectionTimeout = setTimeout(() => {
+      if (STATE.ws.readyState !== WebSocket.OPEN) {
+        log('ERROR', 'WebSocket timeout (10s)');
+        STATE.ws.close();
+      }
+    }, 10000);
+    
+    STATE.ws.on('open', () => {
+      clearTimeout(connectionTimeout);
+      wsReconnectAttempts = 0;
+      STATE.wsReconnecting = false;
+      
+      log('SUCCESS', '✅ WebSocket conectado');
+      
+      try {
+        STATE.ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
+        log('INFO', '📡 Suscrito a tokens nuevos');
+      } catch (e) {
+        log('ERROR', `Error suscribiendo: ${e.message}`);
+      }
+    });
+    
+    STATE.ws.on('message', async (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        
+        if (msg.txType === 'create' || msg.mint) {
+          const mint = msg.mint || msg.token;
+          const name = msg.name || msg.tokenName || 'Unknown';
+          const symbol = msg.symbol || msg.tokenSymbol || 'UNKNOWN';
+          
+          if (STATE.watchlist.has(mint)) return;
+          
+          // Limitar watchlist - eliminar tokens sin señal
+          if (STATE.watchlist.size >= CONFIG.MAX_WATCHLIST_SIZE) {
+            let oldestMint = null;
+            let oldestTime = Date.now();
+            
+            for (const [m, w] of STATE.watchlist.entries()) {
+              if (!w.earlySignal && w.firstSeen < oldestTime) {
+                oldestTime = w.firstSeen;
+                oldestMint = m;
+              }
+            }
+            
+            if (oldestMint) {
+              STATE.watchlist.delete(oldestMint);
+              log('DEBUG', `Watchlist llena - eliminando ${oldestMint.slice(0, 8)} (sin señal)`);
+            }
+          }
+          
+          STATE.stats.detected++;
+          
+          log('SUCCESS', `🆕 ${name} (${symbol}) - ${mint.slice(0, 8)}...`);
+          
+          STATE.watchlist.set(mint, {
+            mint,
+            name,
+            symbol,
+            firstSeen: Date.now(),
+            priceHistory: [],
+            buyCount: 0,
+            realSolLiquidity: 0,
+            K: 0,
+            lastPrice: 0,
+            earlySignal: false,
+            checksCount: 0,
+            bondingCurve: null
+          });
+          
+          STATE.stats.analyzing = STATE.watchlist.size;
+        }
+      } catch (error) {
+        log('ERROR', `Error WS message: ${error.message}`);
+      }
+    });
+    
+    STATE.ws.on('error', (error) => {
+      log('ERROR', `WebSocket error: ${error.message}`);
+      clearTimeout(connectionTimeout);
+    });
+    
+    STATE.ws.on('close', (code, reason) => {
+      clearTimeout(connectionTimeout);
+      log('WARN', `⚠️ WebSocket cerrado (code: ${code})`);
+      
+      wsReconnectAttempts++;
+      
+      if (wsReconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+        log('ERROR', '❌ Max intentos alcanzados - Esperando 5 min');
+        wsReconnectAttempts = 0;
+        setTimeout(() => {
+          STATE.wsReconnecting = false;
+          setupWebSocket();
+        }, 300000);
+        return;
+      }
+      
+      if (!STATE.wsReconnecting) {
+        STATE.wsReconnecting = true;
+        const delay = Math.min(5000 * wsReconnectAttempts, 30000);
+        log('INFO', `🔄 Reconectando en ${delay / 1000}s...`);
+        
+        setTimeout(() => {
+          STATE.wsReconnecting = false;
+          setupWebSocket();
+        }, delay);
+      }
+    });
+    
+  } catch (error) {
+    log('ERROR', `Error creando WebSocket: ${error.message}`);
+    STATE.wsReconnecting = false;
+    
+    wsReconnectAttempts++;
+    if (wsReconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+      setTimeout(setupWebSocket, 10000);
     }
-  });
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -716,9 +801,7 @@ function setupTelegramBot() {
   try {
     STATE.bot = new TelegramBot(CONFIG.TELEGRAM_BOT_TOKEN, { 
       polling: true,
-      polling_options: {
-        timeout: 10
-      }
+      polling_options: { timeout: 10 }
     });
     
     STATE.bot.on('polling_error', (error) => {
@@ -727,28 +810,47 @@ function setupTelegramBot() {
     
     STATE.bot.onText(/\/start/, (msg) => {
       STATE.bot.sendMessage(msg.chat.id,
-        `🤖 <b>Pump.fun Trading Bot</b>\n\n` +
+        `🤖 <b>Pump.fun Bot v7.0 - SDK Oficial</b>\n\n` +
         `<b>Comandos:</b>\n` +
         `/status - Estado del bot\n` +
         `/stats - Estadísticas\n` +
         `/positions - Posiciones activas\n` +
         `/watchlist - Tokens en análisis\n` +
-        `/logs - Últimos logs`,
+        `/reconnect - Reconectar WebSocket\n` +
+        `/refresh - Actualizar global data`,
         { parse_mode: 'HTML' }
       );
+    });
+    
+    STATE.bot.onText(/\/reconnect/, (msg) => {
+      log('INFO', 'Reconexión manual solicitada');
+      wsReconnectAttempts = 0;
+      STATE.wsReconnecting = false;
+      setupWebSocket();
+      STATE.bot.sendMessage(msg.chat.id, '🔄 Reconectando WebSocket...');
+    });
+    
+    STATE.bot.onText(/\/refresh/, async (msg) => {
+      try {
+        STATE.globalData = await STATE.pumpSdk.fetchGlobal();
+        STATE.bot.sendMessage(msg.chat.id, '✅ Global data actualizado');
+      } catch (e) {
+        STATE.bot.sendMessage(msg.chat.id, `❌ Error: ${e.message}`);
+      }
     });
     
     STATE.bot.onText(/\/status/, async (msg) => {
       try {
         const balance = await STATE.connection.getBalance(STATE.wallet.publicKey) / LAMPORTS_PER_SOL;
-        const wsStatus = STATE.ws?.readyState === WebSocket.OPEN ? '✅' : '❌';
+        const wsStatus = STATE.ws?.readyState === WebSocket.OPEN ? '✅ OK' : '❌ FAIL';
+        const wsAttempts = wsReconnectAttempts > 0 ? ` (${wsReconnectAttempts} intentos)` : '';
         
         STATE.bot.sendMessage(msg.chat.id,
-          `📊 <b>Estado</b>\n\n` +
+          `📊 <b>Estado v7.0</b>\n\n` +
           `💰 Balance: ${balance.toFixed(4)} SOL\n` +
           `📈 Posiciones: ${STATE.positions.size}/${CONFIG.MAX_CONCURRENT_POSITIONS}\n` +
           `👀 Analizando: ${STATE.watchlist.size}/${CONFIG.MAX_WATCHLIST_SIZE}\n` +
-          `🌐 WS: ${wsStatus}\n` +
+          `🌐 WS: ${wsStatus}${wsAttempts}\n` +
           `🎯 ${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}\n\n` +
           `🆕 Detectados: ${STATE.stats.detected}\n` +
           `🚫 Filtrados: ${STATE.stats.filtered}\n` +
@@ -821,11 +923,6 @@ function setupTelegramBot() {
       STATE.bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
     });
     
-    STATE.bot.onText(/\/logs/, (msg) => {
-      const recentLogs = LOG_BUFFER.slice(-20).join('\n');
-      STATE.bot.sendMessage(msg.chat.id, `<code>${recentLogs}</code>`, { parse_mode: 'HTML' });
-    });
-    
     log('SUCCESS', '✅ Telegram configurado');
     
   } catch (error) {
@@ -834,13 +931,13 @@ function setupTelegramBot() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SETUP WALLET
+// SETUP
 // ═══════════════════════════════════════════════════════════════
 
 async function setupWallet() {
   try {
     if (!CONFIG.WALLET_PRIVATE_KEY) {
-      throw new Error('WALLET_PRIVATE_KEY no configurada en .env');
+      throw new Error('WALLET_PRIVATE_KEY no configurada');
     }
     
     const privateKeyBytes = decodeBase58(CONFIG.WALLET_PRIVATE_KEY);
@@ -850,12 +947,24 @@ async function setupWallet() {
     STATE.connection = new Connection(CONFIG.RPC_ENDPOINT, 'confirmed');
     log('INFO', `🌐 RPC: ${CONFIG.RPC_ENDPOINT}`);
     
+    // Inicializar Pump SDK
+    STATE.pumpSdk = new PumpSdk(STATE.connection);
+    log('SUCCESS', '✅ Pump SDK inicializado');
+    
+    // Fetch global data inicial
+    try {
+      STATE.globalData = await STATE.pumpSdk.fetchGlobal();
+      log('SUCCESS', '✅ Global data cargado');
+    } catch (e) {
+      log('WARN', `⚠️ No se pudo cargar global data: ${e.message}`);
+    }
+    
     try {
       const balance = await STATE.connection.getBalance(STATE.wallet.publicKey);
       log('SUCCESS', `💰 Balance: ${(balance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
       
       if (balance === 0) {
-        log('WARN', '⚠️ Balance en 0 - Necesitas SOL para operar');
+        log('WARN', '⚠️ Balance en 0');
       }
     } catch (error) {
       log('WARN', `⚠️ No se pudo verificar balance: ${error.message}`);
@@ -863,13 +972,13 @@ async function setupWallet() {
     
     return true;
   } catch (error) {
-    log('ERROR', `❌ Error setup wallet: ${error.message}`);
+    log('ERROR', `Error setup wallet: ${error.message}`);
     return false;
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// LOOPS CON ERROR HANDLING ROBUSTO
+// LOOPS
 // ═══════════════════════════════════════════════════════════════
 
 async function watchlistLoop() {
@@ -894,7 +1003,7 @@ async function watchlistLoop() {
       await sleep(CONFIG.PRICE_CHECK_INTERVAL_SEC * 1000);
       
     } catch (error) {
-      log('ERROR', `Error crítico en watchlist loop: ${error.message}`);
+      log('ERROR', `Error watchlist loop: ${error.message}`);
       STATE.stats.crashes++;
       await sleep(5000);
     }
@@ -913,26 +1022,30 @@ async function positionsLoop() {
       await sleep(5000);
       
     } catch (error) {
-      log('ERROR', `Error crítico en positions loop: ${error.message}`);
+      log('ERROR', `Error positions loop: ${error.message}`);
       STATE.stats.crashes++;
       await sleep(5000);
     }
   }
 }
 
-// Health check loop
 async function healthCheckLoop() {
+  log('INFO', '🔄 Health check iniciado');
+  
   while (true) {
-    await sleep(60000); // Cada minuto
+    await sleep(60000);
     
     try {
-      // Verificar WebSocket
-      if (!STATE.ws || STATE.ws.readyState !== WebSocket.OPEN) {
+      const wsStatus = STATE.ws?.readyState === WebSocket.OPEN ? 'OK' : 'FAIL';
+      log('INFO', `💓 Health: WS=${wsStatus} | Watch=${STATE.watchlist.size} | Pos=${STATE.positions.size}`);
+      
+      if (wsStatus === 'FAIL' && !STATE.wsReconnecting) {
         log('WARN', '⚠️ WebSocket caído - Reconectando...');
+        wsReconnectAttempts = 0;
         setupWebSocket();
       }
       
-      // Limpiar watchlist de tokens estancados
+      // Limpiar watchlist estancada
       const now = Date.now();
       for (const [mint, watch] of STATE.watchlist.entries()) {
         const elapsed = (now - watch.firstSeen) / 1000;
@@ -942,11 +1055,18 @@ async function healthCheckLoop() {
         }
       }
       
-      // Log de salud
-      log('INFO', `💓 Health: WS=${STATE.ws?.readyState === WebSocket.OPEN ? 'OK' : 'FAIL'} | Watch=${STATE.watchlist.size} | Pos=${STATE.positions.size}`);
+      // Refrescar global data cada hora
+      if (Date.now() % 3600000 < 60000) {
+        try {
+          STATE.globalData = await STATE.pumpSdk.fetchGlobal();
+          log('DEBUG', 'Global data actualizado');
+        } catch (e) {
+          log('WARN', `No se pudo actualizar global data: ${e.message}`);
+        }
+      }
       
     } catch (error) {
-      log('ERROR', `Error en health check: ${error.message}`);
+      log('ERROR', `Error health check: ${error.message}`);
     }
   }
 }
@@ -958,7 +1078,7 @@ async function healthCheckLoop() {
 async function main() {
   console.log('\n');
   log('INFO', '═══════════════════════════════════════════════════════════════');
-  log('INFO', '🚀 PUMP.FUN TRADING BOT v5.0 - ROBUST EDITION');
+  log('INFO', '🚀 PUMP.FUN BOT v7.0 - PUMP SDK OFICIAL');
   log('INFO', '═══════════════════════════════════════════════════════════════');
   console.log('\n');
   
@@ -973,7 +1093,7 @@ async function main() {
   setupTelegramBot();
   setupWebSocket();
   
-  await sleep(3000);
+  await sleep(5000);
   
   console.log('\n');
   log('SUCCESS', '═══════════════════════════════════════════════════════════════');
@@ -981,46 +1101,37 @@ async function main() {
   log('SUCCESS', '═══════════════════════════════════════════════════════════════');
   console.log('\n');
   
-  log('INFO', `⚡ K Growth mínimo: +${CONFIG.MIN_K_GROWTH_PERCENT}% en ${CONFIG.EARLY_TIME_WINDOW}s`);
-  log('INFO', `📈 Precio mínimo: +${CONFIG.MIN_PRICE_CHANGE_PERCENT}% en ${CONFIG.EARLY_TIME_WINDOW}s`);
+  log('INFO', `⚡ K Growth: +${CONFIG.MIN_K_GROWTH_PERCENT}% | Precio: +${CONFIG.MIN_PRICE_CHANGE_PERCENT}%`);
   log('INFO', `✅ Confirmación: ${CONFIG.CONFIRMATION_TIME}s`);
   log('INFO', `💰 SOL mínimo: ${CONFIG.MIN_REAL_SOL}`);
   log('INFO', `🛒 Buys mínimas: ${CONFIG.MIN_BUY_COUNT}`);
   log('INFO', `📊 Max posiciones: ${CONFIG.MAX_CONCURRENT_POSITIONS}`);
-  log('INFO', `🔬 Max watchlist: ${CONFIG.MAX_WATCHLIST_SIZE}`);
-  log('INFO', `🔬 Método: Bonding curve directa + Rate limiting`);
+  log('INFO', `🔬 Método: Pump SDK Oficial`);
   console.log('\n');
   
   await sendTelegram(
-    `🚀 <b>Bot Iniciado - v5.0 Robust</b>\n\n` +
-    `${CONFIG.DRY_RUN ? '🧪 DRY RUN MODE' : '💰 MODO REAL'}\n\n` +
-    `💰 ${CONFIG.TRADE_AMOUNT_SOL} SOL por trade\n` +
+    `🚀 <b>Bot v7.0 - Pump SDK Oficial</b>\n\n` +
+    `${CONFIG.DRY_RUN ? '🧪 DRY RUN' : '💰 REAL'}\n\n` +
+    `💰 ${CONFIG.TRADE_AMOUNT_SOL} SOL/trade\n` +
     `📊 Max: ${CONFIG.MAX_CONCURRENT_POSITIONS} posiciones\n\n` +
     `<b>Filtros:</b>\n` +
-    `⚡ K Growth: +${CONFIG.MIN_K_GROWTH_PERCENT}%\n` +
-    `📈 Precio: +${CONFIG.MIN_PRICE_CHANGE_PERCENT}%\n` +
-    `💵 SOL mínimo: ${CONFIG.MIN_REAL_SOL}\n` +
-    `🛒 Buys mínimas: ${CONFIG.MIN_BUY_COUNT}\n\n` +
-    `<b>Protección:</b>\n` +
-    `🛑 Hard Stop: ${CONFIG.HARD_STOP_LOSS}%\n` +
-    `⚡ Quick Stop: ${CONFIG.QUICK_STOP}%\n` +
-    `🛡️ Trailing: ${CONFIG.TRAILING_PERCENT}%\n` +
-    `🎯 Take Profit: ${CONFIG.TAKE_PROFIT_1}%\n\n` +
-    `<b>Mejoras v5.0:</b>\n` +
-    `✅ Memory leak corregido\n` +
-    `✅ Rate limiting RPC\n` +
-    `✅ Health check automático\n` +
-    `✅ Error recovery robusto`
+    `⚡ K: +${CONFIG.MIN_K_GROWTH_PERCENT}% | Precio: +${CONFIG.MIN_PRICE_CHANGE_PERCENT}%\n` +
+    `💵 SOL: ${CONFIG.MIN_REAL_SOL} | Buys: ${CONFIG.MIN_BUY_COUNT}\n\n` +
+    `<b>v7.0 Features:</b>\n` +
+    `✅ Pump SDK oficial @pump-fun/pump-sdk\n` +
+    `✅ Trading directo sin PumpPortal\n` +
+    `✅ Cálculos nativos de bonding curve\n` +
+    `✅ WebSocket robusto con auto-recovery\n` +
+    `✅ Memory management optimizado`
   );
   
-  // Iniciar todos los loops
-  watchlistLoop().catch(e => log('ERROR', `Watchlist loop crashed: ${e.message}`));
-  positionsLoop().catch(e => log('ERROR', `Positions loop crashed: ${e.message}`));
-  healthCheckLoop().catch(e => log('ERROR', `Health check loop crashed: ${e.message}`));
+  watchlistLoop().catch(e => log('ERROR', `Watchlist crashed: ${e.message}`));
+  positionsLoop().catch(e => log('ERROR', `Positions crashed: ${e.message}`));
+  healthCheckLoop().catch(e => log('ERROR', `Health check crashed: ${e.message}`));
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SHUTDOWN HANDLERS
+// SHUTDOWN
 // ═══════════════════════════════════════════════════════════════
 
 let isShuttingDown = false;
@@ -1029,41 +1140,19 @@ async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   
-  log('WARN', `🛑 ${signal} recibido - Cerrando gracefully...`);
+  log('WARN', `🛑 ${signal} recibido`);
   
   try {
-    // Cerrar WebSocket
     if (STATE.ws) {
+      STATE.ws.removeAllListeners();
       STATE.ws.close();
     }
     
-    // Vender todas las posiciones si no es DRY_RUN
-    if (!CONFIG.DRY_RUN && STATE.positions.size > 0) {
-      log('INFO', `💸 Vendiendo ${STATE.positions.size} posiciones...`);
-      
-      for (const [mint, pos] of STATE.positions.entries()) {
-        try {
-          await sellToken(mint, 100);
-          log('SUCCESS', `✅ Vendido ${pos.symbol}`);
-        } catch (e) {
-          log('ERROR', `Error vendiendo ${pos.symbol}: ${e.message}`);
-        }
-      }
-    }
-    
-    await sendTelegram(
-      `🛑 <b>Bot Detenido (${signal})</b>\n\n` +
-      `📊 Estadísticas finales:\n` +
-      `Trades: ${STATE.stats.totalTrades}\n` +
-      `Wins: ${STATE.stats.wins}\n` +
-      `Losses: ${STATE.stats.losses}\n` +
-      `P&L: ${STATE.stats.totalPnl > 0 ? '+' : ''}${STATE.stats.totalPnl.toFixed(2)}%`
-    );
-    
+    await sendTelegram(`🛑 <b>Bot Detenido (${signal})</b>`);
     await sleep(2000);
     
   } catch (error) {
-    log('ERROR', `Error en shutdown: ${error.message}`);
+    log('ERROR', `Error shutdown: ${error.message}`);
   } finally {
     process.exit(0);
   }
@@ -1072,17 +1161,14 @@ async function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-process.on('unhandledRejection', (reason, promise) => {
+process.on('unhandledRejection', (reason) => {
   log('ERROR', `Unhandled Rejection: ${reason}`);
   STATE.stats.crashes++;
 });
 
 process.on('uncaughtException', (error) => {
   log('ERROR', `Uncaught Exception: ${error.message}`);
-  log('ERROR', error.stack);
   STATE.stats.crashes++;
-  
-  // No cerrar el bot, intentar recuperarse
   sendTelegram(`⚠️ <b>Error Recuperado</b>\n\n${error.message}`);
 });
 
@@ -1091,8 +1177,7 @@ process.on('uncaughtException', (error) => {
 // ═══════════════════════════════════════════════════════════════
 
 main().catch(error => {
-  log('ERROR', `❌ Error fatal en main: ${error.message}`);
-  log('ERROR', error.stack);
+  log('ERROR', `Error fatal: ${error.message}`);
   sendTelegram(`❌ <b>Error Fatal</b>\n\n${error.message}`).finally(() => {
     process.exit(1);
   });
