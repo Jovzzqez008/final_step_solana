@@ -1,4 +1,4 @@
-#!/usr/bin/env python3 Forzar redeploy
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 🚀 SOLANA ELITE TRADING BOT - PRODUCTION READY
@@ -118,7 +118,11 @@ class Config:
     JUPITER_QUOTE_API: str = 'https://quote-api.jup.ag/v6/quote'
     JUPITER_SWAP_API: str = 'https://quote-api.jup.ag/v6/swap'
     JUPITER_PRICE_API: str = 'https://api.jup.ag/price/v2'
-    JUPITER_TOKENS_API: str = 'https://tokens.jup.ag/tokens'
+    JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
+    
+    # Categorías disponibles: toporganicscore, toptraded, toptrending
+    JUPITER_SCAN_CATEGORY: str = os.getenv('JUPITER_SCAN_CATEGORY', 'toporganicscore')
+    JUPITER_SCAN_INTERVAL: str = os.getenv('JUPITER_SCAN_INTERVAL', '5m')  # 5m, 1h, 6h, 24h
     
     # ═══ FILTROS DE SEÑALES ═══
     MIN_LIQUIDITY_USD: float = float(os.getenv('MIN_LIQUIDITY_USD', '10000'))
@@ -546,25 +550,95 @@ async def execute_swap(input_mint: str, output_mint: str, amount_lamports: int) 
 # ═══════════════════════════════════════════════════════════════
 
 async def scan_for_signals() -> List[TokenData]:
-    """Escanear tokens buscando señales de trading"""
-    # NOTA: Aquí deberías integrar con tu fuente de datos preferida
-    # Por ejemplo: Jupiter tokens API, DexScreener, Birdeye, etc.
-    
-    # Ejemplo simple usando Jupiter tokens
+    """Escanear tokens buscando señales de trading usando Jupiter Tokens API V2"""
     try:
+        # Construir URL dinámicamente
+        category = config.JUPITER_SCAN_CATEGORY
+        interval = config.JUPITER_SCAN_INTERVAL
+        url = f"{config.JUPITER_TOKENS_API}/{category}/{interval}"
+        params = {'limit': 100}
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(config.JUPITER_TOKENS_API, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    tokens = await resp.json()
-                    # Filtrar y analizar tokens
-                    candidates = []
-                    for token in tokens[:100]:  # Top 100 para performance
-                        # Aquí agregarías tu lógica de filtrado
-                        # Por ahora es un placeholder
-                        pass
-                    return candidates
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Jupiter API error: {resp.status}")
+                    state.stats['api_errors'] += 1
+                    return []
+                
+                tokens = await resp.json()
+                
+                if not isinstance(tokens, list):
+                    logger.warning("Jupiter API response format unexpected")
+                    return []
+                
+                candidates = []
+                
+                for token_data in tokens:
+                    try:
+                        mint = token_data.get('id')
+                        
+                        if not mint or mint in state.positions:
+                            continue
+                        
+                        # Extraer datos del token
+                        symbol = token_data.get('symbol', 'UNKNOWN')
+                        name = token_data.get('name', 'Unknown')
+                        price_usd = float(token_data.get('usdPrice', 0) or 0)
+                        liquidity = float(token_data.get('liquidity', 0) or 0)
+                        market_cap = float(token_data.get('mcap', 0) or 0)
+                        
+                        # Stats 5m
+                        stats_5m = token_data.get('stats5m', {})
+                        price_change_5m = float(stats_5m.get('priceChange', 0) or 0)
+                        buy_volume_5m = float(stats_5m.get('buyVolume', 0) or 0)
+                        sell_volume_5m = float(stats_5m.get('sellVolume', 0) or 0)
+                        volume_5m = buy_volume_5m + sell_volume_5m
+                        
+                        # Stats 1h
+                        stats_1h = token_data.get('stats1h', {})
+                        price_change_1h = float(stats_1h.get('priceChange', 0) or 0)
+                        buy_volume_1h = float(stats_1h.get('buyVolume', 0) or 0)
+                        sell_volume_1h = float(stats_1h.get('sellVolume', 0) or 0)
+                        volume_1h = buy_volume_1h + sell_volume_1h
+                        
+                        # Stats 24h
+                        stats_24h = token_data.get('stats24h', {})
+                        price_change_24h = float(stats_24h.get('priceChange', 0) or 0)
+                        buy_volume_24h = float(stats_24h.get('buyVolume', 0) or 0)
+                        sell_volume_24h = float(stats_24h.get('sellVolume', 0) or 0)
+                        volume_24h = buy_volume_24h + sell_volume_24h
+                        
+                        # Validaciones básicas
+                        if price_usd <= 0:
+                            continue
+                        
+                        # Crear objeto TokenData
+                        token = TokenData(
+                            mint=mint,
+                            symbol=symbol,
+                            name=name,
+                            price_usd=price_usd,
+                            liquidity=liquidity,
+                            volume_24h=volume_24h,
+                            price_change_5m=price_change_5m,
+                            price_change_1h=price_change_1h,
+                            price_change_24h=price_change_24h,
+                            market_cap=market_cap
+                        )
+                        
+                        candidates.append(token)
+                        
+                    except Exception as e:
+                        logger.debug(f"Error parsing token: {e}")
+                        continue
+                
+                if candidates:
+                    logger.info(f"✅ Scanned {len(candidates)} tokens from Jupiter API")
+                return candidates
+                
     except Exception as e:
-        logger.error(f"Error scan_for_signals: {e}")
+        logger.error(f"❌ Error scan_for_signals: {e}")
+        state.stats['api_errors'] += 1
         return []
 
 def has_buy_signal(token: TokenData) -> Tuple[bool, float]:
