@@ -4,13 +4,10 @@
     "builder": "NIXPACKS"
   },
   "deploy": {
-    "startCommand": "python bot_trader_final.py",
+    "startCommand": "python main.py",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 300,
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10,
-    "publicNetworking": {
-      "port": 8080
-    }
+    "restartPolicyMaxRetries": 10
   }
 }
