@@ -910,9 +910,9 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
 # ═══════════════════════════════════════════════════════════════
 
 async def main_trading_loop():
-    """Loop principal de trading con actualización de health status"""
+    """Loop principal de trading"""
     
-    # Importar funciones del health server
+    # Intentar importar funciones del health server (opcional)
     try:
         from health_server import update_bot_status
     except ImportError:
