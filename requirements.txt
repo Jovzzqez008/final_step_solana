@@ -1,5 +1,37 @@
-anyio==4.11.0
+# ═══════════════════════════════════════════════════════════
+# REQUIREMENTS.TXT - COMPATIBLE CON PYTHON 3.12
+# ═══════════════════════════════════════════════════════════
+
+# Core async & HTTP
+aiohttp==3.9.0
+asyncio-throttle==1.0.2
+python-dotenv==1.1.1
+
+# Solana
+solana==0.36.9
+solders==0.26.0
+base58==2.1.1
+
+# Database
 asyncpg==0.29.0
+
+# Telegram
+python-telegram-bot==22.5
+
+# Machine Learning (FIXED: versiones compatibles con Python 3.12)
+numpy==1.26.4
+scikit-learn==1.5.2
+
+# Health Server
+fastapi==0.110.0
+uvicorn[standard]==0.30.1
+
+# Utils
+requests==2.32.5
+pytz==2024.1
+
+# Dependencies implícitas (para evitar conflictos)
+anyio==4.11.0
 certifi==2025.8.3
 charset-normalizer==3.4.3
 construct==2.10.68
@@ -8,22 +40,7 @@ h11==0.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.10
-jsonalias==0.1.1
-python-dotenv
-python-telegram-bot==22.5
-requests==2.32.5
 sniffio==1.3.1
-solana==0.36.9
-solders==0.26.0
-typing_extensions==4.15.0
+typing-extensions==4.15.0
 urllib3==2.5.0
 websockets==12.0
-aiohttp==3.9.0
-pytz==2024.1
-fastapi==0.110.0
-uvicorn==0.30.1
-gunicorn==21.2.0
-base58==2.1.1
-asyncio-throttle==1.0.2
-scikit-learn==1.3.2
-numpy==1.24.3
