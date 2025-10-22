@@ -671,7 +671,7 @@ async def scan_for_signals() -> List[TokenData]:
     except Exception as e:
         logger.error(f"❌ Error scan_for_signals: {e}")
         state.stats['jupiter_failures'] += 1
-        return []['jupiter_failures'] += 1
+        return []
         
         if state.stats['jupiter_failures'] >= 3:
             logger.warning("🔄 Activando SIMULATION MODE por excepciones")
