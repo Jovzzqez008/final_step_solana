@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V5.0 - SHYFT INTEGRATION
-====================================================
-✅ Shyft API como principal (más confiable que Jupiter)
-✅ Batch requests para posiciones (eficiente)
-✅ Fallback inteligente: Shyft → DexScreener → Jupiter
+🚀 SOLANA ELITE TRADING BOT V5.1 - COINGECKO INTEGRATION
+=========================================================
+✅ CoinGecko API como principal (más estable)
+✅ Fallback inteligente: CoinGecko → Shyft → DexScreener → Jupiter
+✅ Rate limiting CoinGecko (30 req/min)
+✅ Batch requests optimizadas
 ✅ Machine Learning integrado
 ✅ Health Server para Railway
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
 ✅ Modo DRY_RUN completo
 
-Version: 5.0 (2025) - Shyft Integration
+Version: 5.1 (2025) - CoinGecko Integration
 """
 
 import os
@@ -64,12 +65,12 @@ except ImportError:
     print("⚠️ python-telegram-bot no instalado")
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIGURACIÓN CON SHYFT API
+# CONFIGURACIÓN CON COINGECKO API
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class Config:
-    """Configuración centralizada con Shyft API"""
+    """Configuración centralizada con CoinGecko API"""
     
     # ═══ WALLET & RPC ═══
     PRIVATE_KEY: str = os.getenv('WALLET_PRIVATE_KEY', '')
@@ -90,13 +91,23 @@ class Config:
     TRADE_AMOUNT_SOL: float = float(os.getenv('TRADE_AMOUNT_SOL', '0.01'))
     SLIPPAGE_BPS: int = int(os.getenv('SLIPPAGE_BPS', '300'))
     
-    # ═══ 🟢 SHYFT API (PRINCIPAL) ═══
+    # ═══ 🟢 COINGECKO API (PRINCIPAL) ═══
+    COINGECKO_API_KEY: str = os.getenv('COINGECKO_API_KEY', '')
+    COINGECKO_BASE_URL: str = 'https://api.coingecko.com/api/v3'
+    # Endpoint por contract address
+    COINGECKO_TOKEN_BY_CONTRACT: str = f'{COINGECKO_BASE_URL}/coins/solana/contract'
+    # Endpoint simple de price
+    COINGECKO_SIMPLE_PRICE: str = f'{COINGECKO_BASE_URL}/simple/token_price/solana'
+    COINGECKO_RATE_LIMIT: float = 2.0  # 30 req/min = 1 cada 2 segundos
+    
+    # ═══ SHYFT API (FALLBACK 1) ═══
     SHYFT_API_KEY: str = os.getenv('SHYFT_API_KEY', '')
     SHYFT_BASE_URL: str = 'https://api.shyft.to/sol/v1'
     SHYFT_NETWORK: str = 'mainnet-beta'
     SHYFT_TOKEN_PRICE: str = f'{SHYFT_BASE_URL}/token/get_price'
     SHYFT_TOKEN_INFO: str = f'{SHYFT_BASE_URL}/token/get_info'
     SHYFT_MULTIPLE_PRICES: str = f'{SHYFT_BASE_URL}/token/get_multiple_prices'
+    SHYFT_RATE_LIMIT_DELAY: float = 0.6  # 100 req/min
     
     # ═══ FALLBACK APIs ═══
     DEXSCREENER_API: str = 'https://api.dexscreener.com/latest/dex'
@@ -133,7 +144,6 @@ class Config:
     MAX_RETRIES: int = int(os.getenv('MAX_RETRIES', '3'))
     API_TIMEOUT_SEC: int = int(os.getenv('API_TIMEOUT_SEC', '15'))
     RETRY_DELAY_SEC: int = int(os.getenv('RETRY_DELAY_SEC', '2'))
-    SHYFT_RATE_LIMIT_DELAY: float = 0.6  # 100 req/min
     
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
 
@@ -294,6 +304,11 @@ class BotState:
             'ml_correct': 0,
             'api_errors': 0,
             
+            # CoinGecko stats
+            'coingecko_success': 0,
+            'coingecko_failures': 0,
+            'coingecko_rate_limited': 0,
+            
             # Shyft stats
             'shyft_success': 0,
             'shyft_failures': 0,
@@ -308,6 +323,7 @@ class BotState:
         self.last_trade_time = 0
         self.running = True
         self.connector: Optional[aiohttp.TCPConnector] = None
+        self.last_coingecko_call = 0
         self.last_shyft_call = 0
 
 state = BotState()
@@ -379,7 +395,119 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
     return None
 
 # ═══════════════════════════════════════════════════════════════
-# 🟢 SHYFT API CLIENT
+# 🟢 COINGECKO API CLIENT (PRINCIPAL)
+# ═══════════════════════════════════════════════════════════════
+
+async def coingecko_rate_limit():
+    """Rate limiting para CoinGecko (30 req/min = 1 cada 2 seg)"""
+    current_time = time.time()
+    time_since_last_call = current_time - state.last_coingecko_call
+    
+    if time_since_last_call < config.COINGECKO_RATE_LIMIT:
+        await asyncio.sleep(config.COINGECKO_RATE_LIMIT - time_since_last_call)
+    
+    state.last_coingecko_call = time.time()
+
+async def get_token_price_coingecko(mint: str) -> Optional[float]:
+    """Obtener precio usando CoinGecko API (endpoint por contract)"""
+    if not config.COINGECKO_API_KEY:
+        return None
+    
+    try:
+        await coingecko_rate_limit()
+        
+        # Usar endpoint simple/token_price (más rápido para solo precio)
+        url = config.COINGECKO_SIMPLE_PRICE
+        params = {
+            'contract_addresses': mint,
+            'vs_currencies': 'usd'
+        }
+        headers = {
+            'x-cg-demo-api-key': config.COINGECKO_API_KEY
+        }
+        
+        result = await api_call_with_retry(url, params=params, headers=headers)
+        
+        if result and mint.lower() in result:
+            price = float(result[mint.lower()].get('usd', 0))
+            if price > 0:
+                state.stats['coingecko_success'] += 1
+                logger.debug(f"✅ CoinGecko: {mint[:8]} = ${price:.8f}")
+                return price
+        
+        # Intentar con endpoint completo si falla el simple
+        url_full = f"{config.COINGECKO_TOKEN_BY_CONTRACT}/{mint}"
+        result_full = await api_call_with_retry(url_full, headers=headers)
+        
+        if result_full:
+            market_data = result_full.get('market_data', {})
+            price = float(market_data.get('current_price', {}).get('usd', 0))
+            if price > 0:
+                state.stats['coingecko_success'] += 1
+                logger.debug(f"✅ CoinGecko Full: {mint[:8]} = ${price:.8f}")
+                return price
+        
+        return None
+        
+    except Exception as e:
+        error_msg = str(e).lower()
+        if 'rate limit' in error_msg or '429' in error_msg:
+            state.stats['coingecko_rate_limited'] += 1
+            await asyncio.sleep(5)
+        else:
+            state.stats['coingecko_failures'] += 1
+        
+        logger.debug(f"CoinGecko error: {str(e)[:100]}")
+        return None
+
+async def get_multiple_prices_coingecko(mints: List[str]) -> Dict[str, float]:
+    """Obtener múltiples precios en batch de CoinGecko"""
+    if not config.COINGECKO_API_KEY or not mints:
+        return {}
+    
+    try:
+        await coingecko_rate_limit()
+        
+        # Limitar a 10 tokens por request (límite de CoinGecko)
+        batch_size = 10
+        all_prices = {}
+        
+        for i in range(0, len(mints), batch_size):
+            batch = mints[i:i+batch_size]
+            
+            url = config.COINGECKO_SIMPLE_PRICE
+            params = {
+                'contract_addresses': ','.join(batch),
+                'vs_currencies': 'usd'
+            }
+            headers = {
+                'x-cg-demo-api-key': config.COINGECKO_API_KEY
+            }
+            
+            result = await api_call_with_retry(url, params=params, headers=headers)
+            
+            if result:
+                for mint in batch:
+                    if mint.lower() in result:
+                        price = float(result[mint.lower()].get('usd', 0))
+                        if price > 0:
+                            all_prices[mint] = price
+            
+            # Rate limit entre batches
+            if i + batch_size < len(mints):
+                await asyncio.sleep(config.COINGECKO_RATE_LIMIT)
+        
+        if all_prices:
+            logger.info(f"✅ CoinGecko batch: {len(all_prices)}/{len(mints)} precios")
+        
+        return all_prices
+        
+    except Exception as e:
+        logger.debug(f"CoinGecko batch error: {str(e)[:100]}")
+        return {}
+
+# ═══════════════════════════════════════════════════════════════
+# SHYFT API CLIENT (FALLBACK 1)
 # ═══════════════════════════════════════════════════════════════
 
 async def shyft_rate_limit():
@@ -431,64 +559,27 @@ async def get_token_price_shyft(mint: str) -> Optional[float]:
         state.stats['shyft_failures'] += 1
         return None
 
-async def get_multiple_prices_shyft(mints: List[str]) -> Dict[str, float]:
-    """Obtener múltiples precios en una sola llamada"""
-    if not config.SHYFT_API_KEY or not mints:
-        return {}
-    
-    try:
-        await shyft_rate_limit()
-        
-        url = config.SHYFT_MULTIPLE_PRICES
-        headers = {
-            'x-api-key': config.SHYFT_API_KEY,
-            'Content-Type': 'application/json'
-        }
-        json_data = {
-            'network': config.SHYFT_NETWORK,
-            'token_addresses': mints
-        }
-        
-        result = await api_call_with_retry(
-            url, 
-            method='POST',
-            headers=headers,
-            json=json_data
-        )
-        
-        if result and result.get('success'):
-            prices = {}
-            for item in result.get('result', []):
-                mint = item.get('address')
-                price = float(item.get('price', 0))
-                if mint and price > 0:
-                    prices[mint] = price
-            
-            logger.info(f"✅ Shyft batch: {len(prices)}/{len(mints)} precios")
-            return prices
-        
-        return {}
-        
-    except Exception as e:
-        logger.debug(f"Shyft batch error: {str(e)[:100]}")
-        return {}
-
 # ═══════════════════════════════════════════════════════════════
-# GET PRICE CON FALLBACK
+# GET PRICE CON FALLBACK (CoinGecko → Shyft → DexScreener → Jupiter)
 # ═══════════════════════════════════════════════════════════════
 
 async def get_token_price(mint: str) -> Optional[float]:
-    """🟢 Shyft → DexScreener → Jupiter V3"""
+    """🟢 CoinGecko → Shyft → DexScreener → Jupiter V3"""
     
     if config.SIMULATION_MODE:
         return 0.0001 + (hash(mint) % 100) * 0.000001
     
-    # 1️⃣ SHYFT
+    # 1️⃣ COINGECKO (PRINCIPAL)
+    price = await get_token_price_coingecko(mint)
+    if price:
+        return price
+    
+    # 2️⃣ SHYFT (FALLBACK 1)
     price = await get_token_price_shyft(mint)
     if price:
         return price
     
-    # 2️⃣ DexScreener
+    # 3️⃣ DexScreener (FALLBACK 2)
     try:
         url = f"{config.DEXSCREENER_API}/tokens/{mint}"
         result = await api_call_with_retry(url)
@@ -508,7 +599,7 @@ async def get_token_price(mint: str) -> Optional[float]:
     except Exception:
         pass
     
-    # 3️⃣ Jupiter V3
+    # 4️⃣ Jupiter V3 (FALLBACK 3)
     try:
         url = f"{config.JUPITER_PRICE_API_V3}?ids={mint}"
         result = await api_call_with_retry(url)
@@ -818,11 +909,11 @@ async def check_positions():
     if not state.positions:
         return
     
-    # 🚀 OPTIMIZACIÓN: Batch request con Shyft
+    # 🚀 OPTIMIZACIÓN: Batch request con CoinGecko
     mints = list(state.positions.keys())
     
-    if config.SHYFT_API_KEY:
-        prices = await get_multiple_prices_shyft(mints)
+    if config.COINGECKO_API_KEY:
+        prices = await get_multiple_prices_coingecko(mints)
     else:
         prices = {}
     
@@ -926,11 +1017,16 @@ async def main_trading_loop():
     
     logger.info("🚀 Bot iniciando...")
     
-    # Validar Shyft API key
-    if config.SHYFT_API_KEY:
-        logger.info("✅ Shyft API key configurada")
+    # Validar APIs
+    if config.COINGECKO_API_KEY:
+        logger.info("✅ CoinGecko API key configurada (API Principal)")
     else:
-        logger.warning("⚠️ SHYFT_API_KEY no configurada - usando solo fallbacks")
+        logger.warning("⚠️ COINGECKO_API_KEY no configurada")
+    
+    if config.SHYFT_API_KEY:
+        logger.info("✅ Shyft API key configurada (Fallback)")
+    else:
+        logger.warning("⚠️ SHYFT_API_KEY no configurada")
     
     # Inicializar
     await init_database()
@@ -939,7 +1035,7 @@ async def main_trading_loop():
         try:
             state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
             mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
-            await send_telegram(f"🚀 <b>Bot v5.0 Iniciado</b>\n\nModo: {mode}\nAPI: Shyft")
+            await send_telegram(f"🚀 <b>Bot v5.1 Iniciado</b>\n\nModo: {mode}\nAPI Principal: CoinGecko\nFallback: Shyft → DexScreener → Jupiter")
         except Exception as e:
             logger.error(f"❌ Error Telegram: {e}")
     
@@ -1012,12 +1108,12 @@ async def main_trading_loop():
                 )
                 
                 logger.info(
-                    f"🟢 APIs: Shyft OK: {state.stats['shyft_success']} | "
-                    f"Shyft Fails: {state.stats['shyft_failures']} | "
-                    f"Rate Limited: {state.stats['shyft_rate_limited']} | "
+                    f"🟢 APIs: CoinGecko OK: {state.stats['coingecko_success']} | "
+                    f"CG Fails: {state.stats['coingecko_failures']} | "
+                    f"CG Rate Limited: {state.stats['coingecko_rate_limited']} | "
+                    f"Shyft OK: {state.stats['shyft_success']} | "
                     f"DexScreener: {state.stats['dexscreener_fallback']} | "
-                    f"Jupiter V3: {state.stats['jupiter_v3_fallback']} | "
-                    f"Jupiter Scan Fails: {state.stats['jupiter_failures']}"
+                    f"Jupiter V3: {state.stats['jupiter_v3_fallback']}"
                 )
             
             # 5. Esperar
