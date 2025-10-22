@@ -1,262 +1,24 @@
-# ═══════════════════════════════════════════════════════════════
-# ✅ MAIN LOOP MEJORADO
-# ═══════════════════════════════════════════════════════════════
-
-async def main_trading_loop():
-    """✅ Loop principal con Moralis como API principal"""
-    
-    try:
-        from health_server import update_bot_status
-    except ImportError:
-        update_bot_status = None
-    
-    logger.info("🚀 Bot iniciando (versión 5.3 - MORALIS)...")
-    
-    # Validar APIs
-    if config.MORALIS_API_KEY:
-        logger.info("✅ Moralis API key configurada (API Principal) ⭐")
-    else:
-        logger.warning("⚠️ MORALIS_API_KEY no configurada - usando fallbacks")
-    
-    if config.COINGECKO_API_KEY:
-        logger.info("✅ CoinGecko API key configurada (Fallback 1)")
-    else:
-        logger.warning("⚠️ COINGECKO_API_KEY no configurada")
-    
-    if config.SHYFT_API_KEY:
-        logger.info("✅ Shyft API key configurada (Fallback 2)")
-    else:
-        logger.warning("⚠️ SHYFT_API_KEY no configurada")
-    
-    logger.info("✅ Jupiter Quote API habilitada (Fallback 3 - sin API key)")
-    
-    # Inicializar
-    await init_database()
-    
-    if config.ENABLE_TELEGRAM and TELEGRAM_AVAILABLE:
-        try:
-            state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
-            mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
-            await send_telegram(
-                f"🚀 <b>Bot v5.3 Iniciado</b>\n\n"
-                f"Modo: {mode}\n"
-                f"API: Moralis ⭐ → CoinGecko → Shyft → Jupiter Quote → DexScreener\n"
-                f"Stop Loss: {config.STOP_LOSS_PERCENT}%\n"
-                f"Take Profit: {config.TAKE_PROFIT_1}% / {config.TAKE_PROFIT_2}%\n"
-                f"Scan Interval: {config.SCAN_INTERVAL_SEC}s\n\n"
-                f"✅ Moralis batch requests activadas"
-            )
-        except Exception as e:
-            logger.error(f"❌ Error Telegram init: {e}")
-    
-    logger.info(f"🧠 ML: {'ENABLED' if ml_predictor.is_trained else 'DISABLED'}")
-    logger.info(f"🧪 DRY_RUN: {config.DRY_RUN}")
-    logger.info(f"📊 Monitoreo cada {config.SCAN_INTERVAL_SEC}s")
-    
-    # Update health
-    if update_bot_status:
-        update_bot_status(
-            running=True, scans=0, positions=0, signals=0,
-            trades=0, wins=0, losses=0, total_pnl=0.0,
-            ml_enabled=ml_predictor.is_trained,
-            mode="DRY_RUN" if config.DRY_RUN else "REAL"
-        )
-    
-    consecutive_errors = 0
-    max_consecutive_errors = 5
-    
-    # Loop principal
-    while state.running:
-        try:
-            state.stats['scans'] += 1
-            scan_start = datetime.now()
-            
-            logger.info(f"\n{'='*60}")
-            logger.info(f"🔄 SCAN #{state.stats['scans']} - {scan_start.strftime('%H:%M:%S')}")
-            logger.info(f"{'='*60}")
-            
-            if update_bot_status:
-                update_bot_status(
-                    running=True,
-                    scans=state.stats['scans'],
-                    positions=len(state.positions),
-                    signals=state.stats['signals'],
-                    trades=state.stats['trades'],
-                    wins=state.stats['wins'],
-                    losses=state.stats['losses'],
-                    total_pnl=state.stats['total_pnl'],
-                    ml_enabled=ml_predictor.is_trained,
-                    mode="DRY_RUN" if config.DRY_RUN else "REAL"
-                )
-            
-            # 1️⃣ Escanear tokens
-            logger.info("📡 Escaneando tokens de Jupiter...")
-            tokens = await scan_for_signals()
-            
-            if tokens:
-                logger.info(f"✅ Encontrados {len(tokens)} tokens candidatos")
-                
-                # 2️⃣ Evaluar señales
-                for token in tokens:
-                    if len(state.positions) >= config.MAX_POSITIONS:
-                        logger.warning(f"⚠️ Límite de posiciones alcanzado ({config.MAX_POSITIONS})")
-                        break
-                    
-                    has_signal, score, ml_conf = has_buy_signal(token)
-                    
-                    if has_signal:
-                        state.stats['signals'] += 1
-                        state.watchlist[token.mint] = token
-                        logger.info(f"🎯 Señal detectada: {token.symbol} (Score: {score:.0f}, ML: {ml_conf:.1f}%)")
-                        await buy_token(token, ml_conf)
-                        await asyncio.sleep(1)
-            else:
-                logger.warning("⚠️ No se encontraron tokens en el scan")
-            
-            # 3️⃣ ✅ MONITOREAR POSICIONES (CRÍTICO)
-            if state.positions:
-                logger.info(f"\n🔍 MONITOREANDO {len(state.positions)} POSICIONES:")
-                await check_positions()
-            else:
-                logger.debug("📊 No hay posiciones para monitorear")
-            
-            # 4️⃣ Stats periódicas
-            if state.stats['scans'] % 5 == 0:
-                win_rate = (state.stats['wins'] / max(1, state.stats['wins'] + state.stats['losses'])) * 100
-                ml_accuracy = (state.stats['ml_correct'] / max(1, state.stats['ml_predictions'])) * 100 if state.stats['ml_predictions'] > 0 else 0
-                
-                logger.info(f"\n📊 ESTADÍSTICAS:")
-                logger.info(f"   Scans: {state.stats['scans']}")
-                logger.info(f"   Señales: {state.stats['signals']}")
-                logger.info(f"   Trades: {state.stats['trades']}")
-                logger.info(f"   Win Rate: {win_rate:.1f}% ({state.stats['wins']}W/{state.stats['losses']}L)")
-                logger.info(f"   P&L Total: {state.stats['total_pnl']:+.2f}%")
-                logger.info(f"   ML Accuracy: {ml_accuracy:.1f}%")
-                logger.info(f"   Posiciones Abiertas: {len(state.positions)}")
-                
-                logger.info(
-                    f"🟢 APIs: "
-                    f"Moralis OK: {state.stats['moralis_success']} | "
-                    f"CoinGecko: {state.stats['coingecko_success']} | "
-                    f"Shyft: {state.stats['shyft_success']} | "
-                    f"Jupiter Quote: {state.stats['jupiter_quote_success']} | "
-                    f"DexScreener: {state.stats['dexscreener_fallback']}"
-                )
-            
-            # Reset error counter si llegó hasta aquí
-            consecutive_errors = 0
-            
-            # 5️⃣ Esperar siguiente scan
-            scan_duration = (datetime.now() - scan_start).total_seconds()
-            sleep_time = max(1, config.SCAN_INTERVAL_SEC - scan_duration)
-            
-            logger.info(f"⏳ Próximo scan en {sleep_time:.1f}s...")
-            await asyncio.sleep(sleep_time)
-            
-        except KeyboardInterrupt:
-            logger.info("\n⏸️ Deteniendo bot por usuario...")
-            state.running = False
-            break
-        
-        except Exception as e:
-            consecutive_errors += 1
-            logger.error(
-                f"❌ ERROR EN MAIN LOOP ({consecutive_errors}/{max_consecutive_errors}): {e}",
-                exc_info=True
-            )
-            
-            if consecutive_errors >= max_consecutive_errors:
-                logger.critical("🚨 DEMASIADOS ERRORES CONSECUTIVOS - Deteniendo bot")
-                await send_telegram(
-                    "🚨 <b>Bot Detenido</b>\n\n"
-                    f"Razón: {max_consecutive_errors} errores consecutivos\n"
-                    f"Último error: {str(e)[:200]}"
-                )
-                break
-            
-            # Esperar más tiempo en caso de error
-            await asyncio.sleep(min(30, consecutive_errors * 10))
-    
-    # Cleanup
-    logger.info("\n🧹 Limpiando recursos...")
-    
-    # Cerrar posiciones abiertas
-    if state.positions:
-        logger.warning(f"⚠️ Cerrando {len(state.positions)} posiciones pendientes...")
-        for mint, position in list(state.positions.items()):
-            try:
-                current_price = await get_token_price(mint)
-                if current_price:
-                    await exit_position(mint, position, current_price, "BOT_STOPPED")
-            except Exception as e:
-                logger.error(f"Error cerrando {position.symbol}: {e}")
-    
-    if state.db_pool:
-        await state.db_pool.close()
-    
-    if state.connector:
-        await state.connector.close()
-    
-    if state.telegram_bot:
-        await send_telegram(
-            f"👋 <b>Bot Detenido</b>\n\n"
-            f"Scans: {state.stats['scans']}\n"
-            f"Trades: {state.stats['trades']}\n"
-            f"P&L Final: {state.stats['total_pnl']:+.2f}%"
-        )
-    
-    logger.info("✅ Bot detenido correctamente")
-
-# ═══════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ═══════════════════════════════════════════════════════════════
-
-async def run_bot_with_health_server():
-    """Ejecutar bot + health server"""
-    
-    try:
-        from health_server import start_health_server, update_bot_status
-        
-        update_bot_status(
-            running=True, scans=0, positions=0, signals=0,
-            trades=0, wins=0, losses=0, total_pnl=0.0,
-            ml_enabled=ml_predictor.is_trained,
-            mode="DRY_RUN" if config.DRY_RUN else "REAL"
-        )
-        
-        logger.info("🏥 Health server habilitado en puerto 8080")
-        
-        await asyncio.gather(
-            main_trading_loop(),
-            start_health_server(port=8080)
-        )
-        
-    except ImportError:
-        logger.warning("⚠️ health_server.py no encontrado - solo bot")
-        await main_trading_loop()
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(run_bot_with_health_server())
-    except KeyboardInterrupt:
-        logger.info("👋 Hasta luego")
-        sys.exit(0)#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V5.3 - MORALIS INTEGRATION
+🚀 SOLANA ELITE TRADING BOT V5.3 - MORALIS + JUPITER QUOTE INTEGRATION
 =================================================================
-✅ Moralis API como principal (más confiable para Solana)
-✅ Fallback: Moralis → CoinGecko → Shyft → Jupiter Quote → DexScreener
-✅ Batch requests optimizadas con Moralis
+✅ MORALIS API como principal (más confiable)
+✅ CoinGecko API como fallback 1
+✅ Shyft API como fallback 2  
+✅ Jupiter Quote API para precios más precisos
+✅ Rate limiting optimizado
+✅ Batch requests optimizadas
 ✅ Machine Learning integrado
 ✅ Health Server para Railway
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
 ✅ Modo DRY_RUN completo
 ✅ Monitoreo de posiciones mejorado
+✅ Notificaciones completas
 ✅ Error handling robusto
 
-Version: 5.3-MORALIS (2025)
+Version: 5.3-MORALIS-JUPITER (2025)
 """
 
 import os
@@ -308,7 +70,7 @@ except ImportError:
     print("⚠️ python-telegram-bot no instalado")
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIGURACIÓN CON MORALIS API
+# CONFIGURACIÓN CON MORALIS + COINGECKO API
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
@@ -334,24 +96,26 @@ class Config:
     TRADE_AMOUNT_SOL: float = float(os.getenv('TRADE_AMOUNT_SOL', '0.01'))
     SLIPPAGE_BPS: int = int(os.getenv('SLIPPAGE_BPS', '300'))
     
-    # ═══ 🆕 MORALIS API (PRINCIPAL) ⭐ ═══
+    # ═══ 🆕 MORALIS API (PRINCIPAL) ═══
     MORALIS_API_KEY: str = os.getenv('MORALIS_API_KEY', '')
     MORALIS_BASE_URL: str = 'https://solana-gateway.moralis.io/token/mainnet'
-    MORALIS_RATE_LIMIT: float = 0.05  # 20 req/sec para plan gratuito
+    MORALIS_RATE_LIMIT_DELAY: float = 0.05  # 20 req/sec max
     
-    # ═══ COINGECKO API (FALLBACK 1) ═══
+    # ═══ 🟢 COINGECKO API (FALLBACK 1) ═══
     COINGECKO_API_KEY: str = os.getenv('COINGECKO_API_KEY', '')
     COINGECKO_BASE_URL: str = 'https://api.coingecko.com/api/v3'
     COINGECKO_TOKEN_BY_CONTRACT: str = f'{COINGECKO_BASE_URL}/coins/solana/contract'
     COINGECKO_SIMPLE_PRICE: str = f'{COINGECKO_BASE_URL}/simple/token_price/solana'
-    COINGECKO_RATE_LIMIT: float = 2.0  # 30 req/min
+    COINGECKO_RATE_LIMIT: float = 2.0  # 30 req/min = 1 cada 2 segundos
     
     # ═══ SHYFT API (FALLBACK 2) ═══
     SHYFT_API_KEY: str = os.getenv('SHYFT_API_KEY', '')
     SHYFT_BASE_URL: str = 'https://api.shyft.to/sol/v1'
     SHYFT_NETWORK: str = 'mainnet-beta'
     SHYFT_TOKEN_PRICE: str = f'{SHYFT_BASE_URL}/token/get_price'
-    SHYFT_RATE_LIMIT_DELAY: float = 0.6
+    SHYFT_TOKEN_INFO: str = f'{SHYFT_BASE_URL}/token/get_info'
+    SHYFT_MULTIPLE_PRICES: str = f'{SHYFT_BASE_URL}/token/get_multiple_prices'
+    SHYFT_RATE_LIMIT_DELAY: float = 0.6  # 100 req/min
     
     # ═══ FALLBACK APIs ═══
     JUPITER_QUOTE_API_V6: str = 'https://quote-api.jup.ag/v6/quote'
@@ -393,6 +157,143 @@ class Config:
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
 
 config = Config()
+
+# ═══════════════════════════════════════════════════════════════
+# 🆕 MORALIS API CLIENT - SOLUCIÓN DEFINITIVA
+# ═══════════════════════════════════════════════════════════════
+
+class MoralisClient:
+    """Cliente para Moralis Token API - precios confiables"""
+    
+    def __init__(self):
+        self.api_key = config.MORALIS_API_KEY
+        self.base_url = config.MORALIS_BASE_URL
+        self.headers = {
+            'Accept': 'application/json',
+            'X-API-Key': self.api_key
+        }
+        self.rate_limit_delay = config.MORALIS_RATE_LIMIT_DELAY
+        self.last_call = 0
+        self.stats = {
+            'success': 0,
+            'failures': 0,
+            'rate_limited': 0
+        }
+    
+    async def _rate_limit(self):
+        """Rate limiting para no exceder límites"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_call
+        
+        if time_since_last < self.rate_limit_delay:
+            await asyncio.sleep(self.rate_limit_delay - time_since_last)
+        
+        self.last_call = time.time()
+    
+    async def get_token_price(self, mint: str) -> Optional[float]:
+        """
+        Obtener precio de UN token
+        GET /token/mainnet/{address}/price
+        """
+        if not self.api_key:
+            logger.warning("⚠️ MORALIS_API_KEY no configurada")
+            return None
+        
+        try:
+            await self._rate_limit()
+            
+            url = f"{self.base_url}/{mint}/price"
+            
+            result = await api_call_with_retry(url, headers=self.headers)
+            
+            if result:
+                # Moralis retorna: {"usdPrice": 0.000123, "nativePrice": {...}}
+                price = float(result.get('usdPrice', 0))
+                
+                if price > 0:
+                    self.stats['success'] += 1
+                    logger.debug(f"✅ Moralis: {mint[:8]} = ${price:.8f}")
+                    return price
+                else:
+                    logger.debug(f"⚠️ Moralis: {mint[:8]} precio = 0")
+            
+            self.stats['failures'] += 1
+            return None
+            
+        except Exception as e:
+            error_msg = str(e).lower()
+            
+            if 'rate limit' in error_msg or '429' in error_msg:
+                self.stats['rate_limited'] += 1
+                logger.warning(f"⚠️ Moralis rate limited - esperando...")
+                await asyncio.sleep(5)
+            else:
+                self.stats['failures'] += 1
+            
+            logger.debug(f"Moralis error: {str(e)[:100]}")
+            return None
+    
+    async def get_multiple_prices(self, mints: List[str]) -> Dict[str, float]:
+        """
+        🚀 BATCH REQUEST - Múltiples precios en 1 llamada
+        POST /token/mainnet/prices
+        Body: {"addresses": ["mint1", "mint2", ...]}
+        """
+        if not self.api_key or not mints:
+            return {}
+        
+        try:
+            await self._rate_limit()
+            
+            url = f"{self.base_url}/prices"
+            
+            # Moralis acepta hasta 25 addresses por request
+            batch_size = 25
+            all_prices = {}
+            
+            for i in range(0, len(mints), batch_size):
+                batch = mints[i:i+batch_size]
+                
+                payload = {
+                    "addresses": batch
+                }
+                
+                result = await api_call_with_retry(
+                    url,
+                    method='POST',
+                    json=payload,
+                    headers={**self.headers, 'Content-Type': 'application/json'}
+                )
+                
+                if result and isinstance(result, list):
+                    # Moralis retorna: [{"address": "...", "usdPrice": 0.123}, ...]
+                    for token_data in result:
+                        address = token_data.get('address')
+                        price = float(token_data.get('usdPrice', 0))
+                        
+                        if address and price > 0:
+                            all_prices[address] = price
+                
+                # Rate limit entre batches
+                if i + batch_size < len(mints):
+                    await asyncio.sleep(self.rate_limit_delay)
+            
+            if all_prices:
+                self.stats['success'] += len(all_prices)
+                logger.info(f"✅ Moralis batch: {len(all_prices)}/{len(mints)} precios")
+            
+            return all_prices
+            
+        except Exception as e:
+            logger.error(f"❌ Moralis batch error: {e}")
+            self.stats['failures'] += 1
+            return {}
+
+# ═══════════════════════════════════════════════════════════════
+# INSTANCIA GLOBAL MORALIS
+# ═══════════════════════════════════════════════════════════════
+
+moralis_client = MoralisClient()
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING
@@ -549,7 +450,7 @@ class BotState:
             'ml_correct': 0,
             'api_errors': 0,
             
-            # Moralis stats (PRINCIPAL)
+            # 🆕 Moralis stats
             'moralis_success': 0,
             'moralis_failures': 0,
             'moralis_rate_limited': 0,
@@ -557,10 +458,12 @@ class BotState:
             # CoinGecko stats
             'coingecko_success': 0,
             'coingecko_failures': 0,
+            'coingecko_rate_limited': 0,
             
             # Shyft stats
             'shyft_success': 0,
             'shyft_failures': 0,
+            'shyft_rate_limited': 0,
             
             # Jupiter Quote stats
             'jupiter_quote_success': 0,
@@ -568,15 +471,13 @@ class BotState:
             
             # Fallback stats
             'dexscreener_fallback': 0,
+            'jupiter_v3_fallback': 0,
             'jupiter_failures': 0
         }
         
         self.last_trade_time = 0
         self.running = True
         self.connector: Optional[aiohttp.TCPConnector] = None
-        
-        # Rate limiting timestamps
-        self.last_moralis_call = 0
         self.last_coingecko_call = 0
         self.last_shyft_call = 0
 
@@ -623,12 +524,8 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
                         
             elif method == 'POST':
                 async with session.post(url, **kwargs) as resp:
-                    if resp.status == 200 or resp.status == 201:
+                    if resp.status == 200:
                         return await resp.json()
-                    elif resp.status == 429:
-                        if attempt < config.MAX_RETRIES - 1:
-                            await asyncio.sleep(config.RETRY_DELAY_SEC * (attempt + 1))
-                            continue
             
         except aiohttp.ClientConnectorError:
             state.stats['api_errors'] += 1
@@ -653,133 +550,11 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
     return None
 
 # ═══════════════════════════════════════════════════════════════
-# 🆕 MORALIS API CLIENT (PRINCIPAL) ⭐
-# ═══════════════════════════════════════════════════════════════
-
-async def moralis_rate_limit():
-    """Rate limiting para Moralis (20 req/sec = 0.05s entre llamadas)"""
-    current_time = time.time()
-    time_since_last_call = current_time - state.last_moralis_call
-    
-    if time_since_last_call < config.MORALIS_RATE_LIMIT:
-        await asyncio.sleep(config.MORALIS_RATE_LIMIT - time_since_last_call)
-    
-    state.last_moralis_call = time.time()
-
-async def get_token_price_moralis(mint: str) -> Optional[float]:
-    """
-    Obtener precio de UN token con Moralis
-    GET /token/mainnet/{address}/price
-    """
-    if not config.MORALIS_API_KEY:
-        return None
-    
-    try:
-        await moralis_rate_limit()
-        
-        url = f"{config.MORALIS_BASE_URL}/{mint}/price"
-        headers = {
-            'Accept': 'application/json',
-            'X-API-Key': config.MORALIS_API_KEY
-        }
-        
-        result = await api_call_with_retry(url, headers=headers)
-        
-        if result and 'usdPrice' in result:
-            price = float(result.get('usdPrice', 0))
-            
-            if price > 0:
-                state.stats['moralis_success'] += 1
-                logger.debug(f"✅ Moralis: {mint[:8]} = ${price:.8f}")
-                return price
-            else:
-                logger.debug(f"⚠️ Moralis: {mint[:8]} precio = 0")
-        
-        state.stats['moralis_failures'] += 1
-        return None
-        
-    except Exception as e:
-        error_msg = str(e).lower()
-        
-        if 'rate limit' in error_msg or '429' in error_msg:
-            state.stats['moralis_rate_limited'] += 1
-            logger.warning(f"⚠️ Moralis rate limited")
-            await asyncio.sleep(5)
-        else:
-            state.stats['moralis_failures'] += 1
-        
-        logger.debug(f"Moralis error: {str(e)[:100]}")
-        return None
-
-async def get_multiple_prices_moralis(mints: List[str]) -> Dict[str, float]:
-    """
-    🚀 BATCH REQUEST - Múltiples precios en 1 llamada
-    POST /token/mainnet/prices
-    Body: {"addresses": ["mint1", "mint2", ...]}
-    """
-    if not config.MORALIS_API_KEY or not mints:
-        return {}
-    
-    try:
-        await moralis_rate_limit()
-        
-        url = f"{config.MORALIS_BASE_URL}/prices"
-        headers = {
-            'Accept': 'application/json',
-            'Content-Type': 'application/json',
-            'X-API-Key': config.MORALIS_API_KEY
-        }
-        
-        # Moralis acepta hasta 25 addresses por request
-        batch_size = 25
-        all_prices = {}
-        
-        for i in range(0, len(mints), batch_size):
-            batch = mints[i:i+batch_size]
-            
-            payload = {
-                "addresses": batch
-            }
-            
-            result = await api_call_with_retry(
-                url,
-                method='POST',
-                json=payload,
-                headers=headers
-            )
-            
-            if result and isinstance(result, list):
-                # Moralis retorna: [{"address": "...", "usdPrice": 0.123}, ...]
-                for token_data in result:
-                    address = token_data.get('address')
-                    price = float(token_data.get('usdPrice', 0))
-                    
-                    if address and price > 0:
-                        all_prices[address] = price
-            
-            # Rate limit entre batches
-            if i + batch_size < len(mints):
-                await asyncio.sleep(config.MORALIS_RATE_LIMIT)
-        
-        if all_prices:
-            state.stats['moralis_success'] += len(all_prices)
-            logger.info(f"✅ Moralis batch: {len(all_prices)}/{len(mints)} precios")
-        else:
-            state.stats['moralis_failures'] += 1
-        
-        return all_prices
-        
-    except Exception as e:
-        logger.error(f"❌ Moralis batch error: {e}")
-        state.stats['moralis_failures'] += 1
-        return {}
-
-# ═══════════════════════════════════════════════════════════════
-# COINGECKO API CLIENT (FALLBACK 1)
+# 🟢 COINGECKO API CLIENT (FALLBACK 1)
 # ═══════════════════════════════════════════════════════════════
 
 async def coingecko_rate_limit():
-    """Rate limiting para CoinGecko"""
+    """Rate limiting para CoinGecko (30 req/min = 1 cada 2 seg)"""
     current_time = time.time()
     time_since_last_call = current_time - state.last_coingecko_call
     
@@ -789,7 +564,7 @@ async def coingecko_rate_limit():
     state.last_coingecko_call = time.time()
 
 async def get_token_price_coingecko(mint: str) -> Optional[float]:
-    """Obtener precio usando CoinGecko API"""
+    """Obtener precio usando CoinGecko API (endpoint por contract)"""
     if not config.COINGECKO_API_KEY:
         return None
     
@@ -814,10 +589,27 @@ async def get_token_price_coingecko(mint: str) -> Optional[float]:
                 logger.debug(f"✅ CoinGecko: {mint[:8]} = ${price:.8f}")
                 return price
         
+        url_full = f"{config.COINGECKO_TOKEN_BY_CONTRACT}/{mint}"
+        result_full = await api_call_with_retry(url_full, headers=headers)
+        
+        if result_full:
+            market_data = result_full.get('market_data', {})
+            price = float(market_data.get('current_price', {}).get('usd', 0))
+            if price > 0:
+                state.stats['coingecko_success'] += 1
+                logger.debug(f"✅ CoinGecko Full: {mint[:8]} = ${price:.8f}")
+                return price
+        
         return None
         
     except Exception as e:
-        state.stats['coingecko_failures'] += 1
+        error_msg = str(e).lower()
+        if 'rate limit' in error_msg or '429' in error_msg:
+            state.stats['coingecko_rate_limited'] += 1
+            await asyncio.sleep(5)
+        else:
+            state.stats['coingecko_failures'] += 1
+        
         logger.debug(f"CoinGecko error: {str(e)[:100]}")
         return None
 
@@ -870,7 +662,7 @@ async def get_multiple_prices_coingecko(mints: List[str]) -> Dict[str, float]:
 # ═══════════════════════════════════════════════════════════════
 
 async def shyft_rate_limit():
-    """Rate limiting para Shyft"""
+    """Rate limiting para Shyft (100 req/min)"""
     current_time = time.time()
     time_since_last_call = current_time - state.last_shyft_call
     
@@ -905,6 +697,12 @@ async def get_token_price_shyft(mint: str) -> Optional[float]:
                 logger.debug(f"✅ Shyft: {mint[:8]} = ${price:.8f}")
                 return price
         
+        if result and not result.get('success'):
+            error_msg = result.get('message', '')
+            if 'rate limit' in error_msg.lower():
+                state.stats['shyft_rate_limited'] += 1
+                await asyncio.sleep(2)
+        
         return None
         
     except Exception as e:
@@ -913,32 +711,70 @@ async def get_token_price_shyft(mint: str) -> Optional[float]:
         return None
 
 # ═══════════════════════════════════════════════════════════════
-# JUPITER QUOTE API CLIENT (FALLBACK 3)
+# 🆕 JUPITER QUOTE API CLIENT (FALLBACK 3)
 # ═══════════════════════════════════════════════════════════════
 
 async def get_token_price_jupiter_quote(mint: str) -> Optional[float]:
-    """Obtener precio usando Jupiter Quote API v6"""
+    """
+    Obtener precio usando Jupiter Quote API v6
+    Más confiable que Price API porque simula swaps reales
+    """
     try:
+        # Constantes
         SOL_MINT = "So11111111111111111111111111111111111111112"
         USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
         
+        # Intentar 1: Token → USDC (método directo)
         url = config.JUPITER_QUOTE_API_V6
         params = {
             'inputMint': mint,
             'outputMint': USDC_MINT,
-            'amount': '1000000000',
+            'amount': '1000000000',  # 1 token (asumiendo 9 decimals)
             'slippageBps': '50'
         }
         
         result = await api_call_with_retry(url, params=params)
         
         if result and 'outAmount' in result:
+            # outAmount está en USDC (6 decimales)
             price_usd = float(result['outAmount']) / 1_000_000
             
             if price_usd > 0:
                 state.stats['jupiter_quote_success'] += 1
                 logger.debug(f"✅ Jupiter Quote: {mint[:8]} = ${price_usd:.8f}")
                 return price_usd
+        
+        # Intentar 2: Token → SOL → USDC (método indirecto)
+        # Primero obtener precio de Token en SOL
+        params_sol = {
+            'inputMint': mint,
+            'outputMint': SOL_MINT,
+            'amount': '1000000000',
+            'slippageBps': '50'
+        }
+        
+        result_sol = await api_call_with_retry(url, params=params_sol)
+        
+        if result_sol and 'outAmount' in result_sol:
+            sol_amount = float(result_sol['outAmount']) / 1_000_000_000  # SOL tiene 9 decimals
+            
+            # Ahora obtener precio de SOL en USDC
+            params_sol_usdc = {
+                'inputMint': SOL_MINT,
+                'outputMint': USDC_MINT,
+                'amount': str(int(sol_amount * 1_000_000_000)),
+                'slippageBps': '50'
+            }
+            
+            result_usdc = await api_call_with_retry(url, params=params_sol_usdc)
+            
+            if result_usdc and 'outAmount' in result_usdc:
+                price_usd = float(result_usdc['outAmount']) / 1_000_000
+                
+                if price_usd > 0:
+                    state.stats['jupiter_quote_success'] += 1
+                    logger.debug(f"✅ Jupiter Quote (via SOL): {mint[:8]} = ${price_usd:.8f}")
+                    return price_usd
         
         return None
         
@@ -948,46 +784,46 @@ async def get_token_price_jupiter_quote(mint: str) -> Optional[float]:
         return None
 
 # ═══════════════════════════════════════════════════════════════
-# 🔧 GET PRICE CON MORALIS PRIMERO
+# 🆕 GET PRICE CON MORALIS PRIMERO + FALLBACK MEJORADO
 # ═══════════════════════════════════════════════════════════════
 
 async def get_token_price(mint: str) -> Optional[float]:
     """
     🆕 NUEVO ORDEN DE FALLBACK:
     1. Moralis (PRINCIPAL) ⭐
-    2. CoinGecko
-    3. Shyft
-    4. Jupiter Quote
-    5. DexScreener
+    2. CoinGecko (FALLBACK 1)
+    3. Shyft (FALLBACK 2)
+    4. Jupiter Quote (FALLBACK 3)
+    5. DexScreener (FALLBACK 4)
+    6. Jupiter V3 (FALLBACK 5)
     """
     
     if config.SIMULATION_MODE:
         return 0.0001 + (hash(mint) % 100) * 0.000001
     
     # 1️⃣ MORALIS (PRINCIPAL) ⭐⭐⭐
-    price = await get_token_price_moralis(mint)
+    price = await moralis_client.get_token_price(mint)
     if price:
+        state.stats['moralis_success'] += 1
         return price
     
-    # 2️⃣ COINGECKO
+    # 2️⃣ COINGECKO (FALLBACK 1)
     price = await get_token_price_coingecko(mint)
     if price:
-        logger.info(f"🔄 Fallback CoinGecko: {mint[:8]} = ${price:.8f}")
         return price
     
-    # 3️⃣ SHYFT
+    # 3️⃣ SHYFT (FALLBACK 2)
     price = await get_token_price_shyft(mint)
     if price:
-        logger.info(f"🔄 Fallback Shyft: {mint[:8]} = ${price:.8f}")
         return price
     
-    # 4️⃣ JUPITER QUOTE
+    # 4️⃣ JUPITER QUOTE (FALLBACK 3)
     price = await get_token_price_jupiter_quote(mint)
     if price:
-        logger.info(f"🔄 Fallback Jupiter Quote: {mint[:8]} = ${price:.8f}")
+        logger.info(f"✅ Jupiter Quote: {mint[:8]} = ${price:.8f}")
         return price
     
-    # 5️⃣ DexScreener
+    # 5️⃣ DexScreener (FALLBACK 4)
     try:
         url = f"{config.DEXSCREENER_API}/tokens/{mint}"
         result = await api_call_with_retry(url)
@@ -1002,13 +838,118 @@ async def get_token_price(mint: str) -> Optional[float]:
                 price = float(pairs[0].get('priceUsd', 0))
                 if price > 0:
                     state.stats['dexscreener_fallback'] += 1
-                    logger.info(f"🔄 Fallback DexScreener: {mint[:8]} = ${price:.8f}")
+                    logger.info(f"✅ DexScreener: {mint[:8]} = ${price:.8f}")
                     return price
+    except Exception:
+        pass
+    
+    # 6️⃣ Jupiter V3 (FALLBACK 5)
+    try:
+        url = f"{config.JUPITER_PRICE_API_V3}?ids={mint}"
+        result = await api_call_with_retry(url)
+        
+        if result and mint in result:
+            price = float(result[mint].get('usdPrice', 0))
+            if price > 0:
+                state.stats['jupiter_v3_fallback'] += 1
+                logger.info(f"✅ Jupiter V3: {mint[:8]} = ${price:.8f}")
+                return price
     except Exception:
         pass
     
     logger.warning(f"⚠️ No se pudo obtener precio para {mint[:8]}")
     return None
+
+# ═══════════════════════════════════════════════════════════════
+# 🚀 MONITOREO DE POSICIONES OPTIMIZADO CON BATCH MORALIS
+# ═══════════════════════════════════════════════════════════════
+
+async def check_positions():
+    """✅ Usar Moralis batch para posiciones"""
+    
+    if not state.positions:
+        logger.debug("📊 No hay posiciones abiertas para monitorear")
+        return
+    
+    logger.info(f"🔍 Monitoreando {len(state.positions)} posiciones...")
+    
+    # 🚀 BATCH REQUEST CON MORALIS (mucho más rápido)
+    mints = list(state.positions.keys())
+    
+    if moralis_client.api_key:
+        logger.debug("📡 Obteniendo precios batch de Moralis...")
+        prices = await moralis_client.get_multiple_prices(mints)
+    else:
+        # Fallback a CoinGecko si no hay Moralis
+        logger.debug("📡 Obteniendo precios batch de CoinGecko...")
+        prices = await get_multiple_prices_coingecko(mints)
+    
+    # Procesar cada posición
+    for mint, position in list(state.positions.items()):
+        try:
+            # Usar precio del batch o fallback individual
+            current_price = prices.get(mint)
+            
+            if not current_price:
+                logger.debug(f"🔄 Fallback individual para {position.symbol}")
+                current_price = await get_token_price(mint)
+            
+            if not current_price:
+                logger.warning(f"⚠️ No se pudo obtener precio para {position.symbol} ({mint[:8]})")
+                continue
+            
+            # Actualizar precios históricos
+            if current_price > position.highest_price:
+                position.highest_price = current_price
+                logger.debug(f"📈 {position.symbol} nuevo máximo: ${current_price:.8f}")
+            
+            if current_price < position.lowest_price:
+                position.lowest_price = current_price
+                logger.debug(f"📉 {position.symbol} nuevo mínimo: ${current_price:.8f}")
+            
+            # Calcular métricas
+            pnl = position.current_pnl(current_price)
+            hold_time = position.hold_time_minutes()
+            
+            # ✅ LOG DETALLADO en cada check
+            logger.info(
+                f"📊 {position.symbol}: "
+                f"Precio: ${current_price:.8f} | "
+                f"P&L: {pnl:+.2f}% | "
+                f"Tiempo: {hold_time:.1f}min | "
+                f"Max: ${position.highest_price:.8f} | "
+                f"Min: ${position.lowest_price:.8f}"
+            )
+            
+            # Evaluar condiciones de salida
+            exit_reason = None
+            
+            # Stop Loss
+            if pnl <= config.STOP_LOSS_PERCENT:
+                exit_reason = "STOP_LOSS"
+                logger.warning(f"🛑 {position.symbol} alcanzó STOP LOSS: {pnl:.2f}%")
+            
+            # Take Profit 2 (mayor ganancia primero)
+            elif pnl >= config.TAKE_PROFIT_2:
+                exit_reason = "TAKE_PROFIT_2"
+                logger.info(f"💰 {position.symbol} alcanzó TP2: {pnl:.2f}%")
+            
+            # Take Profit 1
+            elif pnl >= config.TAKE_PROFIT_1:
+                exit_reason = "TAKE_PROFIT_1"
+                logger.info(f"✅ {position.symbol} alcanzó TP1: {pnl:.2f}%")
+            
+            # Trailing stop (opcional) - timeout con pérdida
+            elif hold_time > 60 and pnl < -3:
+                exit_reason = "TIMEOUT_NEGATIVE"
+                logger.info(f"⏱️ {position.symbol} timeout con pérdida: {pnl:.2f}%")
+            
+            # Ejecutar salida si hay razón
+            if exit_reason:
+                await exit_position(mint, position, current_price, exit_reason)
+        
+        except Exception as e:
+            logger.error(f"❌ Error monitoreando {position.symbol}: {e}", exc_info=True)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
@@ -1294,96 +1235,8 @@ async def buy_token(token: TokenData, ml_confidence: float):
     logger.warning(f"⚠️ MODO REAL no implementado")
 
 # ═══════════════════════════════════════════════════════════════
-# ✅ GESTIÓN DE POSICIONES CON MORALIS BATCH
+# ✅ CERRAR POSICIÓN MEJORADO
 # ═══════════════════════════════════════════════════════════════
-
-async def check_positions():
-    """✅ Monitoreo optimizado con Moralis batch"""
-    
-    if not state.positions:
-        logger.debug("📊 No hay posiciones abiertas para monitorear")
-        return
-    
-    logger.info(f"🔍 Monitoreando {len(state.positions)} posiciones...")
-    
-    # 🚀 BATCH REQUEST CON MORALIS (mucho más rápido)
-    mints = list(state.positions.keys())
-    
-    if config.MORALIS_API_KEY:
-        logger.debug("📡 Obteniendo precios batch de Moralis...")
-        prices = await get_multiple_prices_moralis(mints)
-    elif config.COINGECKO_API_KEY:
-        logger.debug("📡 Obteniendo precios batch de CoinGecko (fallback)...")
-        prices = await get_multiple_prices_coingecko(mints)
-    else:
-        prices = {}
-    
-    # Procesar cada posición
-    for mint, position in list(state.positions.items()):
-        try:
-            # Usar precio del batch o fallback individual
-            current_price = prices.get(mint)
-            
-            if not current_price:
-                logger.debug(f"🔄 Fallback individual para {position.symbol}")
-                current_price = await get_token_price(mint)
-            
-            if not current_price:
-                logger.warning(f"⚠️ No se pudo obtener precio para {position.symbol} ({mint[:8]})")
-                continue
-            
-            # Actualizar precios históricos
-            if current_price > position.highest_price:
-                position.highest_price = current_price
-                logger.debug(f"📈 {position.symbol} nuevo máximo: ${current_price:.8f}")
-            
-            if current_price < position.lowest_price:
-                position.lowest_price = current_price
-                logger.debug(f"📉 {position.symbol} nuevo mínimo: ${current_price:.8f}")
-            
-            # Calcular métricas
-            pnl = position.current_pnl(current_price)
-            hold_time = position.hold_time_minutes()
-            
-            # ✅ LOG DETALLADO en cada check
-            logger.info(
-                f"📊 {position.symbol}: "
-                f"Precio: ${current_price:.8f} | "
-                f"P&L: {pnl:+.2f}% | "
-                f"Tiempo: {hold_time:.1f}min | "
-                f"Max: ${position.highest_price:.8f} | "
-                f"Min: ${position.lowest_price:.8f}"
-            )
-            
-            # Evaluar condiciones de salida
-            exit_reason = None
-            
-            # Stop Loss
-            if pnl <= config.STOP_LOSS_PERCENT:
-                exit_reason = "STOP_LOSS"
-                logger.warning(f"🛑 {position.symbol} alcanzó STOP LOSS: {pnl:.2f}%")
-            
-            # Take Profit 2
-            elif pnl >= config.TAKE_PROFIT_2:
-                exit_reason = "TAKE_PROFIT_2"
-                logger.info(f"💰 {position.symbol} alcanzó TP2: {pnl:.2f}%")
-            
-            # Take Profit 1
-            elif pnl >= config.TAKE_PROFIT_1:
-                exit_reason = "TAKE_PROFIT_1"
-                logger.info(f"✅ {position.symbol} alcanzó TP1: {pnl:.2f}%")
-            
-            # Timeout con pérdida
-            elif hold_time > 60 and pnl < -3:
-                exit_reason = "TIMEOUT_NEGATIVE"
-                logger.info(f"⏱️ {position.symbol} timeout con pérdida: {pnl:.2f}%")
-            
-            # Ejecutar salida si hay razón
-            if exit_reason:
-                await exit_position(mint, position, current_price, exit_reason)
-        
-        except Exception as e:
-            logger.error(f"❌ Error monitoreando {position.symbol}: {e}", exc_info=True)
 
 async def exit_position(mint: str, position: Position, exit_price: float, reason: str):
     """✅ Cierre mejorado con notificaciones completas"""
@@ -1457,3 +1310,248 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
         
     except Exception as e:
         logger.error(f"❌ Error en exit_position: {e}", exc_info=True)
+
+# ═══════════════════════════════════════════════════════════════
+# ✅ MAIN LOOP MEJORADO (FIXED)
+# ═══════════════════════════════════════════════════════════════
+
+async def main_trading_loop():
+    """✅ Loop principal con manejo robusto de errores"""
+    
+    try:
+        from health_server import update_bot_status
+    except ImportError:
+        update_bot_status = None
+    
+    logger.info("🚀 Bot iniciando (versión 5.3 - MORALIS + JUPITER QUOTE)...")
+    
+    # Validar APIs
+    if config.MORALIS_API_KEY:
+        logger.info("✅ Moralis API key configurada (API Principal)")
+    else:
+        logger.warning("⚠️ MORALIS_API_KEY no configurada")
+    
+    if config.COINGECKO_API_KEY:
+        logger.info("✅ CoinGecko API key configurada (Fallback 1)")
+    else:
+        logger.warning("⚠️ COINGECKO_API_KEY no configurada")
+    
+    if config.SHYFT_API_KEY:
+        logger.info("✅ Shyft API key configurada (Fallback 2)")
+    else:
+        logger.warning("⚠️ SHYFT_API_KEY no configurada")
+    
+    logger.info("✅ Jupiter Quote API habilitada (Fallback 3 - sin API key)")
+    
+    # Inicializar
+    await init_database()
+    
+    if config.ENABLE_TELEGRAM and TELEGRAM_AVAILABLE:
+        try:
+            state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
+            mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+            await send_telegram(
+                f"🚀 <b>Bot v5.3 Iniciado</b>\n\n"
+                f"Modo: {mode}\n"
+                f"API: 🆕 MORALIS → CoinGecko → Shyft → Jupiter Quote → DexScreener → Jupiter V3\n"
+                f"Stop Loss: {config.STOP_LOSS_PERCENT}%\n"
+                f"Take Profit: {config.TAKE_PROFIT_1}% / {config.TAKE_PROFIT_2}%\n"
+                f"Scan Interval: {config.SCAN_INTERVAL_SEC}s\n\n"
+                f"✅ Moralis como principal + Batch requests optimizadas"
+            )
+        except Exception as e:
+            logger.error(f"❌ Error Telegram init: {e}")
+    
+    logger.info(f"🧠 ML: {'ENABLED' if ml_predictor.is_trained else 'DISABLED'}")
+    logger.info(f"🧪 DRY_RUN: {config.DRY_RUN}")
+    logger.info(f"📊 Monitoreo cada {config.SCAN_INTERVAL_SEC}s")
+    
+    # Update health
+    if update_bot_status:
+        update_bot_status(
+            running=True, scans=0, positions=0, signals=0,
+            trades=0, wins=0, losses=0, total_pnl=0.0,
+            ml_enabled=ml_predictor.is_trained,
+            mode="DRY_RUN" if config.DRY_RUN else "REAL"
+        )
+    
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
+    # Loop principal
+    while state.running:
+        try:
+            state.stats['scans'] += 1
+            scan_start = datetime.now()
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🔄 SCAN #{state.stats['scans']} - {scan_start.strftime('%H:%M:%S')}")
+            logger.info(f"{'='*60}")
+            
+            if update_bot_status:
+                update_bot_status(
+                    running=True,
+                    scans=state.stats['scans'],
+                    positions=len(state.positions),
+                    signals=state.stats['signals'],
+                    trades=state.stats['trades'],
+                    wins=state.stats['wins'],
+                    losses=state.stats['losses'],
+                    total_pnl=state.stats['total_pnl'],
+                    ml_enabled=ml_predictor.is_trained,
+                    mode="DRY_RUN" if config.DRY_RUN else "REAL"
+                )
+            
+            # 1️⃣ Escanear tokens
+            logger.info("📡 Escaneando tokens de Jupiter...")
+            tokens = await scan_for_signals()
+            
+            if tokens:
+                logger.info(f"✅ Encontrados {len(tokens)} tokens candidatos")
+                
+                # 2️⃣ Evaluar señales
+                for token in tokens:
+                    if len(state.positions) >= config.MAX_POSITIONS:
+                        logger.warning(f"⚠️ Límite de posiciones alcanzado ({config.MAX_POSITIONS})")
+                        break
+                    
+                    has_signal, score, ml_conf = has_buy_signal(token)
+                    
+                    if has_signal:
+                        state.stats['signals'] += 1
+                        state.watchlist[token.mint] = token
+                        logger.info(f"🎯 Señal detectada: {token.symbol} (Score: {score:.0f}, ML: {ml_conf:.1f}%)")
+                        await buy_token(token, ml_conf)
+                        await asyncio.sleep(1)
+            else:
+                logger.warning("⚠️ No se encontraron tokens en el scan")
+            
+            # 3️⃣ ✅ MONITOREAR POSICIONES (CRÍTICO)
+            if state.positions:
+                logger.info(f"\n🔍 MONITOREANDO {len(state.positions)} POSICIONES:")
+                await check_positions()
+            else:
+                logger.debug("📊 No hay posiciones para monitorear")
+            
+            # 4️⃣ Stats periódicas
+            if state.stats['scans'] % 5 == 0:
+                win_rate = (state.stats['wins'] / max(1, state.stats['wins'] + state.stats['losses'])) * 100
+                ml_accuracy = (state.stats['ml_correct'] / max(1, state.stats['ml_predictions'])) * 100 if state.stats['ml_predictions'] > 0 else 0
+                
+                logger.info(f"\n📊 ESTADÍSTICAS:")
+                logger.info(f"   Scans: {state.stats['scans']}")
+                logger.info(f"   Señales: {state.stats['signals']}")
+                logger.info(f"   Trades: {state.stats['trades']}")
+                logger.info(f"   Win Rate: {win_rate:.1f}% ({state.stats['wins']}W/{state.stats['losses']}L)")
+                logger.info(f"   P&L Total: {state.stats['total_pnl']:+.2f}%")
+                logger.info(f"   ML Accuracy: {ml_accuracy:.1f}%")
+                logger.info(f"   Posiciones Abiertas: {len(state.positions)}")
+                
+                logger.info(
+                    f"🆕 APIs: "
+                    f"Moralis OK: {state.stats['moralis_success']} | "
+                    f"CoinGecko OK: {state.stats['coingecko_success']} | "
+                    f"Shyft OK: {state.stats['shyft_success']} | "
+                    f"Jupiter Quote OK: {state.stats['jupiter_quote_success']} | "
+                    f"DexScreener: {state.stats['dexscreener_fallback']} | "
+                    f"Jupiter V3: {state.stats['jupiter_v3_fallback']}"
+                )
+            
+            # Reset error counter si llegó hasta aquí
+            consecutive_errors = 0
+            
+            # 5️⃣ Esperar siguiente scan
+            scan_duration = (datetime.now() - scan_start).total_seconds()
+            sleep_time = max(1, config.SCAN_INTERVAL_SEC - scan_duration)
+            
+            logger.info(f"⏳ Próximo scan en {sleep_time:.1f}s...")
+            await asyncio.sleep(sleep_time)
+            
+        except KeyboardInterrupt:
+            logger.info("\n⏸️ Deteniendo bot por usuario...")
+            state.running = False
+            break
+        
+        except Exception as e:
+            consecutive_errors += 1
+            logger.error(
+                f"❌ ERROR EN MAIN LOOP ({consecutive_errors}/{max_consecutive_errors}): {e}",
+                exc_info=True
+            )
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.critical("🚨 DEMASIADOS ERRORES CONSECUTIVOS - Deteniendo bot")
+                await send_telegram(
+                    "🚨 <b>Bot Detenido</b>\n\n"
+                    f"Razón: {max_consecutive_errors} errores consecutivos\n"
+                    f"Último error: {str(e)[:200]}"
+                )
+                break
+            
+            # Esperar más tiempo en caso de error
+            await asyncio.sleep(min(30, consecutive_errors * 10))
+    
+    # Cleanup
+    logger.info("\n🧹 Limpiando recursos...")
+    
+    # Cerrar posiciones abiertas
+    if state.positions:
+        logger.warning(f"⚠️ Cerrando {len(state.positions)} posiciones pendientes...")
+        for mint, position in list(state.positions.items()):
+            try:
+                current_price = await get_token_price(mint)
+                if current_price:
+                    await exit_position(mint, position, current_price, "BOT_STOPPED")
+            except Exception as e:
+                logger.error(f"Error cerrando {position.symbol}: {e}")
+    
+    if state.db_pool:
+        await state.db_pool.close()
+    
+    if state.connector:
+        await state.connector.close()
+    
+    if state.telegram_bot:
+        await send_telegram(
+            f"👋 <b>Bot Detenido</b>\n\n"
+            f"Scans: {state.stats['scans']}\n"
+            f"Trades: {state.stats['trades']}\n"
+            f"P&L Final: {state.stats['total_pnl']:+.2f}%"
+        )
+    
+    logger.info("✅ Bot detenido correctamente")
+
+# ═══════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
+
+async def run_bot_with_health_server():
+    """Ejecutar bot + health server"""
+    
+    try:
+        from health_server import start_health_server, update_bot_status
+        
+        update_bot_status(
+            running=True, scans=0, positions=0, signals=0,
+            trades=0, wins=0, losses=0, total_pnl=0.0,
+            ml_enabled=ml_predictor.is_trained,
+            mode="DRY_RUN" if config.DRY_RUN else "REAL"
+        )
+        
+        logger.info("🏥 Health server habilitado en puerto 8080")
+        
+        await asyncio.gather(
+            main_trading_loop(),
+            start_health_server(port=8080)
+        )
+        
+    except ImportError:
+        logger.warning("⚠️ health_server.py no encontrado - solo bot")
+        await main_trading_loop()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(run_bot_with_health_server())
+    except KeyboardInterrupt:
+        logger.info("👋 Hasta luego")
+        sys.exit(0)
