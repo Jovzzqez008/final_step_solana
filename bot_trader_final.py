@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V4.1 - ML READY + FIXED
+🚀 SOLANA ELITE TRADING BOT V5.0 - SHYFT INTEGRATION
 ====================================================
-✅ Fallback APIs: Jupiter → CoinGecko → DexScreener
-✅ Machine Learning integrado (predicción + entrenamiento)
-✅ Health Server integrado para Railway
-✅ Sesiones HTTP cerradas correctamente
-✅ Retry inteligente con DNS caching
+✅ Shyft API como principal (más confiable que Jupiter)
+✅ Batch requests para posiciones (eficiente)
+✅ Fallback inteligente: Shyft → DexScreener → Jupiter
+✅ Machine Learning integrado
+✅ Health Server para Railway
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
-✅ Modo DRY_RUN y SIMULATION completo
+✅ Modo DRY_RUN completo
 
-Version: 4.1 (2025) - Production Ready + FIXED
+Version: 5.0 (2025) - Shyft Integration
 """
 
 import os
@@ -39,7 +39,7 @@ from solana.rpc.async_api import AsyncClient
 from solana.rpc.types import TxOpts
 from solana.rpc.commitment import Processed, Confirmed
 
-# ML Libraries (ligeras)
+# ML Libraries
 try:
     from sklearn.ensemble import RandomForestClassifier
     ML_AVAILABLE = True
@@ -64,12 +64,12 @@ except ImportError:
     print("⚠️ python-telegram-bot no instalado")
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIGURACIÓN
+# CONFIGURACIÓN CON SHYFT API
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class Config:
-    """Configuración centralizada del bot"""
+    """Configuración centralizada con Shyft API"""
     
     # ═══ WALLET & RPC ═══
     PRIVATE_KEY: str = os.getenv('WALLET_PRIVATE_KEY', '')
@@ -90,17 +90,18 @@ class Config:
     TRADE_AMOUNT_SOL: float = float(os.getenv('TRADE_AMOUNT_SOL', '0.01'))
     SLIPPAGE_BPS: int = int(os.getenv('SLIPPAGE_BPS', '300'))
     
-    # ═══ APIs (con fallbacks mejorados) ═══
-    JUPITER_QUOTE_API: str = 'https://quote-api.jup.ag/v6/quote'
-    JUPITER_SWAP_API: str = 'https://quote-api.jup.ag/v6/swap'
-    JUPITER_PRICE_API_V3: str = 'https://lite-api.jup.ag/price/v3'  # NEW: API V3
-    JUPITER_PRICE_API: str = 'https://api.jup.ag/price/v2'  # Fallback V2
-    JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
+    # ═══ 🟢 SHYFT API (PRINCIPAL) ═══
+    SHYFT_API_KEY: str = os.getenv('SHYFT_API_KEY', '')
+    SHYFT_BASE_URL: str = 'https://api.shyft.to/sol/v1'
+    SHYFT_NETWORK: str = 'mainnet-beta'
+    SHYFT_TOKEN_PRICE: str = f'{SHYFT_BASE_URL}/token/get_price'
+    SHYFT_TOKEN_INFO: str = f'{SHYFT_BASE_URL}/token/get_info'
+    SHYFT_MULTIPLE_PRICES: str = f'{SHYFT_BASE_URL}/token/get_multiple_prices'
     
-    # Fallback APIs (en orden de confiabilidad)
+    # ═══ FALLBACK APIs ═══
     DEXSCREENER_API: str = 'https://api.dexscreener.com/latest/dex'
-    RAYDIUM_PRICE_API: str = 'https://api.raydium.io/v2/main/price'
-    COINGECKO_API: str = 'https://api.coingecko.com/api/v3'
+    JUPITER_PRICE_API_V3: str = 'https://lite-api.jup.ag/price/v3'
+    JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
     
     JUPITER_SCAN_CATEGORY: str = os.getenv('JUPITER_SCAN_CATEGORY', 'toporganicscore')
     JUPITER_SCAN_INTERVAL: str = os.getenv('JUPITER_SCAN_INTERVAL', '5m')
@@ -131,14 +132,15 @@ class Config:
     # ═══ RETRY & TIMEOUT ═══
     MAX_RETRIES: int = int(os.getenv('MAX_RETRIES', '3'))
     API_TIMEOUT_SEC: int = int(os.getenv('API_TIMEOUT_SEC', '15'))
-    RETRY_DELAY_SEC: int = int(os.getenv('RETRY_DELAY_SEC', '3'))
+    RETRY_DELAY_SEC: int = int(os.getenv('RETRY_DELAY_SEC', '2'))
+    SHYFT_RATE_LIMIT_DELAY: float = 0.6  # 100 req/min
     
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
 
 config = Config()
 
 # ═══════════════════════════════════════════════════════════════
-# LOGGING MEJORADO
+# LOGGING
 # ═══════════════════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -154,7 +156,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
-# MACHINE LEARNING - MODELO INTEGRADO
+# MACHINE LEARNING
 # ═══════════════════════════════════════════════════════════════
 
 class MLPredictor:
@@ -170,7 +172,6 @@ class MLPredictor:
     def _init_model(self):
         """Inicializar modelo con datos sintéticos"""
         try:
-            # Dataset sintético inicial (10 ejemplos)
             X_train = np.array([
                 [5, 10, 80, 120000, 250000],
                 [1, 2, 40, 50000, 70000],
@@ -201,10 +202,7 @@ class MLPredictor:
             self.is_trained = False
     
     def predict_signal_strength(self, token_data: Dict) -> Tuple[float, str]:
-        """
-        Predecir probabilidad de éxito
-        Returns: (confidence_percent, signal)
-        """
+        """Predecir probabilidad de éxito"""
         if not self.is_trained or not ML_AVAILABLE:
             return 50.0, "NO_ML"
         
@@ -295,26 +293,31 @@ class BotState:
             'ml_predictions': 0,
             'ml_correct': 0,
             'api_errors': 0,
-            'jupiter_v3_success': 0,
-            'jupiter_v2_fallback': 0,
-            'jupiter_failures': 0,
+            
+            # Shyft stats
+            'shyft_success': 0,
+            'shyft_failures': 0,
+            'shyft_rate_limited': 0,
+            
+            # Fallback stats
             'dexscreener_fallback': 0,
-            'raydium_fallback': 0,
-            'coingecko_fallback': 0
+            'jupiter_v3_fallback': 0,
+            'jupiter_failures': 0
         }
         
         self.last_trade_time = 0
         self.running = True
         self.connector: Optional[aiohttp.TCPConnector] = None
+        self.last_shyft_call = 0
 
 state = BotState()
 
 # ═══════════════════════════════════════════════════════════════
-# HTTP CLIENT ROBUSTO - FIXED
+# HTTP CLIENT
 # ═══════════════════════════════════════════════════════════════
 
 async def get_http_session() -> aiohttp.ClientSession:
-    """Sesión HTTP optimizada con DNS caching"""
+    """Sesión HTTP optimizada"""
     if not state.connector:
         state.connector = aiohttp.TCPConnector(
             limit=50,
@@ -332,7 +335,7 @@ async def get_http_session() -> aiohttp.ClientSession:
     )
 
 async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Optional[dict]:
-    """API call con retry y cierre correcto de sesión - FIXED"""
+    """API call con retry"""
     
     for attempt in range(config.MAX_RETRIES):
         session = None
@@ -342,145 +345,184 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
             if method == 'GET':
                 async with session.get(url, **kwargs) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        return data
+                        return await resp.json()
                     elif resp.status == 429:
                         if attempt < config.MAX_RETRIES - 1:
                             await asyncio.sleep(config.RETRY_DELAY_SEC * (attempt + 1))
                             continue
-                    else:
-                        logger.debug(f"API error {resp.status} for {url}")
                         
             elif method == 'POST':
                 async with session.post(url, **kwargs) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
-                        return data
+                        return await resp.json()
             
-        except aiohttp.ClientConnectorError as e:
-            logger.debug(f"Connection error (attempt {attempt + 1}): {str(e)[:50]}")
+        except aiohttp.ClientConnectorError:
             state.stats['api_errors'] += 1
-            
             if attempt < config.MAX_RETRIES - 1:
                 await asyncio.sleep(config.RETRY_DELAY_SEC)
                 continue
                 
         except asyncio.TimeoutError:
-            logger.debug(f"Timeout (attempt {attempt + 1}) for {url}")
             if attempt < config.MAX_RETRIES - 1:
                 await asyncio.sleep(config.RETRY_DELAY_SEC)
                 continue
                 
         except Exception as e:
-            logger.debug(f"Unexpected error: {str(e)[:50]}")
+            logger.debug(f"API error: {str(e)[:50]}")
             if attempt < config.MAX_RETRIES - 1:
                 continue
         
         finally:
-            # FIX CRÍTICO: Cerrar sesión correctamente
             if session and not session.closed:
                 await session.close()
     
     return None
 
 # ═══════════════════════════════════════════════════════════════
-# APIs CON FALLBACK INTELIGENTE
+# 🟢 SHYFT API CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+async def shyft_rate_limit():
+    """Rate limiting para Shyft (100 req/min)"""
+    current_time = time.time()
+    time_since_last_call = current_time - state.last_shyft_call
+    
+    if time_since_last_call < config.SHYFT_RATE_LIMIT_DELAY:
+        await asyncio.sleep(config.SHYFT_RATE_LIMIT_DELAY - time_since_last_call)
+    
+    state.last_shyft_call = time.time()
+
+async def get_token_price_shyft(mint: str) -> Optional[float]:
+    """Obtener precio usando Shyft API"""
+    if not config.SHYFT_API_KEY:
+        return None
+    
+    try:
+        await shyft_rate_limit()
+        
+        url = config.SHYFT_TOKEN_PRICE
+        params = {
+            'network': config.SHYFT_NETWORK,
+            'token_address': mint
+        }
+        headers = {
+            'x-api-key': config.SHYFT_API_KEY
+        }
+        
+        result = await api_call_with_retry(url, params=params, headers=headers)
+        
+        if result and result.get('success'):
+            price = float(result.get('result', {}).get('price', 0))
+            if price > 0:
+                state.stats['shyft_success'] += 1
+                logger.debug(f"✅ Shyft: {mint[:8]} = ${price:.8f}")
+                return price
+        
+        if result and not result.get('success'):
+            error_msg = result.get('message', '')
+            if 'rate limit' in error_msg.lower():
+                state.stats['shyft_rate_limited'] += 1
+                await asyncio.sleep(2)
+        
+        return None
+        
+    except Exception as e:
+        logger.debug(f"Shyft error: {str(e)[:100]}")
+        state.stats['shyft_failures'] += 1
+        return None
+
+async def get_multiple_prices_shyft(mints: List[str]) -> Dict[str, float]:
+    """Obtener múltiples precios en una sola llamada"""
+    if not config.SHYFT_API_KEY or not mints:
+        return {}
+    
+    try:
+        await shyft_rate_limit()
+        
+        url = config.SHYFT_MULTIPLE_PRICES
+        headers = {
+            'x-api-key': config.SHYFT_API_KEY,
+            'Content-Type': 'application/json'
+        }
+        json_data = {
+            'network': config.SHYFT_NETWORK,
+            'token_addresses': mints
+        }
+        
+        result = await api_call_with_retry(
+            url, 
+            method='POST',
+            headers=headers,
+            json=json_data
+        )
+        
+        if result and result.get('success'):
+            prices = {}
+            for item in result.get('result', []):
+                mint = item.get('address')
+                price = float(item.get('price', 0))
+                if mint and price > 0:
+                    prices[mint] = price
+            
+            logger.info(f"✅ Shyft batch: {len(prices)}/{len(mints)} precios")
+            return prices
+        
+        return {}
+        
+    except Exception as e:
+        logger.debug(f"Shyft batch error: {str(e)[:100]}")
+        return {}
+
+# ═══════════════════════════════════════════════════════════════
+# GET PRICE CON FALLBACK
 # ═══════════════════════════════════════════════════════════════
 
 async def get_token_price(mint: str) -> Optional[float]:
-    """
-    Obtener precio con fallback múltiple y robusto:
-    Jupiter V3 → DexScreener → Raydium → Jupiter V2 → CoinGecko
-    """
+    """🟢 Shyft → DexScreener → Jupiter V3"""
     
-    # SIMULATION MODE
     if config.SIMULATION_MODE:
         return 0.0001 + (hash(mint) % 100) * 0.000001
     
-    # 1️⃣ Intentar Jupiter Price API V3 (RECOMENDADO - MÁS CONFIABLE)
+    # 1️⃣ SHYFT
+    price = await get_token_price_shyft(mint)
+    if price:
+        return price
+    
+    # 2️⃣ DexScreener
+    try:
+        url = f"{config.DEXSCREENER_API}/tokens/{mint}"
+        result = await api_call_with_retry(url)
+        
+        if result and 'pairs' in result and len(result['pairs']) > 0:
+            pairs = sorted(
+                result['pairs'], 
+                key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0), 
+                reverse=True
+            )
+            if pairs:
+                price = float(pairs[0].get('priceUsd', 0))
+                if price > 0:
+                    state.stats['dexscreener_fallback'] += 1
+                    logger.info(f"✅ DexScreener: {mint[:8]} = ${price:.8f}")
+                    return price
+    except Exception:
+        pass
+    
+    # 3️⃣ Jupiter V3
     try:
         url = f"{config.JUPITER_PRICE_API_V3}?ids={mint}"
         result = await api_call_with_retry(url)
         
         if result and mint in result:
-            price_data = result[mint]
-            price = float(price_data.get('usdPrice', 0))
+            price = float(result[mint].get('usdPrice', 0))
             if price > 0:
-                state.stats['jupiter_v3_success'] += 1
-                logger.debug(f"✅ Jupiter V3: {mint[:8]} = ${price:.8f}")
+                state.stats['jupiter_v3_fallback'] += 1
+                logger.info(f"✅ Jupiter V3: {mint[:8]} = ${price:.8f}")
                 return price
-    except Exception as e:
-        logger.debug(f"Jupiter V3 error: {e}")
+    except Exception:
+        pass
     
-    # 2️⃣ Fallback a DexScreener (MUY CONFIABLE según comunidad)
-    try:
-        logger.debug(f"🔄 Fallback DexScreener para {mint[:8]}")
-        url = f"{config.DEXSCREENER_API}/tokens/{mint}"
-        
-        result = await api_call_with_retry(url)
-        
-        if result and 'pairs' in result and len(result['pairs']) > 0:
-            # Tomar el par con mayor liquidez
-            pairs = sorted(result['pairs'], key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0), reverse=True)
-            if pairs:
-                price = float(pairs[0].get('priceUsd', 0))
-                if price > 0:
-                    state.stats['dexscreener_fallback'] += 1
-                    logger.debug(f"✅ DexScreener: {mint[:8]} = ${price:.8f}")
-                    return price
-    except Exception as e:
-        logger.debug(f"DexScreener error: {e}")
-    
-    # 3️⃣ Fallback a Raydium API (rápida y gratis)
-    try:
-        logger.debug(f"🔄 Fallback Raydium para {mint[:8]}")
-        url = config.RAYDIUM_PRICE_API
-        
-        result = await api_call_with_retry(url)
-        
-        if result and mint in result:
-            price = float(result[mint])
-            if price > 0:
-                state.stats['raydium_fallback'] += 1
-                logger.debug(f"✅ Raydium: {mint[:8]} = ${price:.8f}")
-                return price
-    except Exception as e:
-        logger.debug(f"Raydium error: {e}")
-    
-    # 4️⃣ Fallback a Jupiter V2 (API antigua)
-    try:
-        logger.debug(f"🔄 Fallback Jupiter V2 para {mint[:8]}")
-        url = f"{config.JUPITER_PRICE_API}?ids={mint}"
-        result = await api_call_with_retry(url)
-        
-        if result and 'data' in result and mint in result['data']:
-            price = float(result['data'][mint].get('price', 0))
-            if price > 0:
-                state.stats['jupiter_v2_fallback'] += 1
-                logger.debug(f"✅ Jupiter V2: {mint[:8]} = ${price:.8f}")
-                return price
-    except Exception as e:
-        logger.debug(f"Jupiter V2 error: {e}")
-    
-    # 5️⃣ Último recurso: CoinGecko
-    try:
-        logger.debug(f"🔄 Fallback CoinGecko para {mint[:8]}")
-        url = f"{config.COINGECKO_API}/simple/token_price/solana"
-        params = {'contract_addresses': mint, 'vs_currencies': 'usd'}
-        
-        result = await api_call_with_retry(url, params=params)
-        
-        if result and mint in result:
-            price = float(result[mint].get('usd', 0))
-            if price > 0:
-                state.stats['coingecko_fallback'] += 1
-                logger.debug(f"✅ CoinGecko: {mint[:8]} = ${price:.8f}")
-                return price
-    except Exception as e:
-        logger.debug(f"CoinGecko error: {e}")
-    
-    # ❌ Todos los fallbacks fallaron
-    logger.warning(f"⚠️ No se pudo obtener precio para {mint[:8]} (todos los fallbacks fallaron)")
+    logger.warning(f"⚠️ No se pudo obtener precio para {mint[:8]}")
     return None
 
 # ═══════════════════════════════════════════════════════════════
@@ -488,7 +530,7 @@ async def get_token_price(mint: str) -> Optional[float]:
 # ═══════════════════════════════════════════════════════════════
 
 async def init_database():
-    """Inicializar PostgreSQL con tabla para ML"""
+    """Inicializar PostgreSQL"""
     if not POSTGRES_AVAILABLE or not config.ENABLE_DB or not config.DATABASE_URL:
         logger.warning("⚠️ Database deshabilitada")
         return
@@ -519,14 +561,14 @@ async def init_database():
                 )
             ''')
             
-        logger.info("✅ Database ML-ready inicializada")
+        logger.info("✅ Database inicializada")
         
     except Exception as e:
         logger.error(f"❌ Error database: {e}")
         state.db_pool = None
 
 async def save_trade_for_ml(token: TokenData, position: Position, exit_price: float, exit_reason: str):
-    """Guardar trade completo para entrenamiento ML"""
+    """Guardar trade para ML"""
     if not state.db_pool:
         return
     
@@ -551,10 +593,10 @@ async def save_trade_for_ml(token: TokenData, position: Position, exit_price: fl
                 exit_reason
             )
             
-        logger.info(f"💾 Trade guardado para ML: {token.symbol} ({pnl:+.2f}%)")
+        logger.info(f"💾 Trade guardado: {token.symbol} ({pnl:+.2f}%)")
         
     except Exception as e:
-        logger.debug(f"Error save_trade_for_ml: {e}")
+        logger.debug(f"Error save_trade: {e}")
 
 # ═══════════════════════════════════════════════════════════════
 # TELEGRAM
@@ -574,11 +616,11 @@ async def send_telegram(message: str):
         logger.debug(f"Error Telegram: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# ESCANEO DE TOKENS - FIXED CON FALLBACK A SIMULATION
+# ESCANEO DE TOKENS
 # ═══════════════════════════════════════════════════════════════
 
 async def scan_for_signals() -> List[TokenData]:
-    """Escanear tokens con ML integrado y fallback automático"""
+    """Escanear tokens con Jupiter"""
     
     if config.SIMULATION_MODE:
         logger.info("🧪 [SIMULATION] Generando tokens simulados")
@@ -600,39 +642,19 @@ async def scan_for_signals() -> List[TokenData]:
         
         return fake_tokens
     
-    # MODO REAL - Jupiter API con fallback
     try:
         category = config.JUPITER_SCAN_CATEGORY
         interval = config.JUPITER_SCAN_INTERVAL
         url = f"{config.JUPITER_TOKENS_API}/{category}/{interval}"
         
-        logger.debug(f"🔍 Jupiter URL: {url}")
-        
         result = await api_call_with_retry(url, params={'limit': 100})
         
-        # Validar respuesta
-        if not result:
+        if not result or not isinstance(result, list):
             logger.warning("⚠️ Jupiter API no respondió")
             state.stats['jupiter_failures'] += 1
-            
-            # NO activar SIMULATION automáticamente - solo loguear
-            if state.stats['jupiter_failures'] >= 5:
-                logger.error(f"❌ Jupiter API falló {state.stats['jupiter_failures']} veces - considera revisar la API")
-            
             return []
         
-        if not isinstance(result, list):
-            logger.warning(f"⚠️ Jupiter response inválida: {type(result)}")
-            state.stats['jupiter_failures'] += 1
-            
-            if state.stats['jupiter_failures'] >= 5:
-                logger.error(f"❌ Jupiter API falló {state.stats['jupiter_failures']} veces - considera revisar la API")
-            
-            return []
-        
-        # Reset contador de fallos si todo OK
         state.stats['jupiter_failures'] = 0
-        
         candidates = []
         
         for token_data in result:
@@ -659,12 +681,11 @@ async def scan_for_signals() -> List[TokenData]:
                 if token.price_usd > 0:
                     candidates.append(token)
                 
-            except Exception as e:
-                logger.debug(f"Error parsing token: {e}")
+            except Exception:
                 continue
         
         if candidates:
-            logger.info(f"✅ Scanned {len(candidates)} tokens from Jupiter")
+            logger.info(f"✅ Scanned {len(candidates)} tokens")
         
         return candidates
         
@@ -672,20 +693,10 @@ async def scan_for_signals() -> List[TokenData]:
         logger.error(f"❌ Error scan_for_signals: {e}")
         state.stats['jupiter_failures'] += 1
         return []
-        
-        if state.stats['jupiter_failures'] >= 3:
-            logger.warning("🔄 Activando SIMULATION MODE por excepciones")
-            config.SIMULATION_MODE = True
-            return await scan_for_signals()
-        
-        return []
 
 def has_buy_signal(token: TokenData) -> Tuple[bool, float, float]:
-    """
-    Evaluar señal con ML integrado
-    Returns: (tiene_señal, score_tradicional, ml_confidence)
-    """
-    # Filtros básicos CRÍTICOS
+    """Evaluar señal con ML"""
+    
     if token.liquidity < config.MIN_LIQUIDITY_USD:
         return False, 0, 0
     
@@ -725,7 +736,6 @@ def has_buy_signal(token: TokenData) -> Tuple[bool, float, float]:
     
     # ML Prediction
     ml_confidence = 50.0
-    ml_signal = "NO_ML"
     
     if config.USE_ML_PREDICTIONS and ml_predictor.is_trained:
         token_dict = {
@@ -735,10 +745,10 @@ def has_buy_signal(token: TokenData) -> Tuple[bool, float, float]:
             'liquidity': token.liquidity,
             'volume_24h': token.volume_24h
         }
-        ml_confidence, ml_signal = ml_predictor.predict_signal_strength(token_dict)
+        ml_confidence, _ = ml_predictor.predict_signal_strength(token_dict)
         state.stats['ml_predictions'] += 1
     
-    # Decisión final: score tradicional Y ML confidence
+    # Decisión final
     min_score = 60
     signal_ok = score >= min_score
     
@@ -746,29 +756,24 @@ def has_buy_signal(token: TokenData) -> Tuple[bool, float, float]:
         signal_ok = signal_ok and ml_confidence >= config.ML_MIN_CONFIDENCE
     
     if signal_ok:
-        logger.info(f"🎯 {token.symbol}: BUY | Score: {score:.0f} | ML: {ml_confidence:.1f}% | 5m: {token.price_change_5m:+.1f}%")
+        logger.info(f"🎯 {token.symbol}: BUY | Score: {score:.0f} | ML: {ml_confidence:.1f}%")
     
     return signal_ok, score, ml_confidence
 
 async def buy_token(token: TokenData, ml_confidence: float):
-    """Ejecutar compra (DRY_RUN o REAL)"""
+    """Ejecutar compra (DRY_RUN)"""
     
-    # Validaciones
     if state.stats['today_trades'] >= config.MAX_DAILY_TRADES:
         return
     
     if len(state.positions) >= config.MAX_POSITIONS:
-        logger.debug(f"⏸️ Max posiciones alcanzadas ({config.MAX_POSITIONS})")
         return
     
-    # DRY RUN: Simulación completa
     if config.DRY_RUN:
         logger.info(f"🧪 [DRY RUN] Simulando compra de {token.symbol}")
         
-        # Simular delay
         await asyncio.sleep(0.3)
         
-        # Crear posición simulada
         position = Position(
             mint=token.mint,
             symbol=token.symbol,
@@ -792,36 +797,46 @@ async def buy_token(token: TokenData, ml_confidence: float):
             f"Precio: ${token.price_usd:.8f}\n"
             f"Monto: {config.TRADE_AMOUNT_SOL} SOL\n"
             f"ML Confidence: {ml_confidence:.1f}%\n"
-            f"Score: Liquidity ${token.liquidity:,.0f} | Vol ${token.volume_24h:,.0f}\n\n"
-            f"<i>Operación simulada - Sin transacción real</i>"
+            f"Liquidity: ${token.liquidity:,.0f} | Vol: ${token.volume_24h:,.0f}\n\n"
+            f"<i>Operación simulada</i>"
         )
         
         await send_telegram(msg)
-        logger.info(f"✅ [DRY RUN] Posición simulada abierta: {token.symbol}")
+        logger.info(f"✅ [DRY RUN] Posición abierta: {token.symbol}")
         
         return
     
-    # MODO REAL (deshabilitado por seguridad)
-    logger.warning(f"⚠️ MODO REAL no implementado - activar con precaución")
-    return
+    logger.warning(f"⚠️ MODO REAL no implementado")
 
 # ═══════════════════════════════════════════════════════════════
-# GESTIÓN DE POSICIONES
+# GESTIÓN DE POSICIONES (CON BATCH)
 # ═══════════════════════════════════════════════════════════════
 
 async def check_positions():
-    """Monitorear posiciones abiertas y ejecutar stops/takes"""
+    """Monitorear posiciones con batch request"""
     
     if not state.positions:
         return
     
+    # 🚀 OPTIMIZACIÓN: Batch request con Shyft
+    mints = list(state.positions.keys())
+    
+    if config.SHYFT_API_KEY:
+        prices = await get_multiple_prices_shyft(mints)
+    else:
+        prices = {}
+    
+    # Procesar cada posición
     for mint, position in list(state.positions.items()):
         try:
-            # Obtener precio actual
-            current_price = await get_token_price(mint)
+            # Usar precio del batch o fallback
+            current_price = prices.get(mint)
             
             if not current_price:
-                logger.debug(f"⚠️ No se pudo obtener precio para {position.symbol}")
+                current_price = await get_token_price(mint)
+            
+            if not current_price:
+                logger.debug(f"⚠️ No price para {position.symbol}")
                 continue
             
             # Actualizar precios
@@ -837,29 +852,23 @@ async def check_positions():
             # Decisiones de salida
             exit_reason = None
             
-            # Stop Loss
             if pnl <= config.STOP_LOSS_PERCENT:
                 exit_reason = "STOP_LOSS"
-            
-            # Take Profit 1
             elif pnl >= config.TAKE_PROFIT_1:
                 exit_reason = "TAKE_PROFIT_1"
-            
-            # Take Profit 2
             elif pnl >= config.TAKE_PROFIT_2:
                 exit_reason = "TAKE_PROFIT_2"
             
-            # Ejecutar salida si hay razón
             if exit_reason:
                 await exit_position(mint, position, current_price, exit_reason)
             else:
-                logger.debug(f"📊 {position.symbol}: P&L {pnl:+.2f}% | Tiempo: {hold_time:.1f}min")
+                logger.debug(f"📊 {position.symbol}: P&L {pnl:+.2f}% | {hold_time:.1f}min")
         
         except Exception as e:
-            logger.error(f"❌ Error check_positions para {position.symbol}: {e}")
+            logger.error(f"❌ Error check_positions: {e}")
 
 async def exit_position(mint: str, position: Position, exit_price: float, reason: str):
-    """Cerrar posición y registrar resultado"""
+    """Cerrar posición"""
     
     try:
         pnl = position.current_pnl(exit_price)
@@ -873,11 +882,11 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
         state.stats['total_pnl'] += pnl
         state.stats['today_pnl'] += pnl
         
-        # Verificar si predicción ML fue correcta
+        # ML accuracy
         if position.ml_confidence > 0 and pnl > 0:
             state.stats['ml_correct'] += 1
         
-        # Obtener token data para guardar en DB
+        # Guardar en DB
         token_data = state.watchlist.get(mint)
         if token_data:
             await save_trade_for_ml(token_data, position, exit_price, reason)
@@ -896,62 +905,55 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
         )
         
         await send_telegram(msg)
-        
         logger.info(f"{emoji} Cerrado {position.symbol}: {pnl:+.2f}% ({reason})")
         
-        # Remover posición
         del state.positions[mint]
         
     except Exception as e:
         logger.error(f"❌ Error exit_position: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN LOOP CON HEALTH SERVER INTEGRATION
+# MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
 async def main_trading_loop():
-    """Loop principal de trading"""
+    """Loop principal"""
     
-    # Intentar importar funciones del health server (opcional)
     try:
         from health_server import update_bot_status
     except ImportError:
-        logger.warning("⚠️ health_server.py no encontrado - health checks deshabilitados")
         update_bot_status = None
     
     logger.info("🚀 Bot iniciando...")
     
-    # Inicializar componentes
+    # Validar Shyft API key
+    if config.SHYFT_API_KEY:
+        logger.info("✅ Shyft API key configurada")
+    else:
+        logger.warning("⚠️ SHYFT_API_KEY no configurada - usando solo fallbacks")
+    
+    # Inicializar
     await init_database()
     
     if config.ENABLE_TELEGRAM and TELEGRAM_AVAILABLE:
         try:
             state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
-            mode_msg = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
-            await send_telegram(f"🚀 <b>Bot Trading ML Iniciado</b>\n\nModo: {mode_msg}")
+            mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+            await send_telegram(f"🚀 <b>Bot v5.0 Iniciado</b>\n\nModo: {mode}\nAPI: Shyft")
         except Exception as e:
-            logger.error(f"❌ Error Telegram init: {e}")
+            logger.error(f"❌ Error Telegram: {e}")
     
-    if not config.DRY_RUN and not config.SIMULATION_MODE:
-        logger.warning("⚠️ MODO REAL ACTIVADO - PRECAUCIÓN")
-    
-    logger.info(f"🧠 ML Predictor: {'ENABLED' if ml_predictor.is_trained else 'DISABLED'}")
+    logger.info(f"🧠 ML: {'ENABLED' if ml_predictor.is_trained else 'DISABLED'}")
     logger.info(f"🧪 DRY_RUN: {config.DRY_RUN}")
     logger.info(f"🎮 SIMULATION: {config.SIMULATION_MODE}")
     
-    # Actualizar health server inicial
+    # Update health
     if update_bot_status:
         update_bot_status(
-            running=True,
-            scans=0,
-            positions=0,
-            signals=0,
-            trades=0,
-            wins=0,
-            losses=0,
-            total_pnl=0.0,
+            running=True, scans=0, positions=0, signals=0,
+            trades=0, wins=0, losses=0, total_pnl=0.0,
             ml_enabled=ml_predictor.is_trained,
-            mode="DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+            mode="DRY_RUN" if config.DRY_RUN else "REAL"
         )
     
     # Loop principal
@@ -959,7 +961,6 @@ async def main_trading_loop():
         try:
             state.stats['scans'] += 1
             
-            # Actualizar health server cada scan
             if update_bot_status:
                 update_bot_status(
                     running=True,
@@ -971,10 +972,10 @@ async def main_trading_loop():
                     losses=state.stats['losses'],
                     total_pnl=state.stats['total_pnl'],
                     ml_enabled=ml_predictor.is_trained,
-                    mode="DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+                    mode="DRY_RUN" if config.DRY_RUN else "REAL"
                 )
             
-            # 1. Escanear tokens
+            # 1. Escanear
             tokens = await scan_for_signals()
             
             if tokens:
@@ -1011,16 +1012,15 @@ async def main_trading_loop():
                 )
                 
                 logger.info(
-                    f"🔌 APIs: Jupiter V3: {state.stats['jupiter_v3_success']} | "
+                    f"🟢 APIs: Shyft OK: {state.stats['shyft_success']} | "
+                    f"Shyft Fails: {state.stats['shyft_failures']} | "
+                    f"Rate Limited: {state.stats['shyft_rate_limited']} | "
                     f"DexScreener: {state.stats['dexscreener_fallback']} | "
-                    f"Raydium: {state.stats['raydium_fallback']} | "
-                    f"Jupiter V2: {state.stats['jupiter_v2_fallback']} | "
-                    f"CoinGecko: {state.stats['coingecko_fallback']} | "
-                    f"Jupiter Scan Fails: {state.stats['jupiter_failures']} | "
-                    f"Errors: {state.stats['api_errors']}"
+                    f"Jupiter V3: {state.stats['jupiter_v3_fallback']} | "
+                    f"Jupiter Scan Fails: {state.stats['jupiter_failures']}"
                 )
             
-            # 5. Esperar próximo ciclo
+            # 5. Esperar
             await asyncio.sleep(config.SCAN_INTERVAL_SEC)
             
         except KeyboardInterrupt:
@@ -1042,39 +1042,31 @@ async def main_trading_loop():
     logger.info("👋 Bot detenido")
 
 # ═══════════════════════════════════════════════════════════════
-# ENTRY POINT CON HEALTH SERVER PARALELO
+# ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 
 async def run_bot_with_health_server():
-    """Ejecutar bot + health server en paralelo para Railway"""
+    """Ejecutar bot + health server"""
     
     try:
         from health_server import start_health_server, update_bot_status
         
-        # Inicializar estado del health server
         update_bot_status(
-            running=True,
-            scans=0,
-            positions=0,
-            signals=0,
-            trades=0,
-            wins=0,
-            losses=0,
-            total_pnl=0.0,
+            running=True, scans=0, positions=0, signals=0,
+            trades=0, wins=0, losses=0, total_pnl=0.0,
             ml_enabled=ml_predictor.is_trained,
-            mode="DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+            mode="DRY_RUN" if config.DRY_RUN else "REAL"
         )
         
         logger.info("🏥 Health server habilitado en puerto 8080")
         
-        # Ejecutar ambos en paralelo
         await asyncio.gather(
-            main_trading_loop(),  # Bot principal
-            start_health_server(port=8080)  # Health server para Railway
+            main_trading_loop(),
+            start_health_server(port=8080)
         )
         
     except ImportError:
-        logger.warning("⚠️ health_server.py no encontrado - ejecutando solo bot")
+        logger.warning("⚠️ health_server.py no encontrado - solo bot")
         await main_trading_loop()
 
 if __name__ == "__main__":
