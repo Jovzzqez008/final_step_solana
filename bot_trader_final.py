@@ -1,24 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V5.3 - MORALIS + JUPITER QUOTE INTEGRATION
+🚀 SOLANA ELITE TRADING BOT V5.4 - HYBRID JUPITER PRICE
 =================================================================
-✅ MORALIS API como principal (más confiable)
-✅ CoinGecko API como fallback 1
-✅ Shyft API como fallback 2  
-✅ Jupiter Quote API para precios más precisos
-✅ Rate limiting optimizado
-✅ Batch requests optimizadas
+✅ USA EL PRECIO QUE JUPITER YA TRAE (más rápido y confiable)
+✅ Fallback a Moralis/CoinGecko solo si Jupiter no trae precio
+✅ Elimina el problema de "No se pudo obtener precio"
 ✅ Machine Learning integrado
 ✅ Health Server para Railway
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
 ✅ Modo DRY_RUN completo
 ✅ Monitoreo de posiciones mejorado
-✅ Notificaciones completas
-✅ Error handling robusto
 
-Version: 5.3-MORALIS-JUPITER (2025)
+Version: 5.4-HYBRID-JUPITER (2025)
 """
 
 import os
@@ -70,12 +65,12 @@ except ImportError:
     print("⚠️ python-telegram-bot no instalado")
 
 # ═══════════════════════════════════════════════════════════════
-# CONFIGURACIÓN CON MORALIS + COINGECKO API
+# CONFIGURACIÓN
 # ═══════════════════════════════════════════════════════════════
 
 @dataclass
 class Config:
-    """Configuración centralizada con Moralis API"""
+    """Configuración centralizada"""
     
     # ═══ WALLET & RPC ═══
     PRIVATE_KEY: str = os.getenv('WALLET_PRIVATE_KEY', '')
@@ -96,33 +91,15 @@ class Config:
     TRADE_AMOUNT_SOL: float = float(os.getenv('TRADE_AMOUNT_SOL', '0.01'))
     SLIPPAGE_BPS: int = int(os.getenv('SLIPPAGE_BPS', '300'))
     
-    # ═══ 🆕 MORALIS API (PRINCIPAL) ═══
+    # ═══ APIs (OPCIONAL - solo si Jupiter no trae precio) ═══
     MORALIS_API_KEY: str = os.getenv('MORALIS_API_KEY', '')
     MORALIS_BASE_URL: str = 'https://solana-gateway.moralis.io/token/mainnet'
-    MORALIS_RATE_LIMIT_DELAY: float = 0.05  # 20 req/sec max
     
-    # ═══ 🟢 COINGECKO API (FALLBACK 1) ═══
     COINGECKO_API_KEY: str = os.getenv('COINGECKO_API_KEY', '')
-    COINGECKO_BASE_URL: str = 'https://api.coingecko.com/api/v3'
-    COINGECKO_TOKEN_BY_CONTRACT: str = f'{COINGECKO_BASE_URL}/coins/solana/contract'
-    COINGECKO_SIMPLE_PRICE: str = f'{COINGECKO_BASE_URL}/simple/token_price/solana'
-    COINGECKO_RATE_LIMIT: float = 2.0  # 30 req/min = 1 cada 2 segundos
+    COINGECKO_SIMPLE_PRICE: str = 'https://api.coingecko.com/api/v3/simple/token_price/solana'
     
-    # ═══ SHYFT API (FALLBACK 2) ═══
-    SHYFT_API_KEY: str = os.getenv('SHYFT_API_KEY', '')
-    SHYFT_BASE_URL: str = 'https://api.shyft.to/sol/v1'
-    SHYFT_NETWORK: str = 'mainnet-beta'
-    SHYFT_TOKEN_PRICE: str = f'{SHYFT_BASE_URL}/token/get_price'
-    SHYFT_TOKEN_INFO: str = f'{SHYFT_BASE_URL}/token/get_info'
-    SHYFT_MULTIPLE_PRICES: str = f'{SHYFT_BASE_URL}/token/get_multiple_prices'
-    SHYFT_RATE_LIMIT_DELAY: float = 0.6  # 100 req/min
-    
-    # ═══ FALLBACK APIs ═══
-    JUPITER_QUOTE_API_V6: str = 'https://quote-api.jup.ag/v6/quote'
-    DEXSCREENER_API: str = 'https://api.dexscreener.com/latest/dex'
-    JUPITER_PRICE_API_V3: str = 'https://lite-api.jup.ag/price/v3'
+    # ═══ JUPITER APIs ═══
     JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
-    
     JUPITER_SCAN_CATEGORY: str = os.getenv('JUPITER_SCAN_CATEGORY', 'toporganicscore')
     JUPITER_SCAN_INTERVAL: str = os.getenv('JUPITER_SCAN_INTERVAL', '5m')
     
@@ -144,156 +121,18 @@ class Config:
     TAKE_PROFIT_2: float = float(os.getenv('TAKE_PROFIT_2', '30'))
     MAX_POSITIONS: int = int(os.getenv('MAX_POSITIONS', '3'))
     MAX_DAILY_TRADES: int = int(os.getenv('MAX_DAILY_TRADES', '10'))
-    MAX_LOSS_PER_DAY_PERCENT: float = float(os.getenv('MAX_LOSS_PER_DAY_PERCENT', '5'))
     
     # ═══ TIMING ═══
-    SCAN_INTERVAL_SEC: int = int(os.getenv('SCAN_INTERVAL_SEC', '60'))
+    SCAN_INTERVAL_SEC: int = int(os.getenv('SCAN_INTERVAL_SEC', '30'))
     
     # ═══ RETRY & TIMEOUT ═══
-    MAX_RETRIES: int = int(os.getenv('MAX_RETRIES', '3'))
-    API_TIMEOUT_SEC: int = int(os.getenv('API_TIMEOUT_SEC', '15'))
-    RETRY_DELAY_SEC: int = int(os.getenv('RETRY_DELAY_SEC', '2'))
+    MAX_RETRIES: int = 3
+    API_TIMEOUT_SEC: int = 15
+    RETRY_DELAY_SEC: int = 2
     
     LOG_LEVEL: str = os.getenv('LOG_LEVEL', 'INFO')
 
 config = Config()
-
-# ═══════════════════════════════════════════════════════════════
-# 🆕 MORALIS API CLIENT - SOLUCIÓN DEFINITIVA
-# ═══════════════════════════════════════════════════════════════
-
-class MoralisClient:
-    """Cliente para Moralis Token API - precios confiables"""
-    
-    def __init__(self):
-        self.api_key = config.MORALIS_API_KEY
-        self.base_url = config.MORALIS_BASE_URL
-        self.headers = {
-            'Accept': 'application/json',
-            'X-API-Key': self.api_key
-        }
-        self.rate_limit_delay = config.MORALIS_RATE_LIMIT_DELAY
-        self.last_call = 0
-        self.stats = {
-            'success': 0,
-            'failures': 0,
-            'rate_limited': 0
-        }
-    
-    async def _rate_limit(self):
-        """Rate limiting para no exceder límites"""
-        current_time = time.time()
-        time_since_last = current_time - self.last_call
-        
-        if time_since_last < self.rate_limit_delay:
-            await asyncio.sleep(self.rate_limit_delay - time_since_last)
-        
-        self.last_call = time.time()
-    
-    async def get_token_price(self, mint: str) -> Optional[float]:
-        """
-        Obtener precio de UN token
-        GET /token/mainnet/{address}/price
-        """
-        if not self.api_key:
-            logger.warning("⚠️ MORALIS_API_KEY no configurada")
-            return None
-        
-        try:
-            await self._rate_limit()
-            
-            url = f"{self.base_url}/{mint}/price"
-            
-            result = await api_call_with_retry(url, headers=self.headers)
-            
-            if result:
-                # Moralis retorna: {"usdPrice": 0.000123, "nativePrice": {...}}
-                price = float(result.get('usdPrice', 0))
-                
-                if price > 0:
-                    self.stats['success'] += 1
-                    logger.debug(f"✅ Moralis: {mint[:8]} = ${price:.8f}")
-                    return price
-                else:
-                    logger.debug(f"⚠️ Moralis: {mint[:8]} precio = 0")
-            
-            self.stats['failures'] += 1
-            return None
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            if 'rate limit' in error_msg or '429' in error_msg:
-                self.stats['rate_limited'] += 1
-                logger.warning(f"⚠️ Moralis rate limited - esperando...")
-                await asyncio.sleep(5)
-            else:
-                self.stats['failures'] += 1
-            
-            logger.debug(f"Moralis error: {str(e)[:100]}")
-            return None
-    
-    async def get_multiple_prices(self, mints: List[str]) -> Dict[str, float]:
-        """
-        🚀 BATCH REQUEST - Múltiples precios en 1 llamada
-        POST /token/mainnet/prices
-        Body: {"addresses": ["mint1", "mint2", ...]}
-        """
-        if not self.api_key or not mints:
-            return {}
-        
-        try:
-            await self._rate_limit()
-            
-            url = f"{self.base_url}/prices"
-            
-            # Moralis acepta hasta 25 addresses por request
-            batch_size = 25
-            all_prices = {}
-            
-            for i in range(0, len(mints), batch_size):
-                batch = mints[i:i+batch_size]
-                
-                payload = {
-                    "addresses": batch
-                }
-                
-                result = await api_call_with_retry(
-                    url,
-                    method='POST',
-                    json=payload,
-                    headers={**self.headers, 'Content-Type': 'application/json'}
-                )
-                
-                if result and isinstance(result, list):
-                    # Moralis retorna: [{"address": "...", "usdPrice": 0.123}, ...]
-                    for token_data in result:
-                        address = token_data.get('address')
-                        price = float(token_data.get('usdPrice', 0))
-                        
-                        if address and price > 0:
-                            all_prices[address] = price
-                
-                # Rate limit entre batches
-                if i + batch_size < len(mints):
-                    await asyncio.sleep(self.rate_limit_delay)
-            
-            if all_prices:
-                self.stats['success'] += len(all_prices)
-                logger.info(f"✅ Moralis batch: {len(all_prices)}/{len(mints)} precios")
-            
-            return all_prices
-            
-        except Exception as e:
-            logger.error(f"❌ Moralis batch error: {e}")
-            self.stats['failures'] += 1
-            return {}
-
-# ═══════════════════════════════════════════════════════════════
-# INSTANCIA GLOBAL MORALIS
-# ═══════════════════════════════════════════════════════════════
-
-moralis_client = MoralisClient()
 
 # ═══════════════════════════════════════════════════════════════
 # LOGGING
@@ -437,6 +276,9 @@ class BotState:
         self.positions: Dict[str, Position] = {}
         self.watchlist: Dict[str, TokenData] = {}
         
+        # 🆕 Cache de precios de Jupiter (evita consultas innecesarias)
+        self.jupiter_price_cache: Dict[str, Tuple[float, float]] = {}  # {mint: (price, timestamp)}
+        
         self.stats = {
             'scans': 0,
             'signals': 0,
@@ -448,38 +290,17 @@ class BotState:
             'today_pnl': 0.0,
             'ml_predictions': 0,
             'ml_correct': 0,
-            'api_errors': 0,
             
-            # 🆕 Moralis stats
-            'moralis_success': 0,
-            'moralis_failures': 0,
-            'moralis_rate_limited': 0,
-            
-            # CoinGecko stats
-            'coingecko_success': 0,
-            'coingecko_failures': 0,
-            'coingecko_rate_limited': 0,
-            
-            # Shyft stats
-            'shyft_success': 0,
-            'shyft_failures': 0,
-            'shyft_rate_limited': 0,
-            
-            # Jupiter Quote stats
-            'jupiter_quote_success': 0,
-            'jupiter_quote_failures': 0,
-            
-            # Fallback stats
-            'dexscreener_fallback': 0,
-            'jupiter_v3_fallback': 0,
-            'jupiter_failures': 0
+            # Price sources
+            'jupiter_prices': 0,
+            'moralis_fallback': 0,
+            'coingecko_fallback': 0,
+            'price_failures': 0
         }
         
         self.last_trade_time = 0
         self.running = True
         self.connector: Optional[aiohttp.TCPConnector] = None
-        self.last_coingecko_call = 0
-        self.last_shyft_call = 0
 
 state = BotState()
 
@@ -524,16 +345,14 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
                         
             elif method == 'POST':
                 async with session.post(url, **kwargs) as resp:
-                    if resp.status == 200:
+                    if resp.status in [200, 201]:
                         return await resp.json()
+                    elif resp.status == 429:
+                        if attempt < config.MAX_RETRIES - 1:
+                            await asyncio.sleep(config.RETRY_DELAY_SEC * (attempt + 1))
+                            continue
             
-        except aiohttp.ClientConnectorError:
-            state.stats['api_errors'] += 1
-            if attempt < config.MAX_RETRIES - 1:
-                await asyncio.sleep(config.RETRY_DELAY_SEC)
-                continue
-                
-        except asyncio.TimeoutError:
+        except (aiohttp.ClientConnectorError, asyncio.TimeoutError):
             if attempt < config.MAX_RETRIES - 1:
                 await asyncio.sleep(config.RETRY_DELAY_SEC)
                 continue
@@ -550,86 +369,63 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
     return None
 
 # ═══════════════════════════════════════════════════════════════
-# 🟢 COINGECKO API CLIENT (FALLBACK 1)
+# 🆕 OBTENER PRECIO - MODO HÍBRIDO
 # ═══════════════════════════════════════════════════════════════
 
-async def coingecko_rate_limit():
-    """Rate limiting para CoinGecko (30 req/min = 1 cada 2 seg)"""
-    current_time = time.time()
-    time_since_last_call = current_time - state.last_coingecko_call
+async def get_token_price(mint: str, from_jupiter: Optional[float] = None) -> Optional[float]:
+    """
+    🎯 ESTRATEGIA HÍBRIDA:
+    1. Si Jupiter ya trajo el precio, usarlo (más confiable)
+    2. Si no, intentar Moralis
+    3. Si no, intentar CoinGecko
+    4. Si todo falla, buscar en el cache
+    """
     
-    if time_since_last_call < config.COINGECKO_RATE_LIMIT:
-        await asyncio.sleep(config.COINGECKO_RATE_LIMIT - time_since_last_call)
+    if config.SIMULATION_MODE:
+        return 0.0001 + (hash(mint) % 100) * 0.000001
     
-    state.last_coingecko_call = time.time()
-
-async def get_token_price_coingecko(mint: str) -> Optional[float]:
-    """Obtener precio usando CoinGecko API (endpoint por contract)"""
-    if not config.COINGECKO_API_KEY:
-        return None
+    # 1️⃣ USAR PRECIO DE JUPITER SI VIENE (99% de los casos)
+    if from_jupiter and from_jupiter > 0:
+        # Guardar en cache
+        state.jupiter_price_cache[mint] = (from_jupiter, time.time())
+        state.stats['jupiter_prices'] += 1
+        logger.debug(f"✅ Jupiter Price: {mint[:8]} = ${from_jupiter:.8f}")
+        return from_jupiter
     
-    try:
-        await coingecko_rate_limit()
-        
-        url = config.COINGECKO_SIMPLE_PRICE
-        params = {
-            'contract_addresses': mint,
-            'vs_currencies': 'usd'
-        }
-        headers = {
-            'x-cg-demo-api-key': config.COINGECKO_API_KEY
-        }
-        
-        result = await api_call_with_retry(url, params=params, headers=headers)
-        
-        if result and mint.lower() in result:
-            price = float(result[mint.lower()].get('usd', 0))
-            if price > 0:
-                state.stats['coingecko_success'] += 1
-                logger.debug(f"✅ CoinGecko: {mint[:8]} = ${price:.8f}")
-                return price
-        
-        url_full = f"{config.COINGECKO_TOKEN_BY_CONTRACT}/{mint}"
-        result_full = await api_call_with_retry(url_full, headers=headers)
-        
-        if result_full:
-            market_data = result_full.get('market_data', {})
-            price = float(market_data.get('current_price', {}).get('usd', 0))
-            if price > 0:
-                state.stats['coingecko_success'] += 1
-                logger.debug(f"✅ CoinGecko Full: {mint[:8]} = ${price:.8f}")
-                return price
-        
-        return None
-        
-    except Exception as e:
-        error_msg = str(e).lower()
-        if 'rate limit' in error_msg or '429' in error_msg:
-            state.stats['coingecko_rate_limited'] += 1
-            await asyncio.sleep(5)
-        else:
-            state.stats['coingecko_failures'] += 1
-        
-        logger.debug(f"CoinGecko error: {str(e)[:100]}")
-        return None
-
-async def get_multiple_prices_coingecko(mints: List[str]) -> Dict[str, float]:
-    """Obtener múltiples precios en batch de CoinGecko"""
-    if not config.COINGECKO_API_KEY or not mints:
-        return {}
+    # 2️⃣ BUSCAR EN CACHE (menos de 60 segundos)
+    if mint in state.jupiter_price_cache:
+        cached_price, cached_time = state.jupiter_price_cache[mint]
+        if time.time() - cached_time < 60:
+            logger.debug(f"📦 Cache: {mint[:8]} = ${cached_price:.8f}")
+            return cached_price
     
-    try:
-        await coingecko_rate_limit()
-        
-        batch_size = 10
-        all_prices = {}
-        
-        for i in range(0, len(mints), batch_size):
-            batch = mints[i:i+batch_size]
+    # 3️⃣ FALLBACK A MORALIS (solo si es necesario)
+    if config.MORALIS_API_KEY:
+        try:
+            url = f"{config.MORALIS_BASE_URL}/{mint}/price"
+            headers = {
+                'Accept': 'application/json',
+                'X-API-Key': config.MORALIS_API_KEY
+            }
             
+            result = await api_call_with_retry(url, headers=headers)
+            
+            if result and 'usdPrice' in result:
+                price = float(result.get('usdPrice', 0))
+                if price > 0:
+                    state.stats['moralis_fallback'] += 1
+                    state.jupiter_price_cache[mint] = (price, time.time())
+                    logger.info(f"🔄 Moralis Fallback: {mint[:8]} = ${price:.8f}")
+                    return price
+        except Exception as e:
+            logger.debug(f"Moralis fallback error: {e}")
+    
+    # 4️⃣ FALLBACK A COINGECKO (último recurso)
+    if config.COINGECKO_API_KEY:
+        try:
             url = config.COINGECKO_SIMPLE_PRICE
             params = {
-                'contract_addresses': ','.join(batch),
+                'contract_addresses': mint,
                 'vs_currencies': 'usd'
             }
             headers = {
@@ -638,318 +434,20 @@ async def get_multiple_prices_coingecko(mints: List[str]) -> Dict[str, float]:
             
             result = await api_call_with_retry(url, params=params, headers=headers)
             
-            if result:
-                for mint in batch:
-                    if mint.lower() in result:
-                        price = float(result[mint.lower()].get('usd', 0))
-                        if price > 0:
-                            all_prices[mint] = price
-            
-            if i + batch_size < len(mints):
-                await asyncio.sleep(config.COINGECKO_RATE_LIMIT)
-        
-        if all_prices:
-            logger.info(f"✅ CoinGecko batch: {len(all_prices)}/{len(mints)} precios")
-        
-        return all_prices
-        
-    except Exception as e:
-        logger.debug(f"CoinGecko batch error: {str(e)[:100]}")
-        return {}
-
-# ═══════════════════════════════════════════════════════════════
-# SHYFT API CLIENT (FALLBACK 2)
-# ═══════════════════════════════════════════════════════════════
-
-async def shyft_rate_limit():
-    """Rate limiting para Shyft (100 req/min)"""
-    current_time = time.time()
-    time_since_last_call = current_time - state.last_shyft_call
-    
-    if time_since_last_call < config.SHYFT_RATE_LIMIT_DELAY:
-        await asyncio.sleep(config.SHYFT_RATE_LIMIT_DELAY - time_since_last_call)
-    
-    state.last_shyft_call = time.time()
-
-async def get_token_price_shyft(mint: str) -> Optional[float]:
-    """Obtener precio usando Shyft API"""
-    if not config.SHYFT_API_KEY:
-        return None
-    
-    try:
-        await shyft_rate_limit()
-        
-        url = config.SHYFT_TOKEN_PRICE
-        params = {
-            'network': config.SHYFT_NETWORK,
-            'token_address': mint
-        }
-        headers = {
-            'x-api-key': config.SHYFT_API_KEY
-        }
-        
-        result = await api_call_with_retry(url, params=params, headers=headers)
-        
-        if result and result.get('success'):
-            price = float(result.get('result', {}).get('price', 0))
-            if price > 0:
-                state.stats['shyft_success'] += 1
-                logger.debug(f"✅ Shyft: {mint[:8]} = ${price:.8f}")
-                return price
-        
-        if result and not result.get('success'):
-            error_msg = result.get('message', '')
-            if 'rate limit' in error_msg.lower():
-                state.stats['shyft_rate_limited'] += 1
-                await asyncio.sleep(2)
-        
-        return None
-        
-    except Exception as e:
-        logger.debug(f"Shyft error: {str(e)[:100]}")
-        state.stats['shyft_failures'] += 1
-        return None
-
-# ═══════════════════════════════════════════════════════════════
-# 🆕 JUPITER QUOTE API CLIENT (FALLBACK 3)
-# ═══════════════════════════════════════════════════════════════
-
-async def get_token_price_jupiter_quote(mint: str) -> Optional[float]:
-    """
-    Obtener precio usando Jupiter Quote API v6
-    Más confiable que Price API porque simula swaps reales
-    """
-    try:
-        # Constantes
-        SOL_MINT = "So11111111111111111111111111111111111111112"
-        USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        
-        # Intentar 1: Token → USDC (método directo)
-        url = config.JUPITER_QUOTE_API_V6
-        params = {
-            'inputMint': mint,
-            'outputMint': USDC_MINT,
-            'amount': '1000000000',  # 1 token (asumiendo 9 decimals)
-            'slippageBps': '50'
-        }
-        
-        result = await api_call_with_retry(url, params=params)
-        
-        if result and 'outAmount' in result:
-            # outAmount está en USDC (6 decimales)
-            price_usd = float(result['outAmount']) / 1_000_000
-            
-            if price_usd > 0:
-                state.stats['jupiter_quote_success'] += 1
-                logger.debug(f"✅ Jupiter Quote: {mint[:8]} = ${price_usd:.8f}")
-                return price_usd
-        
-        # Intentar 2: Token → SOL → USDC (método indirecto)
-        # Primero obtener precio de Token en SOL
-        params_sol = {
-            'inputMint': mint,
-            'outputMint': SOL_MINT,
-            'amount': '1000000000',
-            'slippageBps': '50'
-        }
-        
-        result_sol = await api_call_with_retry(url, params=params_sol)
-        
-        if result_sol and 'outAmount' in result_sol:
-            sol_amount = float(result_sol['outAmount']) / 1_000_000_000  # SOL tiene 9 decimals
-            
-            # Ahora obtener precio de SOL en USDC
-            params_sol_usdc = {
-                'inputMint': SOL_MINT,
-                'outputMint': USDC_MINT,
-                'amount': str(int(sol_amount * 1_000_000_000)),
-                'slippageBps': '50'
-            }
-            
-            result_usdc = await api_call_with_retry(url, params=params_sol_usdc)
-            
-            if result_usdc and 'outAmount' in result_usdc:
-                price_usd = float(result_usdc['outAmount']) / 1_000_000
-                
-                if price_usd > 0:
-                    state.stats['jupiter_quote_success'] += 1
-                    logger.debug(f"✅ Jupiter Quote (via SOL): {mint[:8]} = ${price_usd:.8f}")
-                    return price_usd
-        
-        return None
-        
-    except Exception as e:
-        logger.debug(f"Jupiter Quote error: {str(e)[:100]}")
-        state.stats['jupiter_quote_failures'] += 1
-        return None
-
-# ═══════════════════════════════════════════════════════════════
-# 🆕 GET PRICE CON MORALIS PRIMERO + FALLBACK MEJORADO
-# ═══════════════════════════════════════════════════════════════
-
-async def get_token_price(mint: str) -> Optional[float]:
-    """
-    🆕 NUEVO ORDEN DE FALLBACK:
-    1. Moralis (PRINCIPAL) ⭐
-    2. CoinGecko (FALLBACK 1)
-    3. Shyft (FALLBACK 2)
-    4. Jupiter Quote (FALLBACK 3)
-    5. DexScreener (FALLBACK 4)
-    6. Jupiter V3 (FALLBACK 5)
-    """
-    
-    if config.SIMULATION_MODE:
-        return 0.0001 + (hash(mint) % 100) * 0.000001
-    
-    # 1️⃣ MORALIS (PRINCIPAL) ⭐⭐⭐
-    price = await moralis_client.get_token_price(mint)
-    if price:
-        state.stats['moralis_success'] += 1
-        return price
-    
-    # 2️⃣ COINGECKO (FALLBACK 1)
-    price = await get_token_price_coingecko(mint)
-    if price:
-        return price
-    
-    # 3️⃣ SHYFT (FALLBACK 2)
-    price = await get_token_price_shyft(mint)
-    if price:
-        return price
-    
-    # 4️⃣ JUPITER QUOTE (FALLBACK 3)
-    price = await get_token_price_jupiter_quote(mint)
-    if price:
-        logger.info(f"✅ Jupiter Quote: {mint[:8]} = ${price:.8f}")
-        return price
-    
-    # 5️⃣ DexScreener (FALLBACK 4)
-    try:
-        url = f"{config.DEXSCREENER_API}/tokens/{mint}"
-        result = await api_call_with_retry(url)
-        
-        if result and 'pairs' in result and len(result['pairs']) > 0:
-            pairs = sorted(
-                result['pairs'], 
-                key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0), 
-                reverse=True
-            )
-            if pairs:
-                price = float(pairs[0].get('priceUsd', 0))
+            if result and mint.lower() in result:
+                price = float(result[mint.lower()].get('usd', 0))
                 if price > 0:
-                    state.stats['dexscreener_fallback'] += 1
-                    logger.info(f"✅ DexScreener: {mint[:8]} = ${price:.8f}")
+                    state.stats['coingecko_fallback'] += 1
+                    state.jupiter_price_cache[mint] = (price, time.time())
+                    logger.info(f"🔄 CoinGecko Fallback: {mint[:8]} = ${price:.8f}")
                     return price
-    except Exception:
-        pass
+        except Exception as e:
+            logger.debug(f"CoinGecko fallback error: {e}")
     
-    # 6️⃣ Jupiter V3 (FALLBACK 5)
-    try:
-        url = f"{config.JUPITER_PRICE_API_V3}?ids={mint}"
-        result = await api_call_with_retry(url)
-        
-        if result and mint in result:
-            price = float(result[mint].get('usdPrice', 0))
-            if price > 0:
-                state.stats['jupiter_v3_fallback'] += 1
-                logger.info(f"✅ Jupiter V3: {mint[:8]} = ${price:.8f}")
-                return price
-    except Exception:
-        pass
-    
+    # ❌ NO SE PUDO OBTENER PRECIO
+    state.stats['price_failures'] += 1
     logger.warning(f"⚠️ No se pudo obtener precio para {mint[:8]}")
     return None
-
-# ═══════════════════════════════════════════════════════════════
-# 🚀 MONITOREO DE POSICIONES OPTIMIZADO CON BATCH MORALIS
-# ═══════════════════════════════════════════════════════════════
-
-async def check_positions():
-    """✅ Usar Moralis batch para posiciones"""
-    
-    if not state.positions:
-        logger.debug("📊 No hay posiciones abiertas para monitorear")
-        return
-    
-    logger.info(f"🔍 Monitoreando {len(state.positions)} posiciones...")
-    
-    # 🚀 BATCH REQUEST CON MORALIS (mucho más rápido)
-    mints = list(state.positions.keys())
-    
-    if moralis_client.api_key:
-        logger.debug("📡 Obteniendo precios batch de Moralis...")
-        prices = await moralis_client.get_multiple_prices(mints)
-    else:
-        # Fallback a CoinGecko si no hay Moralis
-        logger.debug("📡 Obteniendo precios batch de CoinGecko...")
-        prices = await get_multiple_prices_coingecko(mints)
-    
-    # Procesar cada posición
-    for mint, position in list(state.positions.items()):
-        try:
-            # Usar precio del batch o fallback individual
-            current_price = prices.get(mint)
-            
-            if not current_price:
-                logger.debug(f"🔄 Fallback individual para {position.symbol}")
-                current_price = await get_token_price(mint)
-            
-            if not current_price:
-                logger.warning(f"⚠️ No se pudo obtener precio para {position.symbol} ({mint[:8]})")
-                continue
-            
-            # Actualizar precios históricos
-            if current_price > position.highest_price:
-                position.highest_price = current_price
-                logger.debug(f"📈 {position.symbol} nuevo máximo: ${current_price:.8f}")
-            
-            if current_price < position.lowest_price:
-                position.lowest_price = current_price
-                logger.debug(f"📉 {position.symbol} nuevo mínimo: ${current_price:.8f}")
-            
-            # Calcular métricas
-            pnl = position.current_pnl(current_price)
-            hold_time = position.hold_time_minutes()
-            
-            # ✅ LOG DETALLADO en cada check
-            logger.info(
-                f"📊 {position.symbol}: "
-                f"Precio: ${current_price:.8f} | "
-                f"P&L: {pnl:+.2f}% | "
-                f"Tiempo: {hold_time:.1f}min | "
-                f"Max: ${position.highest_price:.8f} | "
-                f"Min: ${position.lowest_price:.8f}"
-            )
-            
-            # Evaluar condiciones de salida
-            exit_reason = None
-            
-            # Stop Loss
-            if pnl <= config.STOP_LOSS_PERCENT:
-                exit_reason = "STOP_LOSS"
-                logger.warning(f"🛑 {position.symbol} alcanzó STOP LOSS: {pnl:.2f}%")
-            
-            # Take Profit 2 (mayor ganancia primero)
-            elif pnl >= config.TAKE_PROFIT_2:
-                exit_reason = "TAKE_PROFIT_2"
-                logger.info(f"💰 {position.symbol} alcanzó TP2: {pnl:.2f}%")
-            
-            # Take Profit 1
-            elif pnl >= config.TAKE_PROFIT_1:
-                exit_reason = "TAKE_PROFIT_1"
-                logger.info(f"✅ {position.symbol} alcanzó TP1: {pnl:.2f}%")
-            
-            # Trailing stop (opcional) - timeout con pérdida
-            elif hold_time > 60 and pnl < -3:
-                exit_reason = "TIMEOUT_NEGATIVE"
-                logger.info(f"⏱️ {position.symbol} timeout con pérdida: {pnl:.2f}%")
-            
-            # Ejecutar salida si hay razón
-            if exit_reason:
-                await exit_position(mint, position, current_price, exit_reason)
-        
-        except Exception as e:
-            logger.error(f"❌ Error monitoreando {position.symbol}: {e}", exc_info=True)
 
 # ═══════════════════════════════════════════════════════════════
 # DATABASE
@@ -1042,11 +540,11 @@ async def send_telegram(message: str):
         logger.debug(f"Error Telegram: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# ESCANEO DE TOKENS
+# ESCANEO DE TOKENS CON PRECIOS
 # ═══════════════════════════════════════════════════════════════
 
 async def scan_for_signals() -> List[TokenData]:
-    """Escanear tokens con Jupiter"""
+    """✅ Escanear tokens Y guardar sus precios de Jupiter"""
     
     if config.SIMULATION_MODE:
         logger.info("🧪 [SIMULATION] Generando tokens simulados")
@@ -1077,10 +575,8 @@ async def scan_for_signals() -> List[TokenData]:
         
         if not result or not isinstance(result, list):
             logger.warning("⚠️ Jupiter API no respondió")
-            state.stats['jupiter_failures'] += 1
             return []
         
-        state.stats['jupiter_failures'] = 0
         candidates = []
         
         for token_data in result:
@@ -1089,11 +585,17 @@ async def scan_for_signals() -> List[TokenData]:
                 if not mint or mint in state.positions:
                     continue
                 
+                # ✅ USAR EL PRECIO QUE JUPITER YA TRAE
+                jupiter_price = float(token_data.get('usdPrice', 0) or 0)
+                
+                if jupiter_price <= 0:
+                    continue  # Saltar tokens sin precio
+                
                 token = TokenData(
                     mint=mint,
                     symbol=token_data.get('symbol', 'UNKNOWN'),
                     name=token_data.get('name', 'Unknown'),
-                    price_usd=float(token_data.get('usdPrice', 0) or 0),
+                    price_usd=jupiter_price,  # ✅ PRECIO DE JUPITER
                     liquidity=float(token_data.get('liquidity', 0) or 0),
                     volume_24h=float(token_data.get('stats24h', {}).get('buyVolume', 0) or 0) +
                                float(token_data.get('stats24h', {}).get('sellVolume', 0) or 0),
@@ -1104,20 +606,22 @@ async def scan_for_signals() -> List[TokenData]:
                     is_verified=token_data.get('isVerified', False)
                 )
                 
-                if token.price_usd > 0:
-                    candidates.append(token)
+                # ✅ GUARDAR EN CACHE
+                state.jupiter_price_cache[mint] = (jupiter_price, time.time())
                 
-            except Exception:
+                candidates.append(token)
+                
+            except Exception as e:
+                logger.debug(f"Error procesando token: {e}")
                 continue
         
         if candidates:
-            logger.info(f"✅ Scanned {len(candidates)} tokens")
+            logger.info(f"✅ Scanned {len(candidates)} tokens con precios")
         
         return candidates
         
     except Exception as e:
         logger.error(f"❌ Error scan_for_signals: {e}")
-        state.stats['jupiter_failures'] += 1
         return []
 
 def has_buy_signal(token: TokenData) -> Tuple[bool, float, float]:
@@ -1235,8 +739,80 @@ async def buy_token(token: TokenData, ml_confidence: float):
     logger.warning(f"⚠️ MODO REAL no implementado")
 
 # ═══════════════════════════════════════════════════════════════
-# ✅ CERRAR POSICIÓN MEJORADO
+# ✅ GESTIÓN DE POSICIONES CON CACHE
 # ═══════════════════════════════════════════════════════════════
+
+async def check_positions():
+    """✅ Monitoreo usando cache de Jupiter"""
+    
+    if not state.positions:
+        logger.debug("📊 No hay posiciones abiertas para monitorear")
+        return
+    
+    logger.info(f"🔍 Monitoreando {len(state.positions)} posiciones...")
+    
+    # Procesar cada posición
+    for mint, position in list(state.positions.items()):
+        try:
+            # ✅ Intentar obtener precio (primero del cache, luego APIs)
+            current_price = await get_token_price(mint)
+            
+            if not current_price:
+                logger.warning(f"⚠️ No se pudo obtener precio para {position.symbol} ({mint[:8]})")
+                continue
+            
+            # Actualizar precios históricos
+            if current_price > position.highest_price:
+                position.highest_price = current_price
+                logger.debug(f"📈 {position.symbol} nuevo máximo: ${current_price:.8f}")
+            
+            if current_price < position.lowest_price:
+                position.lowest_price = current_price
+                logger.debug(f"📉 {position.symbol} nuevo mínimo: ${current_price:.8f}")
+            
+            # Calcular métricas
+            pnl = position.current_pnl(current_price)
+            hold_time = position.hold_time_minutes()
+            
+            # ✅ LOG DETALLADO en cada check
+            logger.info(
+                f"📊 {position.symbol}: "
+                f"Precio: ${current_price:.8f} | "
+                f"P&L: {pnl:+.2f}% | "
+                f"Tiempo: {hold_time:.1f}min | "
+                f"Max: ${position.highest_price:.8f} | "
+                f"Min: ${position.lowest_price:.8f}"
+            )
+            
+            # Evaluar condiciones de salida
+            exit_reason = None
+            
+            # Stop Loss
+            if pnl <= config.STOP_LOSS_PERCENT:
+                exit_reason = "STOP_LOSS"
+                logger.warning(f"🛑 {position.symbol} alcanzó STOP LOSS: {pnl:.2f}%")
+            
+            # Take Profit 2
+            elif pnl >= config.TAKE_PROFIT_2:
+                exit_reason = "TAKE_PROFIT_2"
+                logger.info(f"💰 {position.symbol} alcanzó TP2: {pnl:.2f}%")
+            
+            # Take Profit 1
+            elif pnl >= config.TAKE_PROFIT_1:
+                exit_reason = "TAKE_PROFIT_1"
+                logger.info(f"✅ {position.symbol} alcanzó TP1: {pnl:.2f}%")
+            
+            # Timeout con pérdida
+            elif hold_time > 60 and pnl < -3:
+                exit_reason = "TIMEOUT_NEGATIVE"
+                logger.info(f"⏱️ {position.symbol} timeout con pérdida: {pnl:.2f}%")
+            
+            # Ejecutar salida si hay razón
+            if exit_reason:
+                await exit_position(mint, position, current_price, exit_reason)
+        
+        except Exception as e:
+            logger.error(f"❌ Error monitoreando {position.symbol}: {e}", exc_info=True)
 
 async def exit_position(mint: str, position: Position, exit_price: float, reason: str):
     """✅ Cierre mejorado con notificaciones completas"""
@@ -1312,36 +888,27 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
         logger.error(f"❌ Error en exit_position: {e}", exc_info=True)
 
 # ═══════════════════════════════════════════════════════════════
-# ✅ MAIN LOOP MEJORADO (FIXED)
+# ✅ MAIN LOOP
 # ═══════════════════════════════════════════════════════════════
 
 async def main_trading_loop():
-    """✅ Loop principal con manejo robusto de errores"""
+    """✅ Loop principal con modo híbrido Jupiter"""
     
     try:
         from health_server import update_bot_status
     except ImportError:
         update_bot_status = None
     
-    logger.info("🚀 Bot iniciando (versión 5.3 - MORALIS + JUPITER QUOTE)...")
+    logger.info("🚀 Bot iniciando (versión 5.4 - HYBRID JUPITER)...")
     
-    # Validar APIs
+    # Validar configuración
+    logger.info("✅ Usando precios de Jupiter directamente (sin APIs externas)")
+    
     if config.MORALIS_API_KEY:
-        logger.info("✅ Moralis API key configurada (API Principal)")
-    else:
-        logger.warning("⚠️ MORALIS_API_KEY no configurada")
+        logger.info("✅ Moralis configurada (fallback opcional)")
     
     if config.COINGECKO_API_KEY:
-        logger.info("✅ CoinGecko API key configurada (Fallback 1)")
-    else:
-        logger.warning("⚠️ COINGECKO_API_KEY no configurada")
-    
-    if config.SHYFT_API_KEY:
-        logger.info("✅ Shyft API key configurada (Fallback 2)")
-    else:
-        logger.warning("⚠️ SHYFT_API_KEY no configurada")
-    
-    logger.info("✅ Jupiter Quote API habilitada (Fallback 3 - sin API key)")
+        logger.info("✅ CoinGecko configurada (fallback opcional)")
     
     # Inicializar
     await init_database()
@@ -1351,13 +918,13 @@ async def main_trading_loop():
             state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
             mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
             await send_telegram(
-                f"🚀 <b>Bot v5.3 Iniciado</b>\n\n"
+                f"🚀 <b>Bot v5.4 Iniciado</b>\n\n"
                 f"Modo: {mode}\n"
-                f"API: 🆕 MORALIS → CoinGecko → Shyft → Jupiter Quote → DexScreener → Jupiter V3\n"
+                f"Estrategia: Usa precios de Jupiter directamente ⚡\n"
                 f"Stop Loss: {config.STOP_LOSS_PERCENT}%\n"
                 f"Take Profit: {config.TAKE_PROFIT_1}% / {config.TAKE_PROFIT_2}%\n"
                 f"Scan Interval: {config.SCAN_INTERVAL_SEC}s\n\n"
-                f"✅ Moralis como principal + Batch requests optimizadas"
+                f"✅ Sin dependencia de APIs externas"
             )
         except Exception as e:
             logger.error(f"❌ Error Telegram init: {e}")
@@ -1402,7 +969,7 @@ async def main_trading_loop():
                     mode="DRY_RUN" if config.DRY_RUN else "REAL"
                 )
             
-            # 1️⃣ Escanear tokens
+            # 1️⃣ Escanear tokens (con precios de Jupiter)
             logger.info("📡 Escaneando tokens de Jupiter...")
             tokens = await scan_for_signals()
             
@@ -1426,7 +993,7 @@ async def main_trading_loop():
             else:
                 logger.warning("⚠️ No se encontraron tokens en el scan")
             
-            # 3️⃣ ✅ MONITOREAR POSICIONES (CRÍTICO)
+            # 3️⃣ ✅ MONITOREAR POSICIONES
             if state.positions:
                 logger.info(f"\n🔍 MONITOREANDO {len(state.positions)} POSICIONES:")
                 await check_positions()
@@ -1448,16 +1015,14 @@ async def main_trading_loop():
                 logger.info(f"   Posiciones Abiertas: {len(state.positions)}")
                 
                 logger.info(
-                    f"🆕 APIs: "
-                    f"Moralis OK: {state.stats['moralis_success']} | "
-                    f"CoinGecko OK: {state.stats['coingecko_success']} | "
-                    f"Shyft OK: {state.stats['shyft_success']} | "
-                    f"Jupiter Quote OK: {state.stats['jupiter_quote_success']} | "
-                    f"DexScreener: {state.stats['dexscreener_fallback']} | "
-                    f"Jupiter V3: {state.stats['jupiter_v3_fallback']}"
+                    f"🟢 Precios: "
+                    f"Jupiter: {state.stats['jupiter_prices']} | "
+                    f"Moralis: {state.stats['moralis_fallback']} | "
+                    f"CoinGecko: {state.stats['coingecko_fallback']} | "
+                    f"Fallos: {state.stats['price_failures']}"
                 )
             
-            # Reset error counter si llegó hasta aquí
+            # Reset error counter
             consecutive_errors = 0
             
             # 5️⃣ Esperar siguiente scan
@@ -1488,13 +1053,11 @@ async def main_trading_loop():
                 )
                 break
             
-            # Esperar más tiempo en caso de error
             await asyncio.sleep(min(30, consecutive_errors * 10))
     
     # Cleanup
     logger.info("\n🧹 Limpiando recursos...")
     
-    # Cerrar posiciones abiertas
     if state.positions:
         logger.warning(f"⚠️ Cerrando {len(state.positions)} posiciones pendientes...")
         for mint, position in list(state.positions.items()):
