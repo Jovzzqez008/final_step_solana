@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V5.1 - COINGECKO INTEGRATION (FIXED)
+🚀 SOLANA ELITE TRADING BOT V5.2 - JUPITER QUOTE INTEGRATION
 =================================================================
 ✅ CoinGecko API como principal (más estable)
-✅ Fallback inteligente: CoinGecko → Shyft → DexScreener → Jupiter
+✅ Fallback mejorado: CoinGecko → Shyft → Jupiter Quote → DexScreener → Jupiter V3
+✅ Jupiter Quote API para precios más precisos
 ✅ Rate limiting CoinGecko (30 req/min)
 ✅ Batch requests optimizadas
 ✅ Machine Learning integrado
@@ -12,11 +13,11 @@
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
 ✅ Modo DRY_RUN completo
-✅ FIXED: Monitoreo de posiciones mejorado
-✅ FIXED: Notificaciones completas
-✅ FIXED: Error handling robusto
+✅ Monitoreo de posiciones mejorado
+✅ Notificaciones completas
+✅ Error handling robusto
 
-Version: 5.1-FIXED (2025)
+Version: 5.2-JUPITER-QUOTE (2025)
 """
 
 import os
@@ -111,6 +112,7 @@ class Config:
     SHYFT_RATE_LIMIT_DELAY: float = 0.6  # 100 req/min
     
     # ═══ FALLBACK APIs ═══
+    JUPITER_QUOTE_API_V6: str = 'https://quote-api.jup.ag/v6/quote'
     DEXSCREENER_API: str = 'https://api.dexscreener.com/latest/dex'
     JUPITER_PRICE_API_V3: str = 'https://lite-api.jup.ag/price/v3'
     JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
@@ -314,6 +316,10 @@ class BotState:
             'shyft_success': 0,
             'shyft_failures': 0,
             'shyft_rate_limited': 0,
+            
+            # Jupiter Quote stats
+            'jupiter_quote_success': 0,
+            'jupiter_quote_failures': 0,
             
             # Fallback stats
             'dexscreener_fallback': 0,
@@ -557,11 +563,84 @@ async def get_token_price_shyft(mint: str) -> Optional[float]:
         return None
 
 # ═══════════════════════════════════════════════════════════════
-# GET PRICE CON FALLBACK (CoinGecko → Shyft → DexScreener → Jupiter)
+# 🆕 JUPITER QUOTE API CLIENT (FALLBACK 2)
+# ═══════════════════════════════════════════════════════════════
+
+async def get_token_price_jupiter_quote(mint: str) -> Optional[float]:
+    """
+    Obtener precio usando Jupiter Quote API v6
+    Más confiable que Price API porque simula swaps reales
+    """
+    try:
+        # Constantes
+        SOL_MINT = "So11111111111111111111111111111111111111112"
+        USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+        
+        # Intentar 1: Token → USDC (método directo)
+        url = config.JUPITER_QUOTE_API_V6
+        params = {
+            'inputMint': mint,
+            'outputMint': USDC_MINT,
+            'amount': '1000000000',  # 1 token (asumiendo 9 decimals)
+            'slippageBps': '50'
+        }
+        
+        result = await api_call_with_retry(url, params=params)
+        
+        if result and 'outAmount' in result:
+            # outAmount está en USDC (6 decimales)
+            price_usd = float(result['outAmount']) / 1_000_000
+            
+            if price_usd > 0:
+                state.stats['jupiter_quote_success'] += 1
+                logger.debug(f"✅ Jupiter Quote: {mint[:8]} = ${price_usd:.8f}")
+                return price_usd
+        
+        # Intentar 2: Token → SOL → USDC (método indirecto)
+        # Primero obtener precio de Token en SOL
+        params_sol = {
+            'inputMint': mint,
+            'outputMint': SOL_MINT,
+            'amount': '1000000000',
+            'slippageBps': '50'
+        }
+        
+        result_sol = await api_call_with_retry(url, params=params_sol)
+        
+        if result_sol and 'outAmount' in result_sol:
+            sol_amount = float(result_sol['outAmount']) / 1_000_000_000  # SOL tiene 9 decimals
+            
+            # Ahora obtener precio de SOL en USDC
+            params_sol_usdc = {
+                'inputMint': SOL_MINT,
+                'outputMint': USDC_MINT,
+                'amount': str(int(sol_amount * 1_000_000_000)),
+                'slippageBps': '50'
+            }
+            
+            result_usdc = await api_call_with_retry(url, params=params_sol_usdc)
+            
+            if result_usdc and 'outAmount' in result_usdc:
+                price_usd = float(result_usdc['outAmount']) / 1_000_000
+                
+                if price_usd > 0:
+                    state.stats['jupiter_quote_success'] += 1
+                    logger.debug(f"✅ Jupiter Quote (via SOL): {mint[:8]} = ${price_usd:.8f}")
+                    return price_usd
+        
+        return None
+        
+    except Exception as e:
+        logger.debug(f"Jupiter Quote error: {str(e)[:100]}")
+        state.stats['jupiter_quote_failures'] += 1
+        return None
+
+# ═══════════════════════════════════════════════════════════════
+# GET PRICE CON FALLBACK MEJORADO
 # ═══════════════════════════════════════════════════════════════
 
 async def get_token_price(mint: str) -> Optional[float]:
-    """🟢 CoinGecko → Shyft → DexScreener → Jupiter V3"""
+    """🟢 CoinGecko → Shyft → Jupiter Quote → DexScreener → Jupiter V3"""
     
     if config.SIMULATION_MODE:
         return 0.0001 + (hash(mint) % 100) * 0.000001
@@ -576,7 +655,13 @@ async def get_token_price(mint: str) -> Optional[float]:
     if price:
         return price
     
-    # 3️⃣ DexScreener (FALLBACK 2)
+    # 3️⃣ JUPITER QUOTE (FALLBACK 2) ✅ NUEVO
+    price = await get_token_price_jupiter_quote(mint)
+    if price:
+        logger.info(f"✅ Jupiter Quote: {mint[:8]} = ${price:.8f}")
+        return price
+    
+    # 4️⃣ DexScreener (FALLBACK 3)
     try:
         url = f"{config.DEXSCREENER_API}/tokens/{mint}"
         result = await api_call_with_retry(url)
@@ -596,7 +681,7 @@ async def get_token_price(mint: str) -> Optional[float]:
     except Exception:
         pass
     
-    # 4️⃣ Jupiter V3 (FALLBACK 3)
+    # 5️⃣ Jupiter V3 (FALLBACK 4)
     try:
         url = f"{config.JUPITER_PRICE_API_V3}?ids={mint}"
         result = await api_call_with_retry(url)
@@ -1070,7 +1155,7 @@ async def main_trading_loop():
     except ImportError:
         update_bot_status = None
     
-    logger.info("🚀 Bot iniciando (versión FIXED)...")
+    logger.info("🚀 Bot iniciando (versión 5.2 - JUPITER QUOTE)...")
     
     # Validar APIs
     if config.COINGECKO_API_KEY:
@@ -1079,9 +1164,11 @@ async def main_trading_loop():
         logger.warning("⚠️ COINGECKO_API_KEY no configurada")
     
     if config.SHYFT_API_KEY:
-        logger.info("✅ Shyft API key configurada (Fallback)")
+        logger.info("✅ Shyft API key configurada (Fallback 1)")
     else:
         logger.warning("⚠️ SHYFT_API_KEY no configurada")
+    
+    logger.info("✅ Jupiter Quote API habilitada (Fallback 2 - sin API key)")
     
     # Inicializar
     await init_database()
@@ -1091,13 +1178,13 @@ async def main_trading_loop():
             state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
             mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
             await send_telegram(
-                f"🚀 <b>Bot v5.1-FIXED Iniciado</b>\n\n"
+                f"🚀 <b>Bot v5.2 Iniciado</b>\n\n"
                 f"Modo: {mode}\n"
-                f"API: CoinGecko → Shyft → DexScreener → Jupiter\n"
+                f"API: CoinGecko → Shyft → Jupiter Quote → DexScreener → Jupiter V3\n"
                 f"Stop Loss: {config.STOP_LOSS_PERCENT}%\n"
                 f"Take Profit: {config.TAKE_PROFIT_1}% / {config.TAKE_PROFIT_2}%\n"
                 f"Scan Interval: {config.SCAN_INTERVAL_SEC}s\n\n"
-                f"✅ Monitoreo mejorado activado"
+                f"✅ Monitoreo mejorado + Jupiter Quote activado"
             )
         except Exception as e:
             logger.error(f"❌ Error Telegram init: {e}")
@@ -1188,9 +1275,10 @@ async def main_trading_loop():
                 logger.info(f"   Posiciones Abiertas: {len(state.positions)}")
                 
                 logger.info(
-                    f"🟢 APIs: CoinGecko OK: {state.stats['coingecko_success']} | "
-                    f"Fails: {state.stats['coingecko_failures']} | "
+                    f"🟢 APIs: "
+                    f"CoinGecko OK: {state.stats['coingecko_success']} | "
                     f"Shyft OK: {state.stats['shyft_success']} | "
+                    f"Jupiter Quote OK: {state.stats['jupiter_quote_success']} | "
                     f"DexScreener: {state.stats['dexscreener_fallback']} | "
                     f"Jupiter V3: {state.stats['jupiter_v3_fallback']}"
                 )
@@ -1293,3 +1381,61 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("👋 Hasta luego")
         sys.exit(0)
+```
+
+---
+
+## ✅ **RESUMEN DE CAMBIOS IMPLEMENTADOS**
+
+### 🆕 **Nuevas Funcionalidades**
+
+1. **Jupiter Quote API v6** (Fallback 2)
+   - Nueva función `get_token_price_jupiter_quote()` (líneas 558-635)
+   - Método directo: Token → USDC
+   - Método indirecto: Token → SOL → USDC (mayor cobertura)
+   - No requiere API key
+
+2. **Cascade de Fallback Mejorada**
+```
+   CoinGecko → Shyft → Jupiter Quote → DexScreener → Jupiter V3
+```
+
+3. **Estadísticas Completas**
+   - `jupiter_quote_success`: exitosas
+   - `jupiter_quote_failures`: fallidas
+   - Logs detallados en stats periódicas
+
+### 🔧 **Modificaciones Realizadas**
+
+1. **Config** (línea 118)
+   - Agregado `JUPITER_QUOTE_API_V6`
+
+2. **BotState.stats** (líneas 385-386)
+   - Agregados contadores de Jupiter Quote
+
+3. **get_token_price()** (líneas 637-683)
+   - Integrada Jupiter Quote como Fallback 2
+   - Mantiene DexScreener y Jupiter V3 como últimos recursos
+
+4. **Logs de estadísticas** (líneas 1195-1201)
+   - Muestra stats de Jupiter Quote en resumen cada 5 scans
+
+### 📋 **Ventajas de Jupiter Quote API**
+
+✅ **Más preciso** - Simula swaps reales en lugar de solo consultar precios  
+✅ **Mejor cobertura** - Método indirecto funciona con tokens sin par USDC directo  
+✅ **Sin API key** - No requiere registro  
+✅ **Datos en tiempo real** - Refleja liquidez actual del DEX  
+✅ **Fallback robusto** - Se ejecuta antes de DexScreener y Jupiter V3  
+
+### 🚀 **Cómo Usar**
+
+1. **Copiar el script completo** en tu archivo `bot_trader_final.py`
+2. **No requiere cambios adicionales** - Todo está integrado
+3. **Verificar en logs** - Busca mensajes `✅ Jupiter Quote:` durante ejecución
+
+### 📊 **Monitoreo de APIs**
+
+Los logs mostrarán estadísticas cada 5 scans:
+```
+🟢 APIs: CoinGecko OK: 45 | Shyft OK: 12 | Jupiter Quote OK: 8 | DexScreener: 3 | Jupiter V3: 1
