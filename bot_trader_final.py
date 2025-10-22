@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V5.1 - COINGECKO INTEGRATION
-=========================================================
+🚀 SOLANA ELITE TRADING BOT V5.1 - COINGECKO INTEGRATION (FIXED)
+=================================================================
 ✅ CoinGecko API como principal (más estable)
 ✅ Fallback inteligente: CoinGecko → Shyft → DexScreener → Jupiter
 ✅ Rate limiting CoinGecko (30 req/min)
@@ -12,8 +12,11 @@
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
 ✅ Modo DRY_RUN completo
+✅ FIXED: Monitoreo de posiciones mejorado
+✅ FIXED: Notificaciones completas
+✅ FIXED: Error handling robusto
 
-Version: 5.1 (2025) - CoinGecko Integration
+Version: 5.1-FIXED (2025)
 """
 
 import os
@@ -94,9 +97,7 @@ class Config:
     # ═══ 🟢 COINGECKO API (PRINCIPAL) ═══
     COINGECKO_API_KEY: str = os.getenv('COINGECKO_API_KEY', '')
     COINGECKO_BASE_URL: str = 'https://api.coingecko.com/api/v3'
-    # Endpoint por contract address
     COINGECKO_TOKEN_BY_CONTRACT: str = f'{COINGECKO_BASE_URL}/coins/solana/contract'
-    # Endpoint simple de price
     COINGECKO_SIMPLE_PRICE: str = f'{COINGECKO_BASE_URL}/simple/token_price/solana'
     COINGECKO_RATE_LIMIT: float = 2.0  # 30 req/min = 1 cada 2 segundos
     
@@ -416,7 +417,6 @@ async def get_token_price_coingecko(mint: str) -> Optional[float]:
     try:
         await coingecko_rate_limit()
         
-        # Usar endpoint simple/token_price (más rápido para solo precio)
         url = config.COINGECKO_SIMPLE_PRICE
         params = {
             'contract_addresses': mint,
@@ -435,7 +435,6 @@ async def get_token_price_coingecko(mint: str) -> Optional[float]:
                 logger.debug(f"✅ CoinGecko: {mint[:8]} = ${price:.8f}")
                 return price
         
-        # Intentar con endpoint completo si falla el simple
         url_full = f"{config.COINGECKO_TOKEN_BY_CONTRACT}/{mint}"
         result_full = await api_call_with_retry(url_full, headers=headers)
         
@@ -468,7 +467,6 @@ async def get_multiple_prices_coingecko(mints: List[str]) -> Dict[str, float]:
     try:
         await coingecko_rate_limit()
         
-        # Limitar a 10 tokens por request (límite de CoinGecko)
         batch_size = 10
         all_prices = {}
         
@@ -493,7 +491,6 @@ async def get_multiple_prices_coingecko(mints: List[str]) -> Dict[str, float]:
                         if price > 0:
                             all_prices[mint] = price
             
-            # Rate limit entre batches
             if i + batch_size < len(mints):
                 await asyncio.sleep(config.COINGECKO_RATE_LIMIT)
         
@@ -900,19 +897,23 @@ async def buy_token(token: TokenData, ml_confidence: float):
     logger.warning(f"⚠️ MODO REAL no implementado")
 
 # ═══════════════════════════════════════════════════════════════
-# GESTIÓN DE POSICIONES (CON BATCH)
+# ✅ GESTIÓN DE POSICIONES MEJORADA (FIXED)
 # ═══════════════════════════════════════════════════════════════
 
 async def check_positions():
-    """Monitorear posiciones con batch request"""
+    """✅ Monitoreo mejorado con logging detallado"""
     
     if not state.positions:
+        logger.debug("📊 No hay posiciones abiertas para monitorear")
         return
+    
+    logger.info(f"🔍 Monitoreando {len(state.positions)} posiciones...")
     
     # 🚀 OPTIMIZACIÓN: Batch request con CoinGecko
     mints = list(state.positions.keys())
     
     if config.COINGECKO_API_KEY:
+        logger.debug("📡 Obteniendo precios batch de CoinGecko...")
         prices = await get_multiple_prices_coingecko(mints)
     else:
         prices = {}
@@ -924,48 +925,80 @@ async def check_positions():
             current_price = prices.get(mint)
             
             if not current_price:
+                logger.debug(f"🔄 Fallback individual para {position.symbol}")
                 current_price = await get_token_price(mint)
             
             if not current_price:
-                logger.debug(f"⚠️ No price para {position.symbol}")
+                logger.warning(f"⚠️ No se pudo obtener precio para {position.symbol} ({mint[:8]})")
                 continue
             
-            # Actualizar precios
+            # Actualizar precios históricos
             if current_price > position.highest_price:
                 position.highest_price = current_price
+                logger.debug(f"📈 {position.symbol} nuevo máximo: ${current_price:.8f}")
+            
             if current_price < position.lowest_price:
                 position.lowest_price = current_price
+                logger.debug(f"📉 {position.symbol} nuevo mínimo: ${current_price:.8f}")
             
-            # Calcular P&L
+            # Calcular métricas
             pnl = position.current_pnl(current_price)
             hold_time = position.hold_time_minutes()
             
-            # Decisiones de salida
+            # ✅ LOG DETALLADO en cada check
+            logger.info(
+                f"📊 {position.symbol}: "
+                f"Precio: ${current_price:.8f} | "
+                f"P&L: {pnl:+.2f}% | "
+                f"Tiempo: {hold_time:.1f}min | "
+                f"Max: ${position.highest_price:.8f} | "
+                f"Min: ${position.lowest_price:.8f}"
+            )
+            
+            # Evaluar condiciones de salida
             exit_reason = None
             
+            # Stop Loss
             if pnl <= config.STOP_LOSS_PERCENT:
                 exit_reason = "STOP_LOSS"
-            elif pnl >= config.TAKE_PROFIT_1:
-                exit_reason = "TAKE_PROFIT_1"
+                logger.warning(f"🛑 {position.symbol} alcanzó STOP LOSS: {pnl:.2f}%")
+            
+            # Take Profit 2 (mayor ganancia primero)
             elif pnl >= config.TAKE_PROFIT_2:
                 exit_reason = "TAKE_PROFIT_2"
+                logger.info(f"💰 {position.symbol} alcanzó TP2: {pnl:.2f}%")
             
+            # Take Profit 1
+            elif pnl >= config.TAKE_PROFIT_1:
+                exit_reason = "TAKE_PROFIT_1"
+                logger.info(f"✅ {position.symbol} alcanzó TP1: {pnl:.2f}%")
+            
+            # Trailing stop (opcional) - timeout con pérdida
+            elif hold_time > 60 and pnl < -3:
+                exit_reason = "TIMEOUT_NEGATIVE"
+                logger.info(f"⏱️ {position.symbol} timeout con pérdida: {pnl:.2f}%")
+            
+            # Ejecutar salida si hay razón
             if exit_reason:
                 await exit_position(mint, position, current_price, exit_reason)
-            else:
-                logger.debug(f"📊 {position.symbol}: P&L {pnl:+.2f}% | {hold_time:.1f}min")
         
         except Exception as e:
-            logger.error(f"❌ Error check_positions: {e}")
+            logger.error(f"❌ Error monitoreando {position.symbol}: {e}", exc_info=True)
 
 async def exit_position(mint: str, position: Position, exit_price: float, reason: str):
-    """Cerrar posición"""
+    """✅ Cierre mejorado con notificaciones completas"""
     
     try:
+        # Calcular métricas finales
         pnl = position.current_pnl(exit_price)
+        hold_time = position.hold_time_minutes()
         
-        # Actualizar stats
-        if pnl > 0:
+        # Determinar resultado
+        is_win = pnl > 0
+        emoji = "✅" if is_win else "❌"
+        
+        # Actualizar estadísticas
+        if is_win:
             state.stats['wins'] += 1
         else:
             state.stats['losses'] += 1
@@ -973,49 +1006,71 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
         state.stats['total_pnl'] += pnl
         state.stats['today_pnl'] += pnl
         
-        # ML accuracy
-        if position.ml_confidence > 0 and pnl > 0:
+        # ML accuracy tracking
+        if position.ml_confidence > 0 and is_win:
             state.stats['ml_correct'] += 1
+        
+        # ✅ LOG COMPLETO del cierre
+        logger.info("=" * 60)
+        logger.info(f"{emoji} POSICIÓN CERRADA: {position.symbol}")
+        logger.info(f"   Entrada: ${position.entry_price:.8f}")
+        logger.info(f"   Salida:  ${exit_price:.8f}")
+        logger.info(f"   P&L:     {pnl:+.2f}%")
+        logger.info(f"   Tiempo:  {hold_time:.1f} minutos")
+        logger.info(f"   Máximo:  ${position.highest_price:.8f} ({position.current_pnl(position.highest_price):+.2f}%)")
+        logger.info(f"   Mínimo:  ${position.lowest_price:.8f} ({position.current_pnl(position.lowest_price):+.2f}%)")
+        logger.info(f"   Razón:   {reason}")
+        logger.info(f"   ML Conf: {position.ml_confidence:.1f}%")
+        logger.info("=" * 60)
         
         # Guardar en DB
         token_data = state.watchlist.get(mint)
         if token_data:
             await save_trade_for_ml(token_data, position, exit_price, reason)
         
-        # Notificar
-        emoji = "✅" if pnl > 0 else "❌"
+        # ✅ NOTIFICACIÓN TELEGRAM COMPLETA
+        win_rate = (state.stats['wins'] / max(1, state.stats['wins'] + state.stats['losses'])) * 100
+        
         msg = (
-            f"{emoji} <b>Posición Cerrada</b>\n\n"
-            f"Token: {position.symbol}\n"
-            f"Entrada: ${position.entry_price:.8f}\n"
-            f"Salida: ${exit_price:.8f}\n"
-            f"P&L: {pnl:+.2f}%\n"
-            f"Tiempo: {position.hold_time_minutes():.1f}min\n"
-            f"Razón: {reason}\n"
-            f"ML Confidence: {position.ml_confidence:.1f}%"
+            f"{emoji} <b>{'GANANCIA' if is_win else 'PÉRDIDA'}</b>\n\n"
+            f"<b>Token:</b> {position.symbol}\n"
+            f"<b>Entrada:</b> ${position.entry_price:.8f}\n"
+            f"<b>Salida:</b> ${exit_price:.8f}\n"
+            f"<b>P&L:</b> {pnl:+.2f}%\n\n"
+            f"<b>Máximo alcanzado:</b> ${position.highest_price:.8f} ({position.current_pnl(position.highest_price):+.2f}%)\n"
+            f"<b>Mínimo:</b> ${position.lowest_price:.8f}\n"
+            f"<b>Tiempo:</b> {hold_time:.1f}min\n"
+            f"<b>Razón:</b> {reason}\n"
+            f"<b>ML Confidence:</b> {position.ml_confidence:.1f}%\n\n"
+            f"📊 <b>Stats Hoy:</b>\n"
+            f"Trades: {state.stats['today_trades']} | "
+            f"W/L: {state.stats['wins']}/{state.stats['losses']} ({win_rate:.1f}%) | "
+            f"P&L Total: {state.stats['total_pnl']:+.2f}%"
         )
         
         await send_telegram(msg)
-        logger.info(f"{emoji} Cerrado {position.symbol}: {pnl:+.2f}% ({reason})")
         
+        # Eliminar posición
         del state.positions[mint]
         
+        logger.info(f"✅ Posición {position.symbol} eliminada del state")
+        
     except Exception as e:
-        logger.error(f"❌ Error exit_position: {e}")
+        logger.error(f"❌ Error en exit_position: {e}", exc_info=True)
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN LOOP
+# ✅ MAIN LOOP MEJORADO (FIXED)
 # ═══════════════════════════════════════════════════════════════
 
 async def main_trading_loop():
-    """Loop principal"""
+    """✅ Loop principal con manejo robusto de errores"""
     
     try:
         from health_server import update_bot_status
     except ImportError:
         update_bot_status = None
     
-    logger.info("🚀 Bot iniciando...")
+    logger.info("🚀 Bot iniciando (versión FIXED)...")
     
     # Validar APIs
     if config.COINGECKO_API_KEY:
@@ -1035,13 +1090,21 @@ async def main_trading_loop():
         try:
             state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
             mode = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
-            await send_telegram(f"🚀 <b>Bot v5.1 Iniciado</b>\n\nModo: {mode}\nAPI Principal: CoinGecko\nFallback: Shyft → DexScreener → Jupiter")
+            await send_telegram(
+                f"🚀 <b>Bot v5.1-FIXED Iniciado</b>\n\n"
+                f"Modo: {mode}\n"
+                f"API: CoinGecko → Shyft → DexScreener → Jupiter\n"
+                f"Stop Loss: {config.STOP_LOSS_PERCENT}%\n"
+                f"Take Profit: {config.TAKE_PROFIT_1}% / {config.TAKE_PROFIT_2}%\n"
+                f"Scan Interval: {config.SCAN_INTERVAL_SEC}s\n\n"
+                f"✅ Monitoreo mejorado activado"
+            )
         except Exception as e:
-            logger.error(f"❌ Error Telegram: {e}")
+            logger.error(f"❌ Error Telegram init: {e}")
     
     logger.info(f"🧠 ML: {'ENABLED' if ml_predictor.is_trained else 'DISABLED'}")
     logger.info(f"🧪 DRY_RUN: {config.DRY_RUN}")
-    logger.info(f"🎮 SIMULATION: {config.SIMULATION_MODE}")
+    logger.info(f"📊 Monitoreo cada {config.SCAN_INTERVAL_SEC}s")
     
     # Update health
     if update_bot_status:
@@ -1052,10 +1115,18 @@ async def main_trading_loop():
             mode="DRY_RUN" if config.DRY_RUN else "REAL"
         )
     
+    consecutive_errors = 0
+    max_consecutive_errors = 5
+    
     # Loop principal
     while state.running:
         try:
             state.stats['scans'] += 1
+            scan_start = datetime.now()
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"🔄 SCAN #{state.stats['scans']} - {scan_start.strftime('%H:%M:%S')}")
+            logger.info(f"{'='*60}")
             
             if update_bot_status:
                 update_bot_status(
@@ -1071,15 +1142,17 @@ async def main_trading_loop():
                     mode="DRY_RUN" if config.DRY_RUN else "REAL"
                 )
             
-            # 1. Escanear
+            # 1️⃣ Escanear tokens
+            logger.info("📡 Escaneando tokens de Jupiter...")
             tokens = await scan_for_signals()
             
             if tokens:
-                logger.info(f"📊 Analizando {len(tokens)} tokens...")
+                logger.info(f"✅ Encontrados {len(tokens)} tokens candidatos")
                 
-                # 2. Evaluar señales
+                # 2️⃣ Evaluar señales
                 for token in tokens:
                     if len(state.positions) >= config.MAX_POSITIONS:
+                        logger.warning(f"⚠️ Límite de posiciones alcanzado ({config.MAX_POSITIONS})")
                         break
                     
                     has_signal, score, ml_conf = has_buy_signal(token)
@@ -1087,55 +1160,104 @@ async def main_trading_loop():
                     if has_signal:
                         state.stats['signals'] += 1
                         state.watchlist[token.mint] = token
+                        logger.info(f"🎯 Señal detectada: {token.symbol} (Score: {score:.0f}, ML: {ml_conf:.1f}%)")
                         await buy_token(token, ml_conf)
                         await asyncio.sleep(1)
+            else:
+                logger.warning("⚠️ No se encontraron tokens en el scan")
             
-            # 3. Monitorear posiciones
-            await check_positions()
+            # 3️⃣ ✅ MONITOREAR POSICIONES (CRÍTICO)
+            if state.positions:
+                logger.info(f"\n🔍 MONITOREANDO {len(state.positions)} POSICIONES:")
+                await check_positions()
+            else:
+                logger.debug("📊 No hay posiciones para monitorear")
             
-            # 4. Stats periódicas
-            if state.stats['scans'] % 10 == 0:
+            # 4️⃣ Stats periódicas
+            if state.stats['scans'] % 5 == 0:
                 win_rate = (state.stats['wins'] / max(1, state.stats['wins'] + state.stats['losses'])) * 100
                 ml_accuracy = (state.stats['ml_correct'] / max(1, state.stats['ml_predictions'])) * 100 if state.stats['ml_predictions'] > 0 else 0
                 
-                logger.info(
-                    f"📊 Stats: Scans: {state.stats['scans']} | "
-                    f"Señales: {state.stats['signals']} | "
-                    f"Trades: {state.stats['trades']} | "
-                    f"W/L: {state.stats['wins']}/{state.stats['losses']} ({win_rate:.1f}%) | "
-                    f"P&L: {state.stats['total_pnl']:+.2f}% | "
-                    f"ML Acc: {ml_accuracy:.1f}%"
-                )
+                logger.info(f"\n📊 ESTADÍSTICAS:")
+                logger.info(f"   Scans: {state.stats['scans']}")
+                logger.info(f"   Señales: {state.stats['signals']}")
+                logger.info(f"   Trades: {state.stats['trades']}")
+                logger.info(f"   Win Rate: {win_rate:.1f}% ({state.stats['wins']}W/{state.stats['losses']}L)")
+                logger.info(f"   P&L Total: {state.stats['total_pnl']:+.2f}%")
+                logger.info(f"   ML Accuracy: {ml_accuracy:.1f}%")
+                logger.info(f"   Posiciones Abiertas: {len(state.positions)}")
                 
                 logger.info(
                     f"🟢 APIs: CoinGecko OK: {state.stats['coingecko_success']} | "
-                    f"CG Fails: {state.stats['coingecko_failures']} | "
-                    f"CG Rate Limited: {state.stats['coingecko_rate_limited']} | "
+                    f"Fails: {state.stats['coingecko_failures']} | "
                     f"Shyft OK: {state.stats['shyft_success']} | "
                     f"DexScreener: {state.stats['dexscreener_fallback']} | "
                     f"Jupiter V3: {state.stats['jupiter_v3_fallback']}"
                 )
             
-            # 5. Esperar
-            await asyncio.sleep(config.SCAN_INTERVAL_SEC)
+            # Reset error counter si llegó hasta aquí
+            consecutive_errors = 0
+            
+            # 5️⃣ Esperar siguiente scan
+            scan_duration = (datetime.now() - scan_start).total_seconds()
+            sleep_time = max(1, config.SCAN_INTERVAL_SEC - scan_duration)
+            
+            logger.info(f"⏳ Próximo scan en {sleep_time:.1f}s...")
+            await asyncio.sleep(sleep_time)
             
         except KeyboardInterrupt:
-            logger.info("⏸️ Deteniendo bot...")
+            logger.info("\n⏸️ Deteniendo bot por usuario...")
             state.running = False
             break
-            
+        
         except Exception as e:
-            logger.error(f"❌ Error en main loop: {e}", exc_info=True)
-            await asyncio.sleep(10)
+            consecutive_errors += 1
+            logger.error(
+                f"❌ ERROR EN MAIN LOOP ({consecutive_errors}/{max_consecutive_errors}): {e}",
+                exc_info=True
+            )
+            
+            if consecutive_errors >= max_consecutive_errors:
+                logger.critical("🚨 DEMASIADOS ERRORES CONSECUTIVOS - Deteniendo bot")
+                await send_telegram(
+                    "🚨 <b>Bot Detenido</b>\n\n"
+                    f"Razón: {max_consecutive_errors} errores consecutivos\n"
+                    f"Último error: {str(e)[:200]}"
+                )
+                break
+            
+            # Esperar más tiempo en caso de error
+            await asyncio.sleep(min(30, consecutive_errors * 10))
     
     # Cleanup
+    logger.info("\n🧹 Limpiando recursos...")
+    
+    # Cerrar posiciones abiertas
+    if state.positions:
+        logger.warning(f"⚠️ Cerrando {len(state.positions)} posiciones pendientes...")
+        for mint, position in list(state.positions.items()):
+            try:
+                current_price = await get_token_price(mint)
+                if current_price:
+                    await exit_position(mint, position, current_price, "BOT_STOPPED")
+            except Exception as e:
+                logger.error(f"Error cerrando {position.symbol}: {e}")
+    
     if state.db_pool:
         await state.db_pool.close()
     
     if state.connector:
         await state.connector.close()
     
-    logger.info("👋 Bot detenido")
+    if state.telegram_bot:
+        await send_telegram(
+            f"👋 <b>Bot Detenido</b>\n\n"
+            f"Scans: {state.stats['scans']}\n"
+            f"Trades: {state.stats['trades']}\n"
+            f"P&L Final: {state.stats['total_pnl']:+.2f}%"
+        )
+    
+    logger.info("✅ Bot detenido correctamente")
 
 # ═══════════════════════════════════════════════════════════════
 # ENTRY POINT
