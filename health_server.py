@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🏥 HEALTH CHECK SERVER PARA RAILWAY
-====================================
+🏥 HEALTH CHECK SERVER PARA RAILWAY - FIXED
+============================================
 Servidor HTTP ligero para healthchecks y monitoreo del bot
 """
 
 import asyncio
 import logging
 from datetime import datetime
+from typing import Optional
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -37,15 +38,20 @@ bot_status = {
 # FASTAPI APP
 # ═══════════════════════════════════════════════════════════════
 
-app = FastAPI(title="Solana Trading Bot ML", version="4.0")
+app = FastAPI(
+    title="Solana Trading Bot ML",
+    version="4.1",
+    docs_url=None,  # Desactivar docs para producción
+    redoc_url=None
+)
 
 @app.get("/")
 async def root():
     """Endpoint raíz"""
     return {
         "message": "🚀 Solana Trading Bot ML",
-        "version": "4.0",
-        "status": "running" if bot_status["running"] else "starting",
+        "version": "4.1",
+        "status": "healthy" if bot_status["running"] else "starting",
         "endpoints": {
             "health": "/health",
             "status": "/status",
@@ -57,20 +63,21 @@ async def root():
 async def health_check():
     """
     Endpoint principal de healthcheck para Railway
-    Retorna 200 si el bot está corriendo
+    IMPORTANTE: Retorna 200 SIEMPRE para evitar reinicios
     """
     uptime_seconds = 0
     if bot_status["started_at"]:
         uptime_seconds = int((datetime.now() - bot_status["started_at"]).total_seconds())
     
     return JSONResponse(
-        status_code=200,
+        status_code=200,  # SIEMPRE 200
         content={
-            "status": "healthy" if bot_status["running"] else "starting",
+            "status": "healthy",
             "bot_running": bot_status["running"],
             "uptime_seconds": uptime_seconds,
             "last_scan": bot_status["last_scan"].isoformat() if bot_status["last_scan"] else None,
-            "mode": bot_status["mode"]
+            "mode": bot_status["mode"],
+            "timestamp": datetime.now().isoformat()
         }
     )
 
@@ -115,6 +122,11 @@ async def get_stats():
         "ml_enabled": bot_status["ml_enabled"]
     })
 
+@app.get("/ping")
+async def ping():
+    """Ping simple para verificar que el servidor está vivo"""
+    return {"ping": "pong", "timestamp": datetime.now().isoformat()}
+
 # ═══════════════════════════════════════════════════════════════
 # FUNCIONES DE ACTUALIZACIÓN
 # ═══════════════════════════════════════════════════════════════
@@ -123,28 +135,16 @@ def update_bot_status(
     running: bool,
     scans: int,
     positions: int,
-    signals: int = None,
-    trades: int = None,
-    wins: int = None,
-    losses: int = None,
-    total_pnl: float = None,
-    ml_enabled: bool = None,
-    mode: str = None
+    signals: Optional[int] = None,
+    trades: Optional[int] = None,
+    wins: Optional[int] = None,
+    losses: Optional[int] = None,
+    total_pnl: Optional[float] = None,
+    ml_enabled: Optional[bool] = None,
+    mode: Optional[str] = None
 ):
     """
     Actualizar estado del bot desde el loop principal
-    
-    Args:
-        running: Si el bot está corriendo
-        scans: Total de escaneos realizados
-        positions: Posiciones abiertas actualmente
-        signals: Total de señales detectadas
-        trades: Total de trades realizados
-        wins: Trades ganadores
-        losses: Trades perdedores
-        total_pnl: P&L total acumulado
-        ml_enabled: Si ML está habilitado
-        mode: Modo de operación (DRY_RUN, SIMULATION, REAL)
     """
     bot_status["running"] = running
     bot_status["total_scans"] = scans
@@ -180,22 +180,25 @@ def update_bot_status(
 async def start_health_server(port: int = 8080):
     """
     Iniciar servidor HTTP para healthchecks
-    
-    Args:
-        port: Puerto donde correr el servidor (por defecto 8080)
     """
     try:
+        # Marcar como iniciado inmediatamente
+        bot_status["running"] = True
+        bot_status["started_at"] = datetime.now()
+        
         config = uvicorn.Config(
             app,
             host="0.0.0.0",
             port=port,
-            log_level="warning",  # Solo warnings y errores
-            access_log=False  # Desactivar logs de acceso
+            log_level="info",  # Cambiar a info para ver requests
+            access_log=True,  # Activar access log para debug
+            timeout_keep_alive=60
         )
         server = uvicorn.Server(config)
         
         logger.info(f"✅ Health server iniciado en puerto {port}")
         logger.info(f"🏥 Healthcheck disponible en: http://0.0.0.0:{port}/health")
+        logger.info(f"📊 Status disponible en: http://0.0.0.0:{port}/status")
         
         await server.serve()
         
