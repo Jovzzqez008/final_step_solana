@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🚀 SOLANA ELITE TRADING BOT V4.0 - ML READY + ROBUSTO
+🚀 SOLANA ELITE TRADING BOT V4.1 - ML READY + FIXED
 ====================================================
 ✅ Fallback APIs: Jupiter → CoinGecko → DexScreener
 ✅ Machine Learning integrado (predicción + entrenamiento)
-✅ Recolección automática de datos para ML
+✅ Health Server integrado para Railway
+✅ Sesiones HTTP cerradas correctamente
 ✅ Retry inteligente con DNS caching
 ✅ PostgreSQL para histórico
 ✅ Telegram notifications
 ✅ Modo DRY_RUN y SIMULATION completo
 
-Version: 4.0 (2025) - Production Ready + ML
+Version: 4.1 (2025) - Production Ready + FIXED
 """
 
 import os
@@ -293,6 +294,7 @@ class BotState:
             'ml_correct': 0,
             'api_errors': 0,
             'jupiter_success': 0,
+            'jupiter_failures': 0,
             'coingecko_fallback': 0,
             'dexscreener_fallback': 0
         }
@@ -304,7 +306,7 @@ class BotState:
 state = BotState()
 
 # ═══════════════════════════════════════════════════════════════
-# HTTP CLIENT ROBUSTO
+# HTTP CLIENT ROBUSTO - FIXED
 # ═══════════════════════════════════════════════════════════════
 
 async def get_http_session() -> aiohttp.ClientSession:
@@ -312,7 +314,7 @@ async def get_http_session() -> aiohttp.ClientSession:
     if not state.connector:
         state.connector = aiohttp.TCPConnector(
             limit=50,
-            ttl_dns_cache=600,  # Cache DNS 10 min
+            ttl_dns_cache=600,
             force_close=False,
             enable_cleanup_closed=True
         )
@@ -326,29 +328,30 @@ async def get_http_session() -> aiohttp.ClientSession:
     )
 
 async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Optional[dict]:
-    """API call con retry y logging limpio"""
+    """API call con retry y cierre correcto de sesión - FIXED"""
     
     for attempt in range(config.MAX_RETRIES):
+        session = None
         try:
             session = await get_http_session()
             
             if method == 'GET':
                 async with session.get(url, **kwargs) as resp:
                     if resp.status == 200:
-                        return await resp.json()
+                        data = await resp.json()
+                        return data
                     elif resp.status == 429:
                         if attempt < config.MAX_RETRIES - 1:
                             await asyncio.sleep(config.RETRY_DELAY_SEC * (attempt + 1))
                             continue
                     else:
-                        logger.debug(f"API error {resp.status}")
+                        logger.debug(f"API error {resp.status} for {url}")
                         
             elif method == 'POST':
-                async with session.get(url, **kwargs) as resp:
+                async with session.post(url, **kwargs) as resp:
                     if resp.status == 200:
-                        return await resp.json()
-            
-            await session.close()
+                        data = await resp.json()
+                        return data
             
         except aiohttp.ClientConnectorError as e:
             logger.debug(f"Connection error (attempt {attempt + 1}): {str(e)[:50]}")
@@ -359,7 +362,7 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
                 continue
                 
         except asyncio.TimeoutError:
-            logger.debug(f"Timeout (attempt {attempt + 1})")
+            logger.debug(f"Timeout (attempt {attempt + 1}) for {url}")
             if attempt < config.MAX_RETRIES - 1:
                 await asyncio.sleep(config.RETRY_DELAY_SEC)
                 continue
@@ -368,6 +371,11 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
             logger.debug(f"Unexpected error: {str(e)[:50]}")
             if attempt < config.MAX_RETRIES - 1:
                 continue
+        
+        finally:
+            # FIX CRÍTICO: Cerrar sesión correctamente
+            if session and not session.closed:
+                await session.close()
     
     return None
 
@@ -520,11 +528,11 @@ async def send_telegram(message: str):
         logger.debug(f"Error Telegram: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# ESCANEO DE TOKENS
+# ESCANEO DE TOKENS - FIXED CON FALLBACK A SIMULATION
 # ═══════════════════════════════════════════════════════════════
 
 async def scan_for_signals() -> List[TokenData]:
-    """Escanear tokens con ML integrado"""
+    """Escanear tokens con ML integrado y fallback automático"""
     
     if config.SIMULATION_MODE:
         logger.info("🧪 [SIMULATION] Generando tokens simulados")
@@ -546,17 +554,42 @@ async def scan_for_signals() -> List[TokenData]:
         
         return fake_tokens
     
-    # MODO REAL - Jupiter API
+    # MODO REAL - Jupiter API con fallback
     try:
         category = config.JUPITER_SCAN_CATEGORY
         interval = config.JUPITER_SCAN_INTERVAL
         url = f"{config.JUPITER_TOKENS_API}/{category}/{interval}"
         
+        logger.debug(f"🔍 Jupiter URL: {url}")
+        
         result = await api_call_with_retry(url, params={'limit': 100})
         
-        if not result or not isinstance(result, list):
-            logger.warning("⚠️ Jupiter API response vacía o inválida")
+        # Validar respuesta
+        if not result:
+            logger.warning("⚠️ Jupiter API no respondió")
+            state.stats['jupiter_failures'] += 1
+            
+            # Activar SIMULATION automáticamente después de 3 fallos
+            if state.stats['jupiter_failures'] >= 3:
+                logger.warning("🔄 Activando SIMULATION MODE por fallos consecutivos de Jupiter")
+                config.SIMULATION_MODE = True
+                return await scan_for_signals()
+            
             return []
+        
+        if not isinstance(result, list):
+            logger.warning(f"⚠️ Jupiter response inválida: {type(result)}")
+            state.stats['jupiter_failures'] += 1
+            
+            if state.stats['jupiter_failures'] >= 3:
+                logger.warning("🔄 Activando SIMULATION MODE")
+                config.SIMULATION_MODE = True
+                return await scan_for_signals()
+            
+            return []
+        
+        # Reset contador de fallos si todo OK
+        state.stats['jupiter_failures'] = 0
         
         candidates = []
         
@@ -595,6 +628,13 @@ async def scan_for_signals() -> List[TokenData]:
         
     except Exception as e:
         logger.error(f"❌ Error scan_for_signals: {e}")
+        state.stats['jupiter_failures'] += 1
+        
+        if state.stats['jupiter_failures'] >= 3:
+            logger.warning("🔄 Activando SIMULATION MODE por excepciones")
+            config.SIMULATION_MODE = True
+            return await scan_for_signals()
+        
         return []
 
 def has_buy_signal(token: TokenData) -> Tuple[bool, float, float]:
@@ -823,11 +863,18 @@ async def exit_position(mint: str, position: Position, exit_price: float, reason
         logger.error(f"❌ Error exit_position: {e}")
 
 # ═══════════════════════════════════════════════════════════════
-# MAIN LOOP
+# MAIN LOOP CON HEALTH SERVER INTEGRATION
 # ═══════════════════════════════════════════════════════════════
 
 async def main_trading_loop():
-    """Loop principal de trading"""
+    """Loop principal de trading con actualización de health status"""
+    
+    # Importar funciones del health server
+    try:
+        from health_server import update_bot_status
+    except ImportError:
+        logger.warning("⚠️ health_server.py no encontrado - health checks deshabilitados")
+        update_bot_status = None
     
     logger.info("🚀 Bot iniciando...")
     
@@ -837,7 +884,8 @@ async def main_trading_loop():
     if config.ENABLE_TELEGRAM and TELEGRAM_AVAILABLE:
         try:
             state.telegram_bot = Bot(token=config.TELEGRAM_TOKEN)
-            await send_telegram("🚀 <b>Bot Trading ML Iniciado</b>\n\nModo: DRY_RUN" if config.DRY_RUN else "MODO REAL")
+            mode_msg = "DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+            await send_telegram(f"🚀 <b>Bot Trading ML Iniciado</b>\n\nModo: {mode_msg}")
         except Exception as e:
             logger.error(f"❌ Error Telegram init: {e}")
     
@@ -848,10 +896,40 @@ async def main_trading_loop():
     logger.info(f"🧪 DRY_RUN: {config.DRY_RUN}")
     logger.info(f"🎮 SIMULATION: {config.SIMULATION_MODE}")
     
+    # Actualizar health server inicial
+    if update_bot_status:
+        update_bot_status(
+            running=True,
+            scans=0,
+            positions=0,
+            signals=0,
+            trades=0,
+            wins=0,
+            losses=0,
+            total_pnl=0.0,
+            ml_enabled=ml_predictor.is_trained,
+            mode="DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+        )
+    
     # Loop principal
     while state.running:
         try:
             state.stats['scans'] += 1
+            
+            # Actualizar health server cada scan
+            if update_bot_status:
+                update_bot_status(
+                    running=True,
+                    scans=state.stats['scans'],
+                    positions=len(state.positions),
+                    signals=state.stats['signals'],
+                    trades=state.stats['trades'],
+                    wins=state.stats['wins'],
+                    losses=state.stats['losses'],
+                    total_pnl=state.stats['total_pnl'],
+                    ml_enabled=ml_predictor.is_trained,
+                    mode="DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+                )
             
             # 1. Escanear tokens
             tokens = await scan_for_signals()
@@ -890,7 +968,8 @@ async def main_trading_loop():
                 )
                 
                 logger.info(
-                    f"🔌 APIs: Jupiter: {state.stats['jupiter_success']} | "
+                    f"🔌 APIs: Jupiter OK: {state.stats['jupiter_success']} | "
+                    f"Jupiter Fails: {state.stats['jupiter_failures']} | "
                     f"CoinGecko: {state.stats['coingecko_fallback']} | "
                     f"DexScreener: {state.stats['dexscreener_fallback']} | "
                     f"Errors: {state.stats['api_errors']}"
@@ -918,12 +997,44 @@ async def main_trading_loop():
     logger.info("👋 Bot detenido")
 
 # ═══════════════════════════════════════════════════════════════
-# ENTRY POINT
+# ENTRY POINT CON HEALTH SERVER PARALELO
 # ═══════════════════════════════════════════════════════════════
+
+async def run_bot_with_health_server():
+    """Ejecutar bot + health server en paralelo para Railway"""
+    
+    try:
+        from health_server import start_health_server, update_bot_status
+        
+        # Inicializar estado del health server
+        update_bot_status(
+            running=True,
+            scans=0,
+            positions=0,
+            signals=0,
+            trades=0,
+            wins=0,
+            losses=0,
+            total_pnl=0.0,
+            ml_enabled=ml_predictor.is_trained,
+            mode="DRY_RUN" if config.DRY_RUN else ("SIMULATION" if config.SIMULATION_MODE else "REAL")
+        )
+        
+        logger.info("🏥 Health server habilitado en puerto 8080")
+        
+        # Ejecutar ambos en paralelo
+        await asyncio.gather(
+            main_trading_loop(),  # Bot principal
+            start_health_server(port=8080)  # Health server para Railway
+        )
+        
+    except ImportError:
+        logger.warning("⚠️ health_server.py no encontrado - ejecutando solo bot")
+        await main_trading_loop()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main_trading_loop())
+        asyncio.run(run_bot_with_health_server())
     except KeyboardInterrupt:
         logger.info("👋 Hasta luego")
         sys.exit(0)
