@@ -90,15 +90,17 @@ class Config:
     TRADE_AMOUNT_SOL: float = float(os.getenv('TRADE_AMOUNT_SOL', '0.01'))
     SLIPPAGE_BPS: int = int(os.getenv('SLIPPAGE_BPS', '300'))
     
-    # ═══ APIs (con fallbacks) ═══
+    # ═══ APIs (con fallbacks mejorados) ═══
     JUPITER_QUOTE_API: str = 'https://quote-api.jup.ag/v6/quote'
     JUPITER_SWAP_API: str = 'https://quote-api.jup.ag/v6/swap'
-    JUPITER_PRICE_API: str = 'https://api.jup.ag/price/v2'
+    JUPITER_PRICE_API_V3: str = 'https://lite-api.jup.ag/price/v3'  # NEW: API V3
+    JUPITER_PRICE_API: str = 'https://api.jup.ag/price/v2'  # Fallback V2
     JUPITER_TOKENS_API: str = 'https://lite-api.jup.ag/tokens/v2'
     
-    # Fallback APIs
-    COINGECKO_API: str = 'https://api.coingecko.com/api/v3'
+    # Fallback APIs (en orden de confiabilidad)
     DEXSCREENER_API: str = 'https://api.dexscreener.com/latest/dex'
+    RAYDIUM_PRICE_API: str = 'https://api.raydium.io/v2/main/price'
+    COINGECKO_API: str = 'https://api.coingecko.com/api/v3'
     
     JUPITER_SCAN_CATEGORY: str = os.getenv('JUPITER_SCAN_CATEGORY', 'toporganicscore')
     JUPITER_SCAN_INTERVAL: str = os.getenv('JUPITER_SCAN_INTERVAL', '5m')
@@ -293,10 +295,12 @@ class BotState:
             'ml_predictions': 0,
             'ml_correct': 0,
             'api_errors': 0,
-            'jupiter_success': 0,
+            'jupiter_v3_success': 0,
+            'jupiter_v2_fallback': 0,
             'jupiter_failures': 0,
-            'coingecko_fallback': 0,
-            'dexscreener_fallback': 0
+            'dexscreener_fallback': 0,
+            'raydium_fallback': 0,
+            'coingecko_fallback': 0
         }
         
         self.last_trade_time = 0
@@ -384,28 +388,83 @@ async def api_call_with_retry(url: str, method: str = 'GET', **kwargs) -> Option
 # ═══════════════════════════════════════════════════════════════
 
 async def get_token_price(mint: str) -> Optional[float]:
-    """Obtener precio con fallback Jupiter → CoinGecko → DexScreener"""
+    """
+    Obtener precio con fallback múltiple y robusto:
+    Jupiter V3 → DexScreener → Raydium → Jupiter V2 → CoinGecko
+    """
     
     # SIMULATION MODE
     if config.SIMULATION_MODE:
         return 0.0001 + (hash(mint) % 100) * 0.000001
     
-    # 1️⃣ Intentar Jupiter primero
+    # 1️⃣ Intentar Jupiter Price API V3 (RECOMENDADO - MÁS CONFIABLE)
     try:
+        url = f"{config.JUPITER_PRICE_API_V3}?ids={mint}"
+        result = await api_call_with_retry(url)
+        
+        if result and mint in result:
+            price_data = result[mint]
+            price = float(price_data.get('usdPrice', 0))
+            if price > 0:
+                state.stats['jupiter_v3_success'] += 1
+                logger.debug(f"✅ Jupiter V3: {mint[:8]} = ${price:.8f}")
+                return price
+    except Exception as e:
+        logger.debug(f"Jupiter V3 error: {e}")
+    
+    # 2️⃣ Fallback a DexScreener (MUY CONFIABLE según comunidad)
+    try:
+        logger.debug(f"🔄 Fallback DexScreener para {mint[:8]}")
+        url = f"{config.DEXSCREENER_API}/tokens/{mint}"
+        
+        result = await api_call_with_retry(url)
+        
+        if result and 'pairs' in result and len(result['pairs']) > 0:
+            # Tomar el par con mayor liquidez
+            pairs = sorted(result['pairs'], key=lambda x: float(x.get('liquidity', {}).get('usd', 0) or 0), reverse=True)
+            if pairs:
+                price = float(pairs[0].get('priceUsd', 0))
+                if price > 0:
+                    state.stats['dexscreener_fallback'] += 1
+                    logger.debug(f"✅ DexScreener: {mint[:8]} = ${price:.8f}")
+                    return price
+    except Exception as e:
+        logger.debug(f"DexScreener error: {e}")
+    
+    # 3️⃣ Fallback a Raydium API (rápida y gratis)
+    try:
+        logger.debug(f"🔄 Fallback Raydium para {mint[:8]}")
+        url = config.RAYDIUM_PRICE_API
+        
+        result = await api_call_with_retry(url)
+        
+        if result and mint in result:
+            price = float(result[mint])
+            if price > 0:
+                state.stats['raydium_fallback'] += 1
+                logger.debug(f"✅ Raydium: {mint[:8]} = ${price:.8f}")
+                return price
+    except Exception as e:
+        logger.debug(f"Raydium error: {e}")
+    
+    # 4️⃣ Fallback a Jupiter V2 (API antigua)
+    try:
+        logger.debug(f"🔄 Fallback Jupiter V2 para {mint[:8]}")
         url = f"{config.JUPITER_PRICE_API}?ids={mint}"
         result = await api_call_with_retry(url)
         
         if result and 'data' in result and mint in result['data']:
             price = float(result['data'][mint].get('price', 0))
             if price > 0:
-                state.stats['jupiter_success'] += 1
+                state.stats['jupiter_v2_fallback'] += 1
+                logger.debug(f"✅ Jupiter V2: {mint[:8]} = ${price:.8f}")
                 return price
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Jupiter V2 error: {e}")
     
-    # 2️⃣ Fallback a CoinGecko
+    # 5️⃣ Último recurso: CoinGecko
     try:
-        logger.debug(f"Fallback CoinGecko para {mint[:8]}")
+        logger.debug(f"🔄 Fallback CoinGecko para {mint[:8]}")
         url = f"{config.COINGECKO_API}/simple/token_price/solana"
         params = {'contract_addresses': mint, 'vs_currencies': 'usd'}
         
@@ -415,25 +474,12 @@ async def get_token_price(mint: str) -> Optional[float]:
             price = float(result[mint].get('usd', 0))
             if price > 0:
                 state.stats['coingecko_fallback'] += 1
+                logger.debug(f"✅ CoinGecko: {mint[:8]} = ${price:.8f}")
                 return price
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"CoinGecko error: {e}")
     
-    # 3️⃣ Fallback a DexScreener
-    try:
-        logger.debug(f"Fallback DexScreener para {mint[:8]}")
-        url = f"{config.DEXSCREENER_API}/tokens/{mint}"
-        
-        result = await api_call_with_retry(url)
-        
-        if result and 'pairs' in result and len(result['pairs']) > 0:
-            price = float(result['pairs'][0].get('priceUsd', 0))
-            if price > 0:
-                state.stats['dexscreener_fallback'] += 1
-                return price
-    except Exception:
-        pass
-    
+    # ❌ Todos los fallbacks fallaron
     logger.warning(f"⚠️ No se pudo obtener precio para {mint[:8]} (todos los fallbacks fallaron)")
     return None
 
@@ -569,11 +615,9 @@ async def scan_for_signals() -> List[TokenData]:
             logger.warning("⚠️ Jupiter API no respondió")
             state.stats['jupiter_failures'] += 1
             
-            # Activar SIMULATION automáticamente después de 3 fallos
-            if state.stats['jupiter_failures'] >= 3:
-                logger.warning("🔄 Activando SIMULATION MODE por fallos consecutivos de Jupiter")
-                config.SIMULATION_MODE = True
-                return await scan_for_signals()
+            # NO activar SIMULATION automáticamente - solo loguear
+            if state.stats['jupiter_failures'] >= 5:
+                logger.error(f"❌ Jupiter API falló {state.stats['jupiter_failures']} veces - considera revisar la API")
             
             return []
         
@@ -581,10 +625,8 @@ async def scan_for_signals() -> List[TokenData]:
             logger.warning(f"⚠️ Jupiter response inválida: {type(result)}")
             state.stats['jupiter_failures'] += 1
             
-            if state.stats['jupiter_failures'] >= 3:
-                logger.warning("🔄 Activando SIMULATION MODE")
-                config.SIMULATION_MODE = True
-                return await scan_for_signals()
+            if state.stats['jupiter_failures'] >= 5:
+                logger.error(f"❌ Jupiter API falló {state.stats['jupiter_failures']} veces - considera revisar la API")
             
             return []
         
@@ -629,6 +671,7 @@ async def scan_for_signals() -> List[TokenData]:
     except Exception as e:
         logger.error(f"❌ Error scan_for_signals: {e}")
         state.stats['jupiter_failures'] += 1
+        return []['jupiter_failures'] += 1
         
         if state.stats['jupiter_failures'] >= 3:
             logger.warning("🔄 Activando SIMULATION MODE por excepciones")
@@ -968,10 +1011,12 @@ async def main_trading_loop():
                 )
                 
                 logger.info(
-                    f"🔌 APIs: Jupiter OK: {state.stats['jupiter_success']} | "
-                    f"Jupiter Fails: {state.stats['jupiter_failures']} | "
-                    f"CoinGecko: {state.stats['coingecko_fallback']} | "
+                    f"🔌 APIs: Jupiter V3: {state.stats['jupiter_v3_success']} | "
                     f"DexScreener: {state.stats['dexscreener_fallback']} | "
+                    f"Raydium: {state.stats['raydium_fallback']} | "
+                    f"Jupiter V2: {state.stats['jupiter_v2_fallback']} | "
+                    f"CoinGecko: {state.stats['coingecko_fallback']} | "
+                    f"Jupiter Scan Fails: {state.stats['jupiter_failures']} | "
                     f"Errors: {state.stats['api_errors']}"
                 )
             
