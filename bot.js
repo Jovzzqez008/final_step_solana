@@ -1,39 +1,39 @@
-// bot.js - Bot élite de Pump.fun (Integración completa)
+// bot.js - BOT ÉLITE FUSIONADO - Main integrado
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 
-// Configuración y módulos
+// Módulos
 const CONFIG = require('./config');
 const { 
   seenMint, 
   lockMonitor, 
   releaseMonitor, 
   incrStat, 
-  getStat,
-  setParam,
-  getParam 
+  getStat 
 } = require('./redis');
 const { connectWebSocket } = require('./ws');
-const { initDB, saveDryRunTrade } = require('./db');
-const { simulateBuy, simulateSell, recordDryRunTrade } = require('./simulator');
+const { initDB } = require('./db');
 const { checkEliteRules } = require('./rules');
 const { setupTelegramBot } = require('./telegram');
+const TradingEngine = require('./trading-engine');
 
 // Estado global
 const monitoredTokens = new Map();
 const alertedTokens = new Set();
+let telegramBot = null;
+let tradingEngine = null;
 let stats = { 
   detected: 0, 
   monitored: 0, 
   alerts: 0, 
   filtered: 0,
-  dryrun_trades: 0,
-  dryrun_wins: 0,
-  dryrun_losses: 0
+  trades_executed: 0,
+  trades_success: 0,
+  trades_failed: 0
 };
 
-// Clase TokenData (mejorada para DRY_RUN)
+// Clase TokenData mejorada
 class TokenData {
   constructor({ mint, symbol, name, initialPrice, initialMarketCap, bondingCurve }) {
     this.mint = mint;
@@ -47,11 +47,7 @@ class TokenData {
     this.startTime = Date.now();
     this.lastChecked = Date.now();
     this.checksCount = 0;
-
-    // Campos para DRY_RUN
-    this.entryPrice = 0;
-    this.tokensHeld = 0;
-    this.entryTime = 0;
+    this.priceSource = 'unknown';
   }
 
   get elapsedMinutes() {
@@ -67,22 +63,67 @@ class TokenData {
     if (this.maxPrice === 0) return 0;
     return ((this.currentPrice - this.maxPrice) / this.maxPrice) * 100;
   }
+
+  updatePrice(priceData) {
+    this.currentPrice = priceData.price;
+    this.priceSource = priceData.source;
+    
+    if (priceData.marketCap > 0) {
+      this.initialMarketCap = priceData.marketCap;
+    }
+    
+    if (this.currentPrice > this.maxPrice) {
+      this.maxPrice = this.currentPrice;
+    }
+    
+    this.lastChecked = Date.now();
+    this.checksCount++;
+  }
 }
 
-// Logger
+// Logger mejorado
 const log = {
-  info: (msg) => console.log(`[INFO] ${new Date().toISOString()} - ${msg}`),
-  warn: (msg) => console.warn(`[WARN] ${new Date().toISOString()} - ${msg}`),
-  error: (msg) => console.error(`[ERROR] ${new Date().toISOString()} - ${msg}`),
-  debug: (msg) => {
+  info: (msg, data) => {
+    const timestamp = new Date().toISOString();
+    console.log(`[INFO] ${timestamp} - ${msg}`, data || '');
+  },
+  warn: (msg, data) => {
+    const timestamp = new Date().toISOString();
+    console.warn(`[WARN] ${timestamp} - ${msg}`, data || '');
+  },
+  error: (msg, data) => {
+    const timestamp = new Date().toISOString();
+    console.error(`[ERROR] ${timestamp} - ${msg}`, data || '');
+  },
+  debug: (msg, data) => {
     if (CONFIG.LOG_LEVEL === 'DEBUG') {
-      console.log(`[DEBUG] ${new Date().toISOString()} - ${msg}`);
+      const timestamp = new Date().toISOString();
+      console.log(`[DEBUG] ${timestamp} - ${msg}`, data || '');
     }
+  },
+  trade: (msg, data) => {
+    const timestamp = new Date().toISOString();
+    console.log(`🎯 [TRADE] ${timestamp} - ${msg}`, data || '');
   }
 };
 
-// Precio desde DexScreener (mantenemos por ahora)
+// Obtener precio mejorado
 async function getCurrentPrice(mint) {
+  // PRIORIDAD: Pump SDK para datos reales
+  const { getTokenDataFromBondingCurve } = require('./pump-sdk');
+  const pumpData = await getTokenDataFromBondingCurve(mint);
+  
+  if (pumpData && pumpData.price > 0) {
+    return {
+      price: pumpData.price,
+      marketCap: pumpData.marketCap,
+      liquidity: pumpData.liquidity,
+      source: 'pump-sdk',
+      bondingCurve: pumpData.bondingCurve
+    };
+  }
+
+  // FALLBACK: DexScreener
   try {
     const response = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
@@ -94,51 +135,68 @@ async function getCurrentPrice(mint) {
       return {
         price: parseFloat(pair.priceUsd || 0),
         marketCap: parseFloat(pair.fdv || pair.marketCap || 0),
-        liquidity: parseFloat(pair.liquidity?.usd || 0)
+        liquidity: parseFloat(pair.liquidity?.usd || 0),
+        source: 'dexscreener'
       };
     }
   } catch (error) {
-    log.debug(`DexScreener failed for ${mint.slice(0, 8)}: ${error.message}`);
+    log.debug(`DexScreener falló para ${mint.slice(0, 8)}: ${error.message}`);
   }
   
   return null;
 }
 
-// Alertas por Telegram
-async function sendTelegramAlert(token, alert) {
-  // Verificar si estamos en silencio
-  const silenceUntil = await getParam('silence_until', 0);
-  if (Date.now() < silenceUntil) {
-    log.info(`🔇 Alert silenced: ${token.symbol}`);
+// Alertas Telegram mejoradas
+async function sendTelegramAlert(token, alert, tradeResult = null) {
+  if (!telegramBot || !CONFIG.TELEGRAM_CHAT_ID) {
+    log.info(`🚀 ALERT (sin Telegram): ${token.symbol} +${alert.gainPercent.toFixed(1)}%`);
     return;
   }
 
-  if (!telegramBot || !CONFIG.TELEGRAM_CHAT_ID) {
-    log.info(`🚀 ALERT (no telegram): ${token.symbol} +${alert.gainPercent.toFixed(1)}%`);
-    return;
-  }
-  
-  const message = `
+  let message = '';
+  let keyboard = {};
+
+  if (tradeResult) {
+    // Mensaje de trade ejecutado
+    message = `
+🎯 *TRADE EJECUTADO* 🎯
+
+*Token:* ${token.name} (${token.symbol})
+*Acción:* ${tradeResult.action || 'COMPRA'}
+*Resultado:* ${tradeResult.success ? '✅ EXITOSO' : '❌ FALLIDO'}
+${tradeResult.txHash ? `*TX:* \`${tradeResult.txHash}\`` : ''}
+${tradeResult.reason ? `*Razón:* ${tradeResult.reason}` : ''}
+
+*Métricas:*
+• Ganancia: +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min
+• Precio: $${alert.priceAtAlert.toFixed(8)}
+• Market Cap: $${alert.marketCapAtAlert.toLocaleString()}
+
+*Enlaces:*
+• [Pump.fun](https://pump.fun/${token.mint})
+• [DexScreener](https://dexscreener.com/solana/${token.mint})
+    `.trim();
+
+  } else {
+    // Mensaje de alerta normal
+    message = `
 🚀 *ALERTA DE MOMENTUM* 🚀
 
 *Token:* ${token.name} (${token.symbol})
 *Mint:* \`${token.mint}\`
-*Ganancia:* +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)} min
-*Precio inicial:* $${token.initialPrice.toFixed(8)}
-*Precio actual:* $${alert.priceAtAlert.toFixed(8)}
-*Market Cap:* $${alert.marketCapAtAlert.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+*Ganancia:* +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min
+*Precio:* $${alert.priceAtAlert.toFixed(8)}
+*Market Cap:* $${alert.marketCapAtAlert.toLocaleString()}
 *Slope:* ${alert.slope?.toFixed(6)} USD/min
 
-📈 *Enlaces rápidos*
+*Enlaces rápidos:*
 • [Pump.fun](https://pump.fun/${token.mint})
 • [DexScreener](https://dexscreener.com/solana/${token.mint})
 • [RugCheck](https://rugcheck.xyz/tokens/${token.mint})
-• [Birdeye](https://birdeye.so/token/${token.mint}?chain=solana)
+    `.trim();
+  }
 
-🕐 Tiempo: ${alert.timeElapsed.toFixed(1)} min desde creación
-  `.trim();
-  
-  const keyboard = {
+  keyboard = {
     inline_keyboard: [
       [
         { text: 'Pump.fun', url: `https://pump.fun/${token.mint}` },
@@ -150,29 +208,29 @@ async function sendTelegramAlert(token, alert) {
       ]
     ]
   };
-  
+
   try {
     await telegramBot.sendMessage(CONFIG.TELEGRAM_CHAT_ID, message, {
       parse_mode: 'Markdown',
       reply_markup: keyboard,
       disable_web_page_preview: true
     });
-    log.info(`✅ Alert sent for ${token.symbol}`);
+    log.info(`✅ Alerta enviada: ${token.symbol}`);
   } catch (error) {
-    log.error(`Telegram send failed: ${error.message}`);
+    log.error(`Error enviando alerta Telegram: ${error.message}`);
   }
 }
 
-// Monitoreo de token (mejorado con DRY_RUN)
+// Monitoreo de token FUSIONADO
 async function monitorToken(mint) {
   const token = monitoredTokens.get(mint);
   if (!token) return;
 
   try {
     while (monitoredTokens.has(mint)) {
-      // Check timeout
+      // Timeout de monitoreo
       if (token.elapsedMinutes >= CONFIG.MAX_MONITOR_TIME_MIN) {
-        log.info(`⏰ Timeout: ${token.symbol} after ${token.elapsedMinutes.toFixed(1)}min`);
+        log.info(`⏰ Timeout: ${token.symbol} después de ${token.elapsedMinutes.toFixed(1)}min`);
         removeToken(mint, 'timeout');
         await releaseMonitor(mint);
         return;
@@ -186,132 +244,71 @@ async function monitorToken(mint) {
       }
 
       // Actualizar token
-      token.currentPrice = priceData.price;
-      token.lastChecked = Date.now();
-      token.checksCount++;
-
-      if (token.currentPrice > token.maxPrice) {
-        token.maxPrice = token.currentPrice;
-      }
+      token.updatePrice(priceData);
 
       // Establecer precio inicial si era 0
-      if (token.initialPrice === 0) {
-        token.initialPrice = token.currentPrice;
-        token.maxPrice = token.currentPrice;
-        token.initialMarketCap = priceData.marketCap;
-        log.info(`✅ Set initial price for ${token.symbol}: $${token.initialPrice.toFixed(8)}`);
+      if (token.initialPrice === 0 && priceData.price > 0) {
+        token.initialPrice = priceData.price;
+        token.maxPrice = priceData.price;
+        if (priceData.marketCap > 0) {
+          token.initialMarketCap = priceData.marketCap;
+        }
+        log.info(`✅ Precio inicial establecido: ${token.symbol} @ $${token.initialPrice.toFixed(8)}`);
       }
 
-      // Check dump
+      // Detectar dump
       if (token.lossFromMaxPercent <= CONFIG.DUMP_THRESHOLD_PERCENT) {
-        log.info(`📉 Dump detected: ${token.symbol} ${token.lossFromMaxPercent.toFixed(1)}%`);
+        log.info(`📉 Dump detectado: ${token.symbol} ${token.lossFromMaxPercent.toFixed(1)}%`);
         removeToken(mint, 'dumped');
         await releaseMonitor(mint);
         return;
       }
 
-      // Verificar reglas de alerta
+      // Verificar reglas de alerta + EJECUTAR TRADING
       if (!alertedTokens.has(mint) && token.initialPrice > 0) {
         const alerts = await checkEliteRules(token, CONFIG);
+        
         for (const alert of alerts) {
           alertedTokens.add(mint);
           await incrStat('alerts');
           stats.alerts++;
 
-          // Enviar alerta
-          await sendTelegramAlert(token, alert);
+          log.trade(`🚀 ALERTA DISPARADA: ${token.symbol} +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min`);
 
-          // Si estamos en DRY_RUN, simular compra
-          if (CONFIG.DRY_RUN) {
-            const sim = simulateBuy(token.currentPrice, CONFIG.TRADE_AMOUNT_SOL, CONFIG.SLIPPAGE_BPS);
-            if (sim.failed) {
-              log.warn(`🧪 DRY_RUN BUY failed for ${token.symbol}`);
-            } else {
-              token.entryPrice = sim.execPrice;
-              token.tokensHeld = sim.tokensBought;
-              token.entryTime = Date.now();
-              log.info(`🧪 DRY_RUN BUY: ${token.symbol} @ $${sim.execPrice.toFixed(8)} (fill ${Math.round(sim.partialFill*100)}%)`);
-
-              // Guardar trade de compra
-              await recordDryRunTrade({
-                type: 'buy',
-                mint: token.mint,
-                symbol: token.symbol,
-                entryPrice: sim.execPrice,
-                amountSol: CONFIG.TRADE_AMOUNT_SOL,
-                tokens: sim.tokensBought,
-                slippageBps: CONFIG.SLIPPAGE_BPS,
-                slipFactor: sim.slipFactor,
-                partialFill: sim.partialFill,
-                liqUsdAtEntry: token.initialMarketCap,
-                slopeAtEntry: (token.currentPrice - token.initialPrice) / Math.max(token.elapsedMinutes, 0.1),
-                drawdownAtEntry: token.lossFromMaxPercent,
-                gainPercentAtEntry: token.gainPercent,
-                elapsedMinAtEntry: token.elapsedMinutes,
-                rulesMatched: [alert.ruleName]
-              });
-            }
-          }
-
-          log.info(`🚀 ALERT: ${token.symbol} +${alert.gainPercent.toFixed(1)}% in ${alert.timeElapsed.toFixed(1)}min`);
-          // No removemos el token porque ahora lo monitoreamos para vender
-          // removeToken(mint, 'alert_sent');
-          // await releaseMonitor(mint);
-          // return;
-        }
-      }
-
-      // Si tenemos tokens en DRY_RUN, verificar venta
-      if (CONFIG.DRY_RUN && token.tokensHeld > 0) {
-        // Estrategia de venta simple: take profit + stop loss
-        const currentGain = ((token.currentPrice - token.entryPrice) / token.entryPrice) * 100;
-        const holdTimeMin = (Date.now() - token.entryTime) / 60000;
-
-        // Take profit: +50% o +100%
-        // Stop loss: -20% o timeout (10 min)
-        if (currentGain >= 100 || currentGain <= -20 || holdTimeMin >= 10) {
-          const sim = simulateSell(token.entryPrice, token.currentPrice, token.tokensHeld, CONFIG.SLIPPAGE_BPS);
-          if (sim.failed) {
-            log.warn(`🧪 DRY_RUN SELL failed for ${token.symbol}`);
-          } else {
-            log.info(`🧪 DRY_RUN SELL: ${token.symbol} P&L ${sim.pnlPercent.toFixed(2)}% (fill ${Math.round(sim.partialFill*100)}%)`);
-
-            // Guardar trade de venta
-            await recordDryRunTrade({
-              type: 'sell',
-              mint: token.mint,
-              symbol: token.symbol,
-              entryPrice: token.entryPrice,
-              exitPrice: sim.execPrice,
-              amountSol: CONFIG.TRADE_AMOUNT_SOL,
-              tokens: sim.tokensSold,
-              slippageBps: CONFIG.SLIPPAGE_BPS,
-              slipFactor: sim.slipFactor,
-              partialFill: sim.partialFill,
-              pnlPercent: sim.pnlPercent,
-              holdTimeMin: holdTimeMin,
-              liqUsdAtEntry: token.initialMarketCap,
-              slopeAtEntry: (token.currentPrice - token.initialPrice) / Math.max(token.elapsedMinutes, 0.1),
-              drawdownAtEntry: token.lossFromMaxPercent,
-              gainPercentAtEntry: token.gainPercent,
-              elapsedMinAtEntry: token.elapsedMinutes,
-              rulesMatched: [] // Podríamos guardar las reglas que dispararon la compra
+          // EJECUTAR TRADING
+          const tradeResult = await tradingEngine.executeBuy(token, alert);
+          stats.trades_executed++;
+          
+          if (tradeResult.success) {
+            stats.trades_success++;
+            log.trade(`✅ TRADE EXITOSO: ${token.symbol}`, { 
+              txHash: tradeResult.txHash,
+              simulated: tradeResult.simulated 
             });
 
-            // Resetear posición
-            token.tokensHeld = 0;
-            token.entryPrice = 0;
-            token.entryTime = 0;
+            // INICIAR MONITOREO PARA VENTA
+            tradingEngine.monitorAndSell(mint).catch(err => {
+              log.error(`Monitoreo de venta falló: ${err.message}`);
+            });
 
-            // Remover token después de vender
-            removeToken(mint, 'sold');
-            await releaseMonitor(mint);
-            return;
+          } else {
+            stats.trades_failed++;
+            log.trade(`❌ TRADE FALLIDO: ${token.symbol}`, { 
+              reason: tradeResult.reason 
+            });
           }
+
+          // ENVIAR ALERTA TELEGRAM
+          await sendTelegramAlert(token, alert, {
+            action: 'BUY',
+            success: tradeResult.success,
+            txHash: tradeResult.txHash,
+            reason: tradeResult.reason
+          });
         }
       }
 
-      // Log progreso
+      // Log de progreso
       if (token.checksCount % 10 === 0) {
         log.debug(`📊 ${token.symbol}: $${token.currentPrice.toFixed(8)} (${token.gainPercent.toFixed(1)}%) - ${token.elapsedMinutes.toFixed(1)}min`);
       }
@@ -319,7 +316,7 @@ async function monitorToken(mint) {
       await sleep(CONFIG.PRICE_CHECK_INTERVAL_SEC * 1000);
     }
   } catch (error) {
-    log.error(`Monitor error for ${mint.slice(0, 8)}: ${error.message}`);
+    log.error(`Error en monitoreo para ${mint.slice(0, 8)}: ${error.message}`);
     removeToken(mint, 'error');
     await releaseMonitor(mint);
   }
@@ -329,7 +326,7 @@ function removeToken(mint, reason) {
   if (monitoredTokens.has(mint)) {
     const token = monitoredTokens.get(mint);
     monitoredTokens.delete(mint);
-    log.debug(`🗑️ Removed ${token.symbol} (${mint.slice(0, 8)}): ${reason}`);
+    log.debug(`🗑️ Token removido: ${token.symbol} (${reason})`);
   }
 }
 
@@ -343,19 +340,19 @@ async function handleNewToken(data) {
     const mint = payload.mint || payload.token;
 
     if (!mint) {
-      log.warn('❌ Token without mint, skipping');
+      log.warn('❌ Token sin mint, saltando');
       return;
     }
 
     // Verificar si ya fue visto
     if (!(await seenMint(mint))) {
-      log.debug(`⏭️ Token ${mint.slice(0, 8)} already seen`);
+      log.debug(`⏭️ Token ya visto: ${mint.slice(0, 8)}`);
       return;
     }
 
-    // Intentar obtener lock de monitoreo
+    // Obtener lock de monitoreo
     if (!(await lockMonitor(mint))) {
-      log.debug(`🔒 Token ${mint.slice(0, 8)} already being monitored`);
+      log.debug(`🔒 Token ya siendo monitoreado: ${mint.slice(0, 8)}`);
       return;
     }
 
@@ -363,21 +360,24 @@ async function handleNewToken(data) {
     const name = payload.name || payload.tokenName || symbol;
     const bondingCurve = payload.bondingCurve || payload.bonding_curve;
 
+    // Obtener datos iniciales REALES
     let initialPrice = 0;
     let initialMarketCap = 0;
 
-    // Extraer precio inicial
-    if (payload.pairs && Array.isArray(payload.pairs) && payload.pairs.length > 0) {
-      const pair = payload.pairs[0];
-      initialPrice = parseFloat(pair.priceUsd || pair.price || 0);
-      initialMarketCap = parseFloat(pair.marketCap || pair.fdv || 0);
+    const priceData = await getCurrentPrice(mint);
+    if (priceData) {
+      initialPrice = priceData.price;
+      initialMarketCap = priceData.marketCap;
     }
 
-    log.info(`🆕 New token: ${symbol} (${mint.slice(0, 8)})`);
+    log.info(`🆕 Nuevo token: ${symbol} (${mint.slice(0, 8)})`, {
+      price: initialPrice,
+      marketCap: initialMarketCap
+    });
 
-    // Filtro: liquidez mínima
-    if (initialMarketCap > 0 && initialMarketCap < CONFIG.MIN_INITIAL_LIQUIDITY_USD) {
-      log.info(`🚫 Filtered ${symbol} - Low market cap ($${initialMarketCap.toFixed(0)})`);
+    // Filtro de liquidez
+    if (initialMarketCap < CONFIG.MIN_INITIAL_LIQUIDITY_USD) {
+      log.info(`🚫 Filtrado por liquidez: ${symbol} ($${Math.round(initialMarketCap)})`);
       await incrStat('filtered');
       stats.filtered++;
       await releaseMonitor(mint);
@@ -398,30 +398,37 @@ async function handleNewToken(data) {
     await incrStat('monitored');
     stats.monitored++;
 
-    log.info(`✅ Monitoring ${symbol} - Initial price: $${initialPrice.toFixed(8)} | MCap: $${initialMarketCap.toFixed(0)}`);
+    log.info(`✅ Monitoreando: ${symbol}`, {
+      price: `$${initialPrice.toFixed(8)}`,
+      marketCap: `$${Math.round(initialMarketCap)}`
+    });
 
-    // Iniciar monitoreo en background
+    // Iniciar monitoreo
     monitorToken(mint).catch(err => {
-      log.error(`Monitor task failed for ${mint.slice(0, 8)}: ${err.message}`);
+      log.error(`Tarea de monitoreo falló: ${err.message}`);
     });
 
   } catch (error) {
-    log.error(`Error handling new token: ${error.message}`);
+    log.error(`Error manejando nuevo token: ${error.message}`);
   }
 }
 
-// Health server
+// Health Server
 function startHealthServer() {
   const http = require('http');
   
   const server = http.createServer((req, res) => {
     if (req.url === '/health') {
+      const activeTrades = tradingEngine ? tradingEngine.getActiveTrades() : [];
+      
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         status: 'healthy',
-        websocket_connected: true, // Mejorar con estado real del WS
+        timestamp: new Date().toISOString(),
+        websocket_connected: true,
         monitored_tokens: monitoredTokens.size,
-        stats
+        active_trades: activeTrades.length,
+        stats: stats
       }));
     } else if (req.url === '/metrics') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -431,12 +438,12 @@ function startHealthServer() {
       }));
     } else {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('Pump.fun Elite Bot - OK');
+      res.end('🤖 Pump.fun Elite Bot - TreeCityWes Strategy 🚀');
     }
   });
   
   server.listen(CONFIG.HEALTH_PORT, () => {
-    log.info(`✅ Health server listening on port ${CONFIG.HEALTH_PORT}`);
+    log.info(`✅ Health server en puerto ${CONFIG.HEALTH_PORT}`);
   });
 }
 
@@ -447,41 +454,59 @@ function sleep(ms) {
 
 // Main
 async function main() {
-  log.info('🚀 Starting Pump.fun Elite Bot...');
+  log.info('🚀 INICIANDO PUMP.FUN ELITE BOT...');
+  log.info('💡 Fusionado con estrategia TreeCityWes');
   
-  // Validar configuración
+  // Validaciones
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
-    log.warn('⚠️ TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set - alerts will not be sent!');
+    log.warn('⚠️ Telegram no configurado - alertas deshabilitadas');
   }
 
-  // Inicializar base de datos
-  await initDB();
+  if (CONFIG.TRADING_MODE === 'LIVE' && !CONFIG.SOLANA_WALLET_PATH) {
+    log.warn('⚠️ MODO LIVE pero wallet no configurada - usando DRY_RUN');
+    CONFIG.TRADING_MODE = 'DRY_RUN';
+    CONFIG.DRY_RUN = true;
+  }
 
-  // Iniciar componentes
-  setupTelegramBot(monitoredTokens, stats, sendTelegramAlert);
+  // Inicializar componentes
+  await initDB();
+  tradingEngine = new TradingEngine(CONFIG);
+  telegramBot = setupTelegramBot(monitoredTokens, stats, sendTelegramAlert);
   startHealthServer();
   
   // Conectar WebSocket
   const stopWS = connectWebSocket(CONFIG.PUMPPORTAL_WSS, handleNewToken, log);
   
-  log.info('✅ Bot started successfully!');
-  log.info(`📊 Monitoring for tokens with +${CONFIG.ALERT_RULES[0].percent}% gains`);
-  log.info(`🧪 DRY_RUN: ${CONFIG.DRY_RUN ? 'ENABLED' : 'DISABLED'}`);
+  log.info('✅ BOT INICIADO EXITOSAMENTE!');
+  log.info(`📊 Monitoreando ganancias de +${CONFIG.ALERT_RULES[0].percent}%`);
+  log.info(`🧪 MODO: ${CONFIG.TRADING_MODE}`);
+  log.info(`💰 TRADING: ${CONFIG.DRY_RUN ? 'DRY_RUN' : 'LIVE'}`);
+  log.info(`🎯 ESTRATEGIA: TreeCityWes (TP 25%/50%, SL -10%, Moon Bag 25%)`);
+
+  // Verificar balance si es LIVE
+  if (CONFIG.TRADING_MODE === 'LIVE') {
+    const balance = await tradingEngine.trading.checkBalance();
+    if (balance < CONFIG.MINIMUM_BUY_AMOUNT) {
+      log.error(`❌ Balance insuficiente: ${balance} SOL (mínimo: ${CONFIG.MINIMUM_BUY_AMOUNT} SOL)`);
+    } else {
+      log.info(`💰 Balance disponible: ${balance} SOL`);
+    }
+  }
 }
 
 // Manejo de señales
 process.on('SIGTERM', () => {
-  log.info('🛑 SIGTERM received, shutting down gracefully...');
+  log.info('🛑 SIGTERM recibido, apagando...');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  log.info('🛑 SIGINT received, shutting down gracefully...');
+  log.info('🛑 SIGINT recibido, apagando...');
   process.exit(0);
 });
 
 // Iniciar bot
 main().catch(error => {
-  log.error(`Fatal error: ${error.message}`);
+  log.error(`❌ Error fatal: ${error.message}`);
   process.exit(1);
 });
