@@ -25,6 +25,7 @@ class PumpDataFetcher {
 
   /**
    * MÉTODO 1: Obtener datos desde la Bonding Curve Account (MÁS CONFIABLE)
+   * SIN usar @coral-xyz/borsh - parsing manual más rápido
    */
   async getTokenDataFromBondingCurve(mintAddress) {
     try {
@@ -39,14 +40,15 @@ class PumpDataFetcher {
       // Obtener datos de la cuenta
       const accountInfo = await this.connection.getAccountInfo(bondingCurveAddress);
       
-      if (!accountInfo) {
+      if (!accountInfo || accountInfo.data.length < BONDING_CURVE_LAYOUT_SIZE) {
         console.log(`❌ No bonding curve found for ${mintAddress.slice(0, 8)}`);
         return null;
       }
 
-      // Parsear datos manualmente (más rápido que Borsh)
+      // Parsear datos MANUALMENTE (sin Borsh - más rápido y sin dependencias)
       const data = accountInfo.data;
       
+      // Leer valores directamente del buffer
       const virtualSolReserves = data.readBigUInt64LE(VIRTUAL_SOL_OFFSET);
       const virtualTokenReserves = data.readBigUInt64LE(VIRTUAL_TOKEN_OFFSET);
       const realSolReserves = data.readBigUInt64LE(REAL_SOL_OFFSET);
