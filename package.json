@@ -1,0 +1,26 @@
+{
+  "name": "pump-fun-elite-bot",
+  "version": "1.0.0",
+  "description": "Bot de trading élite para Pump.fun con DRY_RUN y ML",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "export": "node export.js",
+    "dev": "LOG_LEVEL=DEBUG node bot.js"
+  },
+  "keywords": ["solana", "pump.fun", "trading", "bot", "ml"],
+  "author": "Jorge",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.14.2",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "node-telegram-bot-api": "^0.64.0",
+    "axios": "^1.6.2",
+    "@solana/web3.js": "^1.87.6",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
