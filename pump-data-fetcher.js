@@ -1,8 +1,8 @@
-// pump-data-fetcher.js - La forma CORRECTA de obtener market cap de Pump.fun
+// pump-data-fetcher.js - VERSIÓN CORREGIDA con Rate Limiting y PDA Fix
 const { Connection, PublicKey } = require('@solana/web3.js');
 const axios = require('axios');
 
-// Constantes de Pump.fun
+// Constantes de Pump.fun CORREGIDAS
 const PUMP_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 const PUMP_GLOBAL_ACCOUNT = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
 const PUMP_FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM');
@@ -14,62 +14,135 @@ const VIRTUAL_TOKEN_OFFSET = 72;
 const REAL_SOL_OFFSET = 80;
 const TOKEN_SUPPLY_OFFSET = 89;
 
+// Rate Limiter para RPC requests
+class RateLimiter {
+  constructor(maxRequestsPerSecond = 10) {
+    this.maxRequests = maxRequestsPerSecond;
+    this.queue = [];
+    this.processing = false;
+    this.requestTimes = [];
+  }
+
+  async throttle(fn) {
+    return new Promise((resolve, reject) => {
+      this.queue.push({ fn, resolve, reject });
+      this.processQueue();
+    });
+  }
+
+  async processQueue() {
+    if (this.processing || this.queue.length === 0) return;
+
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      // Limpiar requests antiguos (más de 1 segundo)
+      const now = Date.now();
+      this.requestTimes = this.requestTimes.filter(t => now - t < 1000);
+
+      // Si alcanzamos el límite, esperar
+      if (this.requestTimes.length >= this.maxRequests) {
+        const oldestRequest = this.requestTimes[0];
+        const waitTime = 1000 - (now - oldestRequest);
+        if (waitTime > 0) {
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+        }
+        continue;
+      }
+
+      // Procesar siguiente request
+      const { fn, resolve, reject } = this.queue.shift();
+      this.requestTimes.push(Date.now());
+
+      try {
+        const result = await fn();
+        resolve(result);
+      } catch (error) {
+        reject(error);
+      }
+
+      // Pequeño delay entre requests
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+
+    this.processing = false;
+  }
+
+  getQueueSize() {
+    return this.queue.length;
+  }
+
+  getRequestCount() {
+    const now = Date.now();
+    return this.requestTimes.filter(t => now - t < 1000).length;
+  }
+}
+
 class PumpDataFetcher {
   constructor(rpcUrl = null) {
     this.connection = new Connection(
       rpcUrl || process.env.HELIUS_RPC_URL || 'https://api.mainnet-beta.solana.com',
       'confirmed'
     );
-    this.solPriceUSD = 150; // Actualizar dinámicamente
+    this.solPriceUSD = 150;
+    this.lastSolPriceUpdate = 0;
+    
+    // Rate limiter: 10 requests/segundo (seguro para RPC público)
+    this.rateLimiter = new RateLimiter(10);
+    
+    // Cache para evitar requests duplicados
+    this.cache = new Map();
+    this.cacheTimeout = 3000; // 3 segundos
+    
+    console.log('✅ PumpDataFetcher inicializado con rate limiting');
   }
 
   /**
    * MÉTODO 1: Obtener datos desde la Bonding Curve Account (MÁS CONFIABLE)
-   * SIN usar @coral-xyz/borsh - parsing manual más rápido
+   * ✅ FIX: Usar PUMP_PROGRAM_ID en lugar de PUMP_GLOBAL_ACCOUNT
    */
   async getTokenDataFromBondingCurve(mintAddress) {
     try {
       const mint = new PublicKey(mintAddress);
       
-      // Derivar la bonding curve account address
+      // ✅ FIX CRÍTICO: Derivar la bonding curve address correctamente
       const [bondingCurveAddress] = PublicKey.findProgramAddressSync(
         [Buffer.from('bonding-curve'), mint.toBuffer()],
-        PUMP_GLOBAL_ACCOUNT
+        PUMP_PROGRAM_ID  // ✅ Usar PUMP_PROGRAM_ID, no PUMP_GLOBAL_ACCOUNT
       );
 
-      // Obtener datos de la cuenta
-      const accountInfo = await this.connection.getAccountInfo(bondingCurveAddress);
+      // Rate-limited request
+      const accountInfo = await this.rateLimiter.throttle(async () => {
+        return await this.connection.getAccountInfo(bondingCurveAddress);
+      });
       
       if (!accountInfo || accountInfo.data.length < BONDING_CURVE_LAYOUT_SIZE) {
-        console.log(`❌ No bonding curve found for ${mintAddress.slice(0, 8)}`);
         return null;
       }
 
-      // Parsear datos MANUALMENTE (sin Borsh - más rápido y sin dependencias)
+      // Parsear datos MANUALMENTE (sin Borsh)
       const data = accountInfo.data;
       
-      // Leer valores directamente del buffer
       const virtualSolReserves = data.readBigUInt64LE(VIRTUAL_SOL_OFFSET);
       const virtualTokenReserves = data.readBigUInt64LE(VIRTUAL_TOKEN_OFFSET);
       const realSolReserves = data.readBigUInt64LE(REAL_SOL_OFFSET);
       const tokenTotalSupply = data.readBigUInt64LE(TOKEN_SUPPLY_OFFSET);
       const complete = data.readUInt8(88) === 1;
 
-      // CALCULAR PRECIO (en lamports por token)
+      // CALCULAR PRECIO
       const pricePerToken = Number(virtualSolReserves) / Number(virtualTokenReserves);
-      const priceInSol = pricePerToken / 1e9; // Convertir lamports a SOL
+      const priceInSol = pricePerToken / 1e9;
       const priceInUsd = priceInSol * this.solPriceUSD;
 
       // CALCULAR MARKET CAP
-      const supply = Number(tokenTotalSupply) / 1e6; // Ajustar por decimales (típicamente 6)
+      const supply = Number(tokenTotalSupply) / 1e6;
       const marketCapUsd = priceInUsd * supply;
 
-      // CALCULAR LIQUIDEZ (SOL real en el pool)
+      // CALCULAR LIQUIDEZ
       const liquiditySol = Number(realSolReserves) / 1e9;
       const liquidityUsd = liquiditySol * this.solPriceUSD;
 
       // CALCULAR BONDING CURVE PROGRESS
-      // Pump.fun migra a Raydium cuando alcanza ~85 SOL
       const bondingCurveProgress = Math.min(100, (liquiditySol / 85) * 100);
 
       return {
@@ -117,7 +190,7 @@ class PumpDataFetcher {
 
       return null;
     } catch (error) {
-      console.error(`Pump.fun API error: ${error.message}`);
+      // No loguear errores de API para no saturar logs
       return null;
     }
   }
@@ -148,47 +221,85 @@ class PumpDataFetcher {
 
       return null;
     } catch (error) {
-      console.error(`DexScreener error: ${error.message}`);
       return null;
     }
   }
 
   /**
-   * MÉTODO PRINCIPAL: Intenta todos los métodos en cascada
+   * MÉTODO PRINCIPAL: Intenta todos los métodos en cascada CON CACHE
    */
   async getTokenData(mintAddress) {
-    // Actualizar precio SOL
+    // Verificar cache
+    const cached = this.getCached(mintAddress);
+    if (cached) {
+      return cached;
+    }
+
+    // Actualizar precio SOL si es necesario
     await this.updateSolPrice();
 
     // 1. Intentar bonding curve (más confiable)
     let data = await this.getTokenDataFromBondingCurve(mintAddress);
     if (data && data.price > 0) {
-      console.log(`✅ Datos obtenidos desde bonding curve on-chain`);
+      this.setCache(mintAddress, data);
       return data;
     }
 
     // 2. Intentar API de Pump.fun
     data = await this.getTokenDataFromAPI(mintAddress);
     if (data && data.price > 0) {
-      console.log(`✅ Datos obtenidos desde Pump.fun API`);
+      this.setCache(mintAddress, data);
       return data;
     }
 
     // 3. Último recurso: DexScreener
     data = await this.getTokenDataFromDexScreener(mintAddress);
     if (data && data.price > 0) {
-      console.log(`✅ Datos obtenidos desde DexScreener`);
+      this.setCache(mintAddress, data);
       return data;
     }
 
-    console.log(`❌ No se pudieron obtener datos para ${mintAddress.slice(0, 8)}`);
     return null;
   }
 
   /**
-   * Actualizar precio de SOL desde CoinGecko
+   * Cache management
+   */
+  getCached(mintAddress) {
+    const cached = this.cache.get(mintAddress);
+    if (!cached) return null;
+
+    const age = Date.now() - cached.timestamp;
+    if (age > this.cacheTimeout) {
+      this.cache.delete(mintAddress);
+      return null;
+    }
+
+    return cached.data;
+  }
+
+  setCache(mintAddress, data) {
+    this.cache.set(mintAddress, {
+      data,
+      timestamp: Date.now()
+    });
+
+    // Limitar tamaño del cache
+    if (this.cache.size > 100) {
+      const firstKey = this.cache.keys().next().value;
+      this.cache.delete(firstKey);
+    }
+  }
+
+  /**
+   * Actualizar precio de SOL desde CoinGecko (cada 60 segundos)
    */
   async updateSolPrice() {
+    const now = Date.now();
+    if (now - this.lastSolPriceUpdate < 60000) {
+      return; // Ya actualizado recientemente
+    }
+
     try {
       const response = await axios.get(
         'https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd',
@@ -197,9 +308,11 @@ class PumpDataFetcher {
       
       if (response.data.solana) {
         this.solPriceUSD = response.data.solana.usd;
+        this.lastSolPriceUpdate = now;
         console.log(`💰 Precio SOL actualizado: $${this.solPriceUSD}`);
       }
     } catch (error) {
+      // Usar precio previo si falla
       console.log(`⚠️ No se pudo actualizar precio SOL, usando $${this.solPriceUSD}`);
     }
   }
@@ -210,7 +323,7 @@ class PumpDataFetcher {
   async getMultipleTokensData(mintAddresses) {
     const promises = mintAddresses.map(mint => 
       this.getTokenData(mint).catch(err => {
-        console.error(`Error fetching ${mint}: ${err.message}`);
+        console.error(`Error fetching ${mint.slice(0, 8)}: ${err.message}`);
         return null;
       })
     );
@@ -262,14 +375,79 @@ class PumpDataFetcher {
       console.log(`🛑 Monitoreo detenido para ${mintAddress.slice(0, 8)}`);
     };
   }
+
+  /**
+   * Obtener estadísticas del fetcher
+   */
+  getStats() {
+    return {
+      cacheSize: this.cache.size,
+      queueSize: this.rateLimiter.getQueueSize(),
+      requestsPerSecond: this.rateLimiter.getRequestCount(),
+      solPrice: this.solPriceUSD,
+      lastSolUpdate: new Date(this.lastSolPriceUpdate).toISOString()
+    };
+  }
+
+  /**
+   * Limpiar cache manualmente
+   */
+  clearCache() {
+    const size = this.cache.size;
+    this.cache.clear();
+    console.log(`🧹 Cache limpiado (${size} entradas eliminadas)`);
+  }
+
+  /**
+   * Verificar salud de la conexión RPC
+   */
+  async healthCheck() {
+    try {
+      const start = Date.now();
+      await this.connection.getSlot();
+      const latency = Date.now() - start;
+      
+      return {
+        healthy: latency < 2000,
+        latency,
+        endpoint: this.connection.rpcEndpoint
+      };
+    } catch (error) {
+      return {
+        healthy: false,
+        latency: -1,
+        error: error.message
+      };
+    }
+  }
+}
+
+// Función de utilidad para validar mint address
+function isValidMintAddress(address) {
+  try {
+    new PublicKey(address);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Ejemplo de uso
 async function example() {
   const fetcher = new PumpDataFetcher(process.env.HELIUS_RPC_URL);
 
+  // Health check
+  const health = await fetcher.healthCheck();
+  console.log('🏥 RPC Health:', health);
+
   // Obtener datos de un token
   const mint = 'MINT_ADDRESS_AQUI';
+  
+  if (!isValidMintAddress(mint)) {
+    console.error('❌ Mint address inválido');
+    return;
+  }
+
   const data = await fetcher.getTokenData(mint);
   
   if (data) {
@@ -281,6 +459,9 @@ async function example() {
     console.log(`🔢 Supply: ${data.supply.toLocaleString()}`);
     console.log(`🔗 Fuente: ${data.source}`);
   }
+
+  // Stats del fetcher
+  console.log('\n📊 Fetcher Stats:', fetcher.getStats());
 
   // Monitorear cambios en tiempo real
   const stopMonitoring = await fetcher.watchTokenMarketCap(mint, (update) => {
@@ -295,5 +476,11 @@ async function example() {
 
 module.exports = PumpDataFetcher;
 
+// Exportar utilidades
+module.exports.isValidMintAddress = isValidMintAddress;
+module.exports.PUMP_PROGRAM_ID = PUMP_PROGRAM_ID;
+
 // Descomentar para probar
-// example();
+// if (require.main === module) {
+//   example();
+// }
