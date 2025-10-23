@@ -1,4 +1,4 @@
-// trading-engine.js - VERSIÓN MEJORADA CON CIRCUIT BREAKER Y MÉTRICAS
+// trading-engine.js - VERSIÓN MEJORADA CON CIRCUIT BREAKER, MÉTRICAS Y SDK INTEGRATION
 const PumpFunTrading = require('./pump-api');
 const PumpDataFetcher = require('./pump-data-fetcher');
 
@@ -68,7 +68,8 @@ class PerformanceMetrics {
       executionTimeMs: tradeData.executionTimeMs,
       slippage: tradeData.slippage || 0,
       pnl: tradeData.pnl || 0,
-      retries: tradeData.retries || 0
+      retries: tradeData.retries || 0,
+      method: tradeData.method || 'legacy'
     });
     
     // Mantener solo las últimas N trades
@@ -85,14 +86,18 @@ class PerformanceMetrics {
         avgExecutionTime: 0,
         avgSlippage: 0,
         avgPnL: 0,
-        winRate: 0
+        winRate: 0,
+        sdkTrades: 0,
+        legacyTrades: 0
       };
     }
     
     const successful = this.trades.filter(t => t.success);
     const withPnL = this.trades.filter(t => t.pnl !== 0);
     const wins = withPnL.filter(t => t.pnl > 0);
-    
+    const sdkTrades = this.trades.filter(t => t.method === 'sdk');
+    const legacyTrades = this.trades.filter(t => t.method === 'legacy');
+
     return {
       totalTrades: this.trades.length,
       successRate: (successful.length / this.trades.length * 100).toFixed(2),
@@ -100,7 +105,10 @@ class PerformanceMetrics {
       avgSlippage: (successful.reduce((sum, t) => sum + Math.abs(t.slippage), 0) / successful.length).toFixed(3),
       avgPnL: withPnL.length > 0 ? (withPnL.reduce((sum, t) => sum + t.pnl, 0) / withPnL.length).toFixed(2) : 0,
       winRate: withPnL.length > 0 ? (wins.length / withPnL.length * 100).toFixed(2) : 0,
-      avgRetries: (this.trades.reduce((sum, t) => sum + t.retries, 0) / this.trades.length).toFixed(2)
+      avgRetries: (this.trades.reduce((sum, t) => sum + t.retries, 0) / this.trades.length).toFixed(2),
+      sdkTrades: sdkTrades.length,
+      legacyTrades: legacyTrades.length,
+      sdkSuccessRate: sdkTrades.length > 0 ? (sdkTrades.filter(t => t.success).length / sdkTrades.length * 100).toFixed(2) : 0
     };
   }
   
@@ -138,10 +146,11 @@ class PerformanceMetrics {
 }
 
 class TradingEngine {
-  constructor(config) {
+  constructor(config, sdkIntegration = null) {
     this.config = config;
     this.trading = new PumpFunTrading(config);
     this.dataFetcher = new PumpDataFetcher(config.RPC_URL);
+    this.sdkIntegration = sdkIntegration; // Nueva: integración con SDK
     this.activeTrades = new Map();
     this.failedAttempts = new Map();
     
@@ -262,7 +271,7 @@ class TradingEngine {
       });
 
       this.circuitBreaker.recordSuccess();
-      this.recordTradeMetrics(startTime, true, simulatedSlippage * 100, 0);
+      this.recordTradeMetrics(startTime, true, simulatedSlippage * 100, 0, 0, 'simulated');
 
       return { 
         success: true, 
@@ -273,8 +282,46 @@ class TradingEngine {
       };
     }
 
-    // MODO LIVE - Trading real con retry
-    console.log(`🚀 LIVE TRADE: Comprando ${token.symbol}...`);
+    // MODO LIVE - Intentar con SDK primero
+    if (this.sdkIntegration) {
+      try {
+        console.log(`🚀 INTENTANDO COMPRA CON SDK: ${token.symbol}`);
+        const txHash = await this.sdkIntegration.buy(
+          token.mint,
+          this.config.TRADE_AMOUNT_SOL || this.config.MINIMUM_BUY_AMOUNT
+        );
+        
+        if (txHash) {
+          const executionTime = Date.now() - startTime;
+          
+          this.failedAttempts.delete(token.mint);
+          this.circuitBreaker.recordSuccess();
+          
+          this.activeTrades.set(token.mint, {
+            symbol: token.symbol,
+            entryPrice: pumpData.price,
+            entryTime: Date.now(),
+            amountSol: this.config.TRADE_AMOUNT_SOL || this.config.MINIMUM_BUY_AMOUNT,
+            tokensBought: (this.config.TRADE_AMOUNT_SOL || this.config.MINIMUM_BUY_AMOUNT) / pumpData.price,
+            txHash: txHash,
+            simulated: false,
+            bondingCurveAtEntry: pumpData.bondingCurve,
+            liquidityAtEntry: pumpData.liquidity,
+            method: 'sdk'
+          });
+
+          this.recordTradeMetrics(startTime, true, 0, 0, 0, 'sdk');
+          console.log(`✅ COMPRA EXITOSA CON SDK: ${token.symbol} - TX: ${txHash} (${executionTime}ms)`);
+          
+          return { success: true, txHash, retries: 0, executionTime, method: 'sdk' };
+        }
+      } catch (error) {
+        console.warn(`⚠️ SDK buy falló, usando método legacy: ${error.message}`);
+      }
+    }
+
+    // Fallback al método legacy
+    console.log(`🚀 LIVE TRADE (LEGACY): Comprando ${token.symbol}...`);
     
     let txHash = null;
     let retries = 0;
@@ -325,21 +372,22 @@ class TradingEngine {
         txHash: txHash,
         simulated: false,
         bondingCurveAtEntry: pumpData.bondingCurve,
-        liquidityAtEntry: pumpData.liquidity
+        liquidityAtEntry: pumpData.liquidity,
+        method: 'legacy'
       });
 
-      this.recordTradeMetrics(startTime, true, 0, retries);
-      console.log(`✅ COMPRA EXITOSA: ${token.symbol} - TX: ${txHash} (${executionTime}ms, ${retries} retries)`);
+      this.recordTradeMetrics(startTime, true, 0, retries, 0, 'legacy');
+      console.log(`✅ COMPRA EXITOSA (LEGACY): ${token.symbol} - TX: ${txHash} (${executionTime}ms, ${retries} retries)`);
       
-      return { success: true, txHash, retries, executionTime };
+      return { success: true, txHash, retries, executionTime, method: 'legacy' };
 
     } else {
       this.incrementFailCount(token.mint);
       this.circuitBreaker.recordFailure();
-      this.recordTradeMetrics(startTime, false, 0, retries);
+      this.recordTradeMetrics(startTime, false, 0, retries, 0, 'legacy');
       
       console.log(`❌ COMPRA FALLADA después de ${maxRetries} intentos: ${token.symbol}`);
-      return { success: false, reason: 'tx_failed_all_retries', retries, executionTime };
+      return { success: false, reason: 'tx_failed_all_retries', retries, executionTime, method: 'legacy' };
     }
   }
 
@@ -474,7 +522,7 @@ class TradingEngine {
       }
       
       // Registrar métricas de venta
-      this.recordTradeMetrics(startTime, true, Math.abs(simulatedSlippage) * 100, 0, pnl);
+      this.recordTradeMetrics(startTime, true, Math.abs(simulatedSlippage) * 100, 0, pnl, 'simulated');
       
       if (pnl > 0) {
         this.circuitBreaker.recordSuccess();
@@ -527,7 +575,7 @@ class TradingEngine {
       
       const pnl = ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100;
       
-      this.recordTradeMetrics(startTime, true, 0, retries, pnl);
+      this.recordTradeMetrics(startTime, true, 0, retries, pnl, 'legacy');
       
       if (pnl > 0) {
         this.circuitBreaker.recordSuccess();
@@ -547,7 +595,7 @@ class TradingEngine {
       
     } else {
       this.circuitBreaker.recordFailure();
-      this.recordTradeMetrics(startTime, false, 0, retries);
+      this.recordTradeMetrics(startTime, false, 0, retries, 0, 'legacy');
       
       console.log(`❌ VENTA FALLADA después de ${maxRetries} intentos`);
       return { 
@@ -558,13 +606,14 @@ class TradingEngine {
     }
   }
 
-  recordTradeMetrics(startTime, success, slippage, retries, pnl = 0) {
+  recordTradeMetrics(startTime, success, slippage, retries, pnl = 0, method = 'legacy') {
     this.metrics.recordTrade({
       success,
       executionTimeMs: Date.now() - startTime,
       slippage,
       pnl,
-      retries
+      retries,
+      method
     });
   }
 
@@ -599,6 +648,7 @@ class TradingEngine {
       activeTrades: this.activeTrades.size,
       failedMints: this.failedAttempts.size,
       rpcHealthy: this.rpcHealthy,
+      sdkAvailable: !!this.sdkIntegration,
       circuitBreaker: {
         isOpen: circuitStatus.isOpen,
         failures: circuitStatus.failures,
@@ -622,6 +672,7 @@ class TradingEngine {
     console.log('\n🔄 Estado General:');
     console.log(`  • Trades Activos: ${stats.activeTrades}`);
     console.log(`  • RPC Saludable: ${stats.rpcHealthy ? '✅' : '❌'}`);
+    console.log(`  • SDK Disponible: ${stats.sdkAvailable ? '✅' : '❌'}`);
     console.log(`  • Circuit Breaker: ${stats.circuitBreaker.isOpen ? '🔴 ABIERTO' : '🟢 CERRADO'}`);
     
     if (stats.circuitBreaker.isOpen) {
@@ -636,6 +687,8 @@ class TradingEngine {
     console.log(`  • Avg Slippage: ${stats.performance.avgSlippage}%`);
     console.log(`  • Avg PnL: ${stats.performance.avgPnL}%`);
     console.log(`  • Avg Retries: ${stats.performance.avgRetries}`);
+    console.log(`  • SDK Trades: ${stats.performance.sdkTrades} (${stats.performance.sdkSuccessRate}% éxito)`);
+    console.log(`  • Legacy Trades: ${stats.performance.legacyTrades}`);
     
     console.log('\n🔥 Performance Reciente (últimos 10):');
     console.log(`  • Wins: ${stats.recent.wins} | Losses: ${stats.recent.losses}`);
