@@ -1,4 +1,4 @@
-// bot.js - BOT ÉLITE FUSIONADO - Main integrado
+// bot.js - BOT ÉLITE FUSIONADO - Main integrado CON HELIUS
 const WebSocket = require('ws');
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
@@ -43,7 +43,7 @@ class TokenData {
     this.initialMarketCap = initialMarketCap || 0;
     this.maxPrice = initialPrice || 0;
     this.currentPrice = initialPrice || 0;
-    this.bondingCurve = bondingCurve;
+    this.bondingCurve = bondingCurve || 0;
     this.startTime = Date.now();
     this.lastChecked = Date.now();
     this.checksCount = 0;
@@ -70,6 +70,10 @@ class TokenData {
     
     if (priceData.marketCap > 0) {
       this.initialMarketCap = priceData.marketCap;
+    }
+    
+    if (priceData.bondingCurve !== undefined) {
+      this.bondingCurve = priceData.bondingCurve;
     }
     
     if (this.currentPrice > this.maxPrice) {
@@ -107,9 +111,9 @@ const log = {
   }
 };
 
-// Obtener precio mejorado
+// Obtener precio MEJORADO con Helius como prioridad
 async function getCurrentPrice(mint) {
-  // PRIORIDAD: Pump SDK para datos reales
+  // PRIORIDAD 1: Helius + Bonding Curve (datos REALES)
   const { getTokenDataFromBondingCurve } = require('./pump-sdk');
   const pumpData = await getTokenDataFromBondingCurve(mint);
   
@@ -118,24 +122,52 @@ async function getCurrentPrice(mint) {
       price: pumpData.price,
       marketCap: pumpData.marketCap,
       liquidity: pumpData.liquidity,
-      source: 'pump-sdk',
-      bondingCurve: pumpData.bondingCurve
+      bondingCurve: pumpData.bondingCurve,
+      source: pumpData.source || 'helius-bonding-curve'
     };
   }
 
-  // FALLBACK: DexScreener
+  // PRIORIDAD 2: API directa de Pump.fun
+  try {
+    const response = await axios.get(
+      `https://frontend-api.pump.fun/coins/${mint}`,
+      { timeout: 3000 }
+    );
+    
+    if (response.data && response.data.price_usd) {
+      return {
+        price: parseFloat(response.data.price_usd || 0),
+        marketCap: parseFloat(response.data.market_cap || 0),
+        liquidity: parseFloat(response.data.liquidity_usd || 0),
+        bondingCurve: parseFloat(response.data.bonding_curve_progress || 0),
+        source: 'pump.fun-api'
+      };
+    }
+  } catch (error) {
+    log.debug(`Pump.fun API falló para ${mint.slice(0, 8)}: ${error.message}`);
+  }
+
+  // PRIORIDAD 3: DexScreener (fallback)
   try {
     const response = await axios.get(
       `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
-      { timeout: 5000 }
+      { timeout: 3000 }
     );
     
     if (response.data.pairs && response.data.pairs.length > 0) {
       const pair = response.data.pairs[0];
+      
+      // Calcular market cap aproximado si no está disponible
+      let marketCap = parseFloat(pair.fdv || pair.marketCap || 0);
+      if (marketCap === 0 && pair.priceUsd) {
+        marketCap = parseFloat(pair.priceUsd) * 1000000; // Asumir 1M supply
+      }
+
       return {
         price: parseFloat(pair.priceUsd || 0),
-        marketCap: parseFloat(pair.fdv || pair.marketCap || 0),
+        marketCap: marketCap,
         liquidity: parseFloat(pair.liquidity?.usd || 0),
+        bondingCurve: 0, // No disponible en DexScreener
         source: 'dexscreener'
       };
     }
@@ -166,11 +198,13 @@ async function sendTelegramAlert(token, alert, tradeResult = null) {
 *Resultado:* ${tradeResult.success ? '✅ EXITOSO' : '❌ FALLIDO'}
 ${tradeResult.txHash ? `*TX:* \`${tradeResult.txHash}\`` : ''}
 ${tradeResult.reason ? `*Razón:* ${tradeResult.reason}` : ''}
+${tradeResult.simulated ? `*MODO:* 🧪 DRY_RUN` : ''}
 
 *Métricas:*
 • Ganancia: +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min
 • Precio: $${alert.priceAtAlert.toFixed(8)}
 • Market Cap: $${alert.marketCapAtAlert.toLocaleString()}
+• Bonding Curve: ${token.bondingCurve}%
 
 *Enlaces:*
 • [Pump.fun](https://pump.fun/${token.mint})
@@ -187,6 +221,7 @@ ${tradeResult.reason ? `*Razón:* ${tradeResult.reason}` : ''}
 *Ganancia:* +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min
 *Precio:* $${alert.priceAtAlert.toFixed(8)}
 *Market Cap:* $${alert.marketCapAtAlert.toLocaleString()}
+*Bonding Curve:* ${token.bondingCurve}%
 *Slope:* ${alert.slope?.toFixed(6)} USD/min
 
 *Enlaces rápidos:*
@@ -253,7 +288,7 @@ async function monitorToken(mint) {
         if (priceData.marketCap > 0) {
           token.initialMarketCap = priceData.marketCap;
         }
-        log.info(`✅ Precio inicial establecido: ${token.symbol} @ $${token.initialPrice.toFixed(8)}`);
+        log.info(`✅ Precio inicial establecido: ${token.symbol} @ $${token.initialPrice.toFixed(8)} (${token.priceSource})`);
       }
 
       // Detectar dump
@@ -273,7 +308,12 @@ async function monitorToken(mint) {
           await incrStat('alerts');
           stats.alerts++;
 
-          log.trade(`🚀 ALERTA DISPARADA: ${token.symbol} +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min`);
+          log.trade(`🚀 ALERTA DISPARADA: ${token.symbol} +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min`, {
+            price: `$${token.currentPrice.toFixed(8)}`,
+            marketCap: `$${Math.round(token.initialMarketCap)}`,
+            bondingCurve: `${token.bondingCurve}%`,
+            source: token.priceSource
+          });
 
           // EJECUTAR TRADING
           const tradeResult = await tradingEngine.executeBuy(token, alert);
@@ -283,7 +323,8 @@ async function monitorToken(mint) {
             stats.trades_success++;
             log.trade(`✅ TRADE EXITOSO: ${token.symbol}`, { 
               txHash: tradeResult.txHash,
-              simulated: tradeResult.simulated 
+              simulated: tradeResult.simulated,
+              amount: CONFIG.MINIMUM_BUY_AMOUNT
             });
 
             // INICIAR MONITOREO PARA VENTA
@@ -303,14 +344,15 @@ async function monitorToken(mint) {
             action: 'BUY',
             success: tradeResult.success,
             txHash: tradeResult.txHash,
-            reason: tradeResult.reason
+            reason: tradeResult.reason,
+            simulated: tradeResult.simulated
           });
         }
       }
 
       // Log de progreso
       if (token.checksCount % 10 === 0) {
-        log.debug(`📊 ${token.symbol}: $${token.currentPrice.toFixed(8)} (${token.gainPercent.toFixed(1)}%) - ${token.elapsedMinutes.toFixed(1)}min`);
+        log.debug(`📊 ${token.symbol}: $${token.currentPrice.toFixed(8)} (${token.gainPercent.toFixed(1)}%) - ${token.elapsedMinutes.toFixed(1)}min - BC: ${token.bondingCurve}%`);
       }
 
       await sleep(CONFIG.PRICE_CHECK_INTERVAL_SEC * 1000);
@@ -330,14 +372,15 @@ function removeToken(mint, reason) {
   }
 }
 
-// Manejo de nuevos tokens
+// Manejo de nuevos tokens MEJORADO con Helius
 async function handleNewToken(data) {
+  let mint;
   try {
     await incrStat('detected');
     stats.detected++;
 
     const payload = data.data || data;
-    const mint = payload.mint || payload.token;
+    mint = payload.mint || payload.token;
 
     if (!mint) {
       log.warn('❌ Token sin mint, saltando');
@@ -360,24 +403,51 @@ async function handleNewToken(data) {
     const name = payload.name || payload.tokenName || symbol;
     const bondingCurve = payload.bondingCurve || payload.bonding_curve;
 
-    // Obtener datos iniciales REALES
+    // OBTENER DATOS REALES desde bonding curve con Helius
+    const tokenData = await getCurrentPrice(mint);
+    
     let initialPrice = 0;
     let initialMarketCap = 0;
+    let initialLiquidity = 0;
+    let bondingCurveProgress = 0;
+    let dataSource = 'none';
 
-    const priceData = await getCurrentPrice(mint);
-    if (priceData) {
-      initialPrice = priceData.price;
-      initialMarketCap = priceData.marketCap;
+    if (tokenData) {
+      initialPrice = tokenData.price;
+      initialMarketCap = tokenData.marketCap;
+      initialLiquidity = tokenData.liquidity;
+      bondingCurveProgress = tokenData.bondingCurve || 0;
+      dataSource = tokenData.source;
+      
+      log.info(`🎯 DATOS REALES: ${symbol} (${mint.slice(0, 8)})`, {
+        price: `$${initialPrice.toFixed(8)}`,
+        marketCap: `$${Math.round(initialMarketCap)}`,
+        liquidity: `$${Math.round(initialLiquidity)}`,
+        bondingCurve: `${bondingCurveProgress}%`,
+        source: dataSource
+      });
+    } else {
+      log.warn(`⚠️ No se pudieron obtener datos para: ${symbol} (${mint.slice(0, 8)})`);
     }
 
-    log.info(`🆕 Nuevo token: ${symbol} (${mint.slice(0, 8)})`, {
-      price: initialPrice,
-      marketCap: initialMarketCap
-    });
+    // FILTRO MEJORADO - considerar múltiples factores
+    const hasValidData = initialPrice > 0 && initialMarketCap > 0;
+    const hasSufficientLiquidity = initialMarketCap >= CONFIG.MIN_INITIAL_LIQUIDITY_USD;
+    const bondingCurveOK = bondingCurveProgress < CONFIG.MAX_BONDING_CURVE_PROGRESS;
 
-    // Filtro de liquidez
-    if (initialMarketCap < CONFIG.MIN_INITIAL_LIQUIDITY_USD) {
-      log.info(`🚫 Filtrado por liquidez: ${symbol} ($${Math.round(initialMarketCap)})`);
+    if (!hasValidData || !hasSufficientLiquidity || !bondingCurveOK) {
+      const reason = !hasValidData ? 'datos inválidos' : 
+                    !hasSufficientLiquidity ? 'liquidez insuficiente' : 
+                    'bonding curve muy alta';
+                    
+      log.info(`🚫 Filtrado: ${symbol}`, {
+        reason: reason,
+        marketCap: `$${Math.round(initialMarketCap)}`,
+        bondingCurve: `${bondingCurveProgress}%`,
+        minLiquidity: `$${CONFIG.MIN_INITIAL_LIQUIDITY_USD}`,
+        maxBondingCurve: `${CONFIG.MAX_BONDING_CURVE_PROGRESS}%`
+      });
+      
       await incrStat('filtered');
       stats.filtered++;
       await releaseMonitor(mint);
@@ -391,7 +461,7 @@ async function handleNewToken(data) {
       name,
       initialPrice,
       initialMarketCap,
-      bondingCurve
+      bondingCurve: bondingCurveProgress
     });
 
     monitoredTokens.set(mint, token);
@@ -400,16 +470,29 @@ async function handleNewToken(data) {
 
     log.info(`✅ Monitoreando: ${symbol}`, {
       price: `$${initialPrice.toFixed(8)}`,
-      marketCap: `$${Math.round(initialMarketCap)}`
+      marketCap: `$${Math.round(initialMarketCap)}`,
+      bondingCurve: `${bondingCurveProgress}%`,
+      source: dataSource
     });
 
     // Iniciar monitoreo
     monitorToken(mint).catch(err => {
-      log.error(`Tarea de monitoreo falló: ${err.message}`);
+      log.error(`Tarea de monitoreo falló para ${mint.slice(0, 8)}: ${err.message}`);
+      removeToken(mint, 'monitor_error');
+      releaseMonitor(mint).catch(() => {}); // Ignorar errores de release
     });
 
   } catch (error) {
-    log.error(`Error manejando nuevo token: ${error.message}`);
+    log.error(`Error manejando nuevo token ${mint ? mint.slice(0, 8) : 'unknown'}: ${error.message}`);
+    
+    // Liberar lock en caso de error
+    if (mint) {
+      try {
+        await releaseMonitor(mint);
+      } catch (releaseError) {
+        // Ignorar error al liberar
+      }
+    }
   }
 }
 
@@ -456,6 +539,7 @@ function sleep(ms) {
 async function main() {
   log.info('🚀 INICIANDO PUMP.FUN ELITE BOT...');
   log.info('💡 Fusionado con estrategia TreeCityWes');
+  log.info('🔗 Usando Helius RPC para datos reales de bonding curve');
   
   // Validaciones
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
@@ -466,6 +550,14 @@ async function main() {
     log.warn('⚠️ MODO LIVE pero wallet no configurada - usando DRY_RUN');
     CONFIG.TRADING_MODE = 'DRY_RUN';
     CONFIG.DRY_RUN = true;
+  }
+
+  // Verificar configuración Helius
+  const rpcUrl = CONFIG.RPC_URL || process.env.HELIUS_RPC_URL;
+  if (!rpcUrl || !rpcUrl.includes('helius')) {
+    log.warn('⚠️ RPC_URL no parece ser de Helius - la obtención de datos puede ser lenta');
+  } else {
+    log.info('✅ Helius RPC configurado');
   }
 
   // Inicializar componentes
@@ -482,6 +574,7 @@ async function main() {
   log.info(`🧪 MODO: ${CONFIG.TRADING_MODE}`);
   log.info(`💰 TRADING: ${CONFIG.DRY_RUN ? 'DRY_RUN' : 'LIVE'}`);
   log.info(`🎯 ESTRATEGIA: TreeCityWes (TP 25%/50%, SL -10%, Moon Bag 25%)`);
+  log.info(`📈 FILTROS: MCap > $${CONFIG.MIN_INITIAL_LIQUIDITY_USD}, BC < ${CONFIG.MAX_BONDING_CURVE_PROGRESS}%`);
 
   // Verificar balance si es LIVE
   if (CONFIG.TRADING_MODE === 'LIVE') {
