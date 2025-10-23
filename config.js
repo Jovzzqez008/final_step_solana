@@ -1,4 +1,4 @@
-// config.js - Configuración centralizada con trading real
+// config.js - Configuración centralizada con trading real (VERSIÓN FINAL)
 require('dotenv').config();
 
 const CONFIG = {
@@ -23,7 +23,7 @@ const CONFIG = {
   TRADE_AMOUNT_SOL: Number(process.env.TRADE_AMOUNT_SOL || 0.01),
   SLIPPAGE_BPS: Number(process.env.SLIPPAGE_BPS || 100),
   
-  // Wallet Real (de tu código)
+  // Wallet Real
   SOLANA_WALLET_PATH: process.env.SOLANA_WALLET_PATH,
   DEVELOPER_ADDRESS: process.env.DEVELOPER_ADDRESS || '8bXf8Rg3u4Prz71LgKR5mpa7aMe2F4cSKYYRctmqro6x',
   PRIORITY_FEE_BASE: Number(process.env.PRIORITY_FEE_BASE || 0.0003),
@@ -47,16 +47,25 @@ const CONFIG = {
   MAX_MONITOR_TIME_MIN: Number(process.env.MAX_MONITOR_TIME_MIN || 30),
   DUMP_THRESHOLD_PERCENT: Number(process.env.DUMP_THRESHOLD_PERCENT || -60),
   PRICE_CHECK_INTERVAL_SEC: Number(process.env.PRICE_CHECK_INTERVAL_SEC || 5), // ✅ AUMENTADO de 3 a 5
-  MIN_INITIAL_LIQUIDITY_USD: Number(process.env.MIN_INITIAL_LIQUIDITY_USD || 300),
+  MIN_INITIAL_LIQUIDITY_USD: Number(process.env.MIN_INITIAL_LIQUIDITY_USD || 50), // ✅ REDUCIDO de 300 a 50
   
   // ✅ NUEVO: Configuración para retry de tokens nuevos
-  INITIAL_DATA_RETRY_DELAY: Number(process.env.INITIAL_DATA_RETRY_DELAY || 2000), // 2 segundos antes de reintentar
-  MAX_DATA_FETCH_RETRIES: Number(process.env.MAX_DATA_FETCH_RETRIES || 2),        // Máximo 2 reintentos
-  DATA_FETCH_TIMEOUT: Number(process.env.DATA_FETCH_TIMEOUT || 10000),            // 10 segundos (antes 5000)
+  INITIAL_DATA_RETRY_DELAY: Number(process.env.INITIAL_DATA_RETRY_DELAY || 2000), // 2 segundos
+  MAX_DATA_FETCH_RETRIES: Number(process.env.MAX_DATA_FETCH_RETRIES || 3),        // 3 reintentos
+  DATA_FETCH_TIMEOUT: Number(process.env.DATA_FETCH_TIMEOUT || 10000),            // 10 segundos
+  
+  // ✅ NUEVO: Retry para tokens con liquidez = 0
+  ZERO_LIQUIDITY_RETRY_DELAY: Number(process.env.ZERO_LIQUIDITY_RETRY_DELAY || 5000), // 5 segundos
+  ALLOW_ZERO_LIQUIDITY_MONITORING: process.env.ALLOW_ZERO_LIQUIDITY_MONITORING === 'true', // Monitorear sin liquidez
   
   // ✅ NUEVO: Rate limiting mejorado
-  MAX_REQUESTS_PER_SECOND: Number(process.env.MAX_REQUESTS_PER_SECOND || 10),    // Límite de requests al RPC
-  REQUEST_DELAY_MS: Number(process.env.REQUEST_DELAY_MS || 100),                 // Delay entre requests
+  MAX_REQUESTS_PER_SECOND: Number(process.env.MAX_REQUESTS_PER_SECOND || 10),
+  REQUEST_DELAY_MS: Number(process.env.REQUEST_DELAY_MS || 100),
+  
+  // ✅ NUEVO: Manejo de API errors
+  API_530_MAX_RETRIES: Number(process.env.API_530_MAX_RETRIES || 3),
+  API_530_RETRY_DELAY_MS: Number(process.env.API_530_RETRY_DELAY_MS || 2000),
+  API_429_RETRY_DELAY_MS: Number(process.env.API_429_RETRY_DELAY_MS || 5000),
   
   // Performance
   MAX_CONCURRENCY: Number(process.env.MAX_CONCURRENCY || 8),
@@ -73,7 +82,7 @@ if (CONFIG.TRADING_MODE === 'LIVE' && !CONFIG.SOLANA_WALLET_PATH && !process.env
   console.warn('⚠️ TRADING_MODE=LIVE pero SOLANA_WALLET_PATH/SOLANA_PRIVATE_KEY no está configurado');
 }
 
-// ✅ NUEVO: Validación de RPC
+// ✅ Validación de RPC
 if (!process.env.HELIUS_RPC_URL && !process.env.RPC_URL) {
   console.warn('⚠️ Usando RPC público de Solana - considera usar Helius para mejor performance');
   console.warn('📝 Regístrate gratis en: https://helius.dev');
@@ -81,7 +90,7 @@ if (!process.env.HELIUS_RPC_URL && !process.env.RPC_URL) {
   console.log('✅ Helius RPC configurado');
 }
 
-// ✅ NUEVO: Validación de timeouts
+// ✅ Validación de timeouts
 if (CONFIG.PRICE_CHECK_INTERVAL_SEC < 3) {
   console.warn('⚠️ PRICE_CHECK_INTERVAL_SEC muy bajo, puede causar rate limiting');
   CONFIG.PRICE_CHECK_INTERVAL_SEC = 3;
@@ -92,7 +101,7 @@ if (CONFIG.INITIAL_DATA_RETRY_DELAY < 1000) {
   CONFIG.INITIAL_DATA_RETRY_DELAY = 1000;
 }
 
-// ✅ NUEVO: Mostrar configuración crítica al inicio
+// ✅ Mostrar configuración crítica al inicio
 if (CONFIG.LOG_LEVEL === 'DEBUG' || CONFIG.LOG_LEVEL === 'INFO') {
   console.log('\n📋 Configuración cargada:');
   console.log(`   RPC: ${CONFIG.RPC_URL.split('?')[0]}...`);
