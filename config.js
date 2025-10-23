@@ -14,7 +14,7 @@ const CONFIG = {
   DATABASE_URL: process.env.DATABASE_URL || '',
   
   // Solana
-  RPC_URL: process.env.RPC_URL || 'https://api.mainnet-beta.solana.com',
+  RPC_URL: process.env.RPC_URL || process.env.HELIUS_RPC_URL || 'https://api.mainnet-beta.solana.com',
   SOL_PRICE_USD: Number(process.env.SOL_PRICE_USD || 150),
   
   // Trading Mode
@@ -46,8 +46,17 @@ const CONFIG = {
   // Monitoring
   MAX_MONITOR_TIME_MIN: Number(process.env.MAX_MONITOR_TIME_MIN || 30),
   DUMP_THRESHOLD_PERCENT: Number(process.env.DUMP_THRESHOLD_PERCENT || -60),
-  PRICE_CHECK_INTERVAL_SEC: Number(process.env.PRICE_CHECK_INTERVAL_SEC || 3),
+  PRICE_CHECK_INTERVAL_SEC: Number(process.env.PRICE_CHECK_INTERVAL_SEC || 5), // ✅ AUMENTADO de 3 a 5
   MIN_INITIAL_LIQUIDITY_USD: Number(process.env.MIN_INITIAL_LIQUIDITY_USD || 300),
+  
+  // ✅ NUEVO: Configuración para retry de tokens nuevos
+  INITIAL_DATA_RETRY_DELAY: Number(process.env.INITIAL_DATA_RETRY_DELAY || 2000), // 2 segundos antes de reintentar
+  MAX_DATA_FETCH_RETRIES: Number(process.env.MAX_DATA_FETCH_RETRIES || 2),        // Máximo 2 reintentos
+  DATA_FETCH_TIMEOUT: Number(process.env.DATA_FETCH_TIMEOUT || 10000),            // 10 segundos (antes 5000)
+  
+  // ✅ NUEVO: Rate limiting mejorado
+  MAX_REQUESTS_PER_SECOND: Number(process.env.MAX_REQUESTS_PER_SECOND || 10),    // Límite de requests al RPC
+  REQUEST_DELAY_MS: Number(process.env.REQUEST_DELAY_MS || 100),                 // Delay entre requests
   
   // Performance
   MAX_CONCURRENCY: Number(process.env.MAX_CONCURRENCY || 8),
@@ -60,8 +69,40 @@ const CONFIG = {
 };
 
 // Validaciones
-if (CONFIG.TRADING_MODE === 'LIVE' && !CONFIG.SOLANA_WALLET_PATH) {
-  console.warn('⚠️ TRADING_MODE=LIVE pero SOLANA_WALLET_PATH no está configurado');
+if (CONFIG.TRADING_MODE === 'LIVE' && !CONFIG.SOLANA_WALLET_PATH && !process.env.SOLANA_PRIVATE_KEY) {
+  console.warn('⚠️ TRADING_MODE=LIVE pero SOLANA_WALLET_PATH/SOLANA_PRIVATE_KEY no está configurado');
+}
+
+// ✅ NUEVO: Validación de RPC
+if (!process.env.HELIUS_RPC_URL && !process.env.RPC_URL) {
+  console.warn('⚠️ Usando RPC público de Solana - considera usar Helius para mejor performance');
+  console.warn('📝 Regístrate gratis en: https://helius.dev');
+} else if (process.env.HELIUS_RPC_URL) {
+  console.log('✅ Helius RPC configurado');
+}
+
+// ✅ NUEVO: Validación de timeouts
+if (CONFIG.PRICE_CHECK_INTERVAL_SEC < 3) {
+  console.warn('⚠️ PRICE_CHECK_INTERVAL_SEC muy bajo, puede causar rate limiting');
+  CONFIG.PRICE_CHECK_INTERVAL_SEC = 3;
+}
+
+if (CONFIG.INITIAL_DATA_RETRY_DELAY < 1000) {
+  console.warn('⚠️ INITIAL_DATA_RETRY_DELAY muy bajo, tokens nuevos pueden no estar listos');
+  CONFIG.INITIAL_DATA_RETRY_DELAY = 1000;
+}
+
+// ✅ NUEVO: Mostrar configuración crítica al inicio
+if (CONFIG.LOG_LEVEL === 'DEBUG' || CONFIG.LOG_LEVEL === 'INFO') {
+  console.log('\n📋 Configuración cargada:');
+  console.log(`   RPC: ${CONFIG.RPC_URL.split('?')[0]}...`);
+  console.log(`   Trading Mode: ${CONFIG.TRADING_MODE}`);
+  console.log(`   Price Check Interval: ${CONFIG.PRICE_CHECK_INTERVAL_SEC}s`);
+  console.log(`   Data Retry Delay: ${CONFIG.INITIAL_DATA_RETRY_DELAY}ms`);
+  console.log(`   Max Retries: ${CONFIG.MAX_DATA_FETCH_RETRIES}`);
+  console.log(`   Min Liquidity: $${CONFIG.MIN_INITIAL_LIQUIDITY_USD}`);
+  console.log(`   Max Bonding Curve: ${CONFIG.MAX_BONDING_CURVE_PROGRESS}%`);
+  console.log('');
 }
 
 module.exports = CONFIG;
