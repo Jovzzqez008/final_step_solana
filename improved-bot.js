@@ -17,6 +17,8 @@ const { checkEliteRules } = require('./rules');
 const { setupTelegramBot } = require('./telegram');
 const TradingEngine = require('./trading-engine');
 const PumpDataFetcher = require('./pump-data-fetcher');
+const PumpSDKIntegration = require('./pump-sdk-integration');
+const OnChainTokenDetector = require('./onchain-token-detector');
 
 // Estado global
 const monitoredTokens = new Map();
@@ -24,6 +26,8 @@ const alertedTokens = new Set();
 let telegramBot = null;
 let tradingEngine = null;
 let dataFetcher = null;
+let sdkIntegration = null;
+let onchainDetector = null;
 let stats = { 
   detected: 0, 
   monitored: 0, 
@@ -479,7 +483,9 @@ function startHealthServer() {
         active_trades: activeTrades.length,
         stats: stats,
         engine: engineStats,
-        fetcher: fetcherStats
+        fetcher: fetcherStats,
+        sdk_integration: sdkIntegration ? 'active' : 'inactive',
+        onchain_detector: onchainDetector ? 'active' : 'inactive'
       }));
     } else if (req.url === '/metrics') {
       const engineStats = tradingEngine ? tradingEngine.getStats() : {};
@@ -554,6 +560,12 @@ function startPeriodicReports() {
       log.info(`  • SOL Price: ${fetcherStats.solPrice}`);
     }
     
+    // SDK Integration stats
+    log.info('');
+    log.info('🔗 SDK INTEGRATION:');
+    log.info(`  • SDK Status: ${sdkIntegration ? '✅ ACTIVO' : '❌ INACTIVO'}`);
+    log.info(`  • On-chain Detector: ${onchainDetector ? '✅ ACTIVO' : '❌ INACTIVO'}`);
+    
     log.info('📊 ═══════════════════════════════════════════════════════════');
   }, 600000); // 10 minutos
 }
@@ -594,6 +606,22 @@ async function main() {
   
   dataFetcher = new PumpDataFetcher(rpcUrl);
   
+  // Inicializar SDK (paralelo al WebSocket)
+  try {
+    sdkIntegration = new PumpSDKIntegration(CONFIG);
+    
+    // Iniciar detector on-chain
+    onchainDetector = new OnChainTokenDetector(
+      CONFIG.RPC_URL,
+      handleNewToken // Usar el mismo handler
+    );
+    
+    await onchainDetector.start();
+    log.info('✅ SDK Pump.fun inicializado (modo híbrido)');
+  } catch (error) {
+    log.warn('⚠️ SDK no disponible, usando solo WebSocket:', error.message);
+  }
+  
   // Health check del RPC
   const rpcHealth = await dataFetcher.healthCheck();
   if (rpcHealth.healthy) {
@@ -619,6 +647,7 @@ async function main() {
   log.info(`🎯 ESTRATEGIA: TreeCityWes (TP 25%/50%, SL -10%, Trailing -15%)`);
   log.info(`📈 FILTROS: MCap>${CONFIG.MIN_INITIAL_LIQUIDITY_USD}, BC<${CONFIG.MAX_BONDING_CURVE_PROGRESS}%`);
   log.info(`🛡️ PROTECCIONES: Circuit Breaker (3 fallos), Rate Limiting (10 req/s)`);
+  log.info(`🔗 MODO HÍBRIDO: ${sdkIntegration ? '✅ ACTIVO' : '❌ INACTIVO'}`);
   log.info('═══════════════════════════════════════════════════════════');
 
   // Verificar balance si es LIVE
@@ -645,6 +674,13 @@ process.on('SIGTERM', () => {
   log.info('🛑 SIGTERM - apagando...');
   if (reportInterval) clearInterval(reportInterval);
   
+  // Cerrar SDK y detector on-chain
+  if (onchainDetector) {
+    onchainDetector.stop().catch(err => {
+      log.error('Error cerrando detector on-chain:', err.message);
+    });
+  }
+  
   // Reporte final
   if (tradingEngine) {
     tradingEngine.getDetailedReport();
@@ -656,6 +692,13 @@ process.on('SIGTERM', () => {
 process.on('SIGINT', () => {
   log.info('🛑 SIGINT - apagando...');
   if (reportInterval) clearInterval(reportInterval);
+  
+  // Cerrar SDK y detector on-chain
+  if (onchainDetector) {
+    onchainDetector.stop().catch(err => {
+      log.error('Error cerrando detector on-chain:', err.message);
+    });
+  }
   
   // Reporte final
   if (tradingEngine) {
