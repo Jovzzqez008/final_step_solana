@@ -1,12 +1,15 @@
 {
   "name": "pump-trading-bot-improved",
-  "version": "2.0.0",
-  "description": "Bot de trading mejorado para Pump.fun - Sin Selenium, datos on-chain reales",
+  "version": "3.0.0",
+  "description": "Bot de trading mejorado para Pump.fun con SDK oficial",
   "main": "improved-bot.js",
   "scripts": {
     "start": "node improved-bot.js",
     "dev": "LOG_LEVEL=DEBUG node improved-bot.js",
-    "test:fetcher": "node test-fetcher.js",
+    "test": "node test-utils.js all",
+    "test:token": "node test-utils.js token",
+    "test:rpc": "node test-utils.js rpc",
+    "test:wallet": "node test-utils.js wallet",
     "sell:all": "node sell-all.js",
     "check:balance": "node check-balance.js"
   },
@@ -17,7 +20,8 @@
     "bot",
     "treecitywes",
     "crypto",
-    "defi"
+    "defi",
+    "sdk"
   ],
   "author": "TreeCityWes.eth @ HashHead.io",
   "license": "MIT",
@@ -26,6 +30,7 @@
     "axios": "^1.6.2",
     "@solana/web3.js": "^1.87.6",
     "@solana/spl-token": "^0.3.9",
+    "@pump-fun/pump-sdk": "^1.19.0",
     "bs58": "^5.0.0",
     "ws": "^8.14.2",
     "ioredis": "^5.3.2",
