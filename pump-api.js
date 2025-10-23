@@ -1,41 +1,24 @@
-// pump-api.js - Trading real con la API de Pump.fun (de tu código)
+// pump-api.js - Trading real con la API de Pump.fun (ACTUALIZADO)
 const axios = require('axios');
 const bs58 = require('bs58');
-const fs = require('fs');
-const { Keypair, Connection, clusterApiUrl } = require('@solana/web3.js');
+const { Connection, clusterApiUrl, SystemProgram, Transaction, PublicKey, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { loadWalletKeypair } = require('./wallet-loader');
 
 class PumpFunTrading {
   constructor(config) {
     this.config = config;
     this.connection = new Connection(
-      config.RPC_URL || clusterApiUrl('mainnet-beta')
+      config.RPC_URL || config.HELIUS_RPC_URL || clusterApiUrl('mainnet-beta'),
+      'confirmed'
     );
-    this.payer = this.loadWallet();
-  }
-
-  loadWallet() {
-    if (!this.config.SOLANA_WALLET_PATH) {
-      console.warn('❌ SOLANA_WALLET_PATH no configurado - Trading real deshabilitado');
-      return null;
-    }
-
+    
+    // Cargar wallet usando el nuevo loader
     try {
-      const keypairData = fs.readFileSync(this.config.SOLANA_WALLET_PATH, 'utf8');
-      let keypair;
-      
-      // Manejar diferentes formatos de wallet
-      if (keypairData.startsWith('[')) {
-        // Array JSON
-        keypair = JSON.parse(keypairData);
-      } else {
-        // Secret key base58
-        keypair = bs58.decode(keypairData);
-      }
-      
-      return Keypair.fromSecretKey(Uint8Array.from(keypair));
+      this.payer = loadWalletKeypair();
+      console.log(`✅ Trading wallet cargada: ${this.payer.publicKey.toString()}`);
     } catch (error) {
-      console.error('❌ Error cargando wallet:', error.message);
-      return null;
+      console.error('❌ No se pudo cargar wallet para trading:', error.message);
+      this.payer = null;
     }
   }
 
@@ -49,8 +32,8 @@ class PumpFunTrading {
       trade_type: "buy",
       mint,
       amount: amountSol,
-      slippage: 5,
-      priorityFee: this.config.PRIORITY_FEE_BASE,
+      slippage: this.config.SLIPPAGE_PERCENT || 5,
+      priorityFee: this.config.PRIORITY_FEE_BASE || 0.0003,
       userPrivateKey: bs58.encode(this.payer.secretKey)
     };
 
@@ -81,8 +64,8 @@ class PumpFunTrading {
       trade_type: "sell",
       mint,
       amount: amountTokens.toString(),
-      slippage: 5,
-      priorityFee: this.config.PRIORITY_FEE_BASE,
+      slippage: this.config.SLIPPAGE_PERCENT || 5,
+      priorityFee: this.config.PRIORITY_FEE_BASE || 0.0003,
       userPrivateKey: bs58.encode(this.payer.secretKey)
     };
 
@@ -104,7 +87,10 @@ class PumpFunTrading {
   }
 
   async checkBalance() {
-    if (!this.payer) return 0;
+    if (!this.payer) {
+      console.warn('⚠️ Wallet no cargada, no se puede consultar balance');
+      return 0;
+    }
     
     try {
       const balance = await this.connection.getBalance(this.payer.publicKey);
@@ -117,25 +103,41 @@ class PumpFunTrading {
     }
   }
 
-  async sendDeveloperFee() {
-    if (!this.payer) return null;
+  async sendDeveloperFee(amountSOL = 0.05) {
+    if (!this.payer || !this.config.DEVELOPER_ADDRESS) {
+      console.warn('⚠️ No se puede enviar fee: wallet o dirección no configurada');
+      return null;
+    }
 
     try {
       const transaction = new Transaction().add(
         SystemProgram.transfer({
           fromPubkey: this.payer.publicKey,
           toPubkey: new PublicKey(this.config.DEVELOPER_ADDRESS),
-          lamports: 0.05 * 1e9 // 0.05 SOL
+          lamports: amountSOL * 1e9
         })
       );
 
-      const signature = await sendAndConfirmTransaction(this.connection, transaction, [this.payer]);
+      const signature = await sendAndConfirmTransaction(
+        this.connection, 
+        transaction, 
+        [this.payer]
+      );
+      
       console.log(`💸 Fee desarrollador enviado: ${signature}`);
       return signature;
     } catch (error) {
       console.error('❌ Error enviando fee desarrollador:', error.message);
       return null;
     }
+  }
+
+  getPublicKey() {
+    return this.payer ? this.payer.publicKey.toString() : null;
+  }
+
+  isWalletLoaded() {
+    return this.payer !== null;
   }
 }
 
