@@ -1,7 +1,6 @@
-// bot-ultimate.js - VERSIÓN DEFINITIVA - Mejor de ambos mundos
+// improved-bot.js - VERSIÓN MEJORADA con todas las optimizaciones
 require('dotenv').config();
 const WebSocket = require('ws');
-const axios = require('axios');
 
 // Módulos
 const CONFIG = require('./config');
@@ -34,6 +33,9 @@ let stats = {
   trades_success: 0,
   trades_failed: 0
 };
+
+// Reportes automáticos cada 10 minutos
+let reportInterval = null;
 
 // Clase TokenData mejorada
 class TokenData {
@@ -121,7 +123,7 @@ const log = {
   }
 };
 
-// Obtener precio usando PumpDataFetcher (MUCHO MEJOR)
+// Obtener precio usando PumpDataFetcher
 async function getCurrentPrice(mint) {
   try {
     const tokenData = await dataFetcher.getTokenData(mint);
@@ -163,6 +165,8 @@ async function sendTelegramAlert(token, alert, tradeResult = null) {
 ${tradeResult.txHash ? `*TX:* \`${tradeResult.txHash}\`` : ''}
 ${tradeResult.reason ? `*Razón:* ${tradeResult.reason}` : ''}
 ${tradeResult.simulated ? `*MODO:* 🧪 DRY_RUN` : ''}
+${tradeResult.executionTime ? `*Tiempo:* ${tradeResult.executionTime}ms` : ''}
+${tradeResult.retries ? `*Retries:* ${tradeResult.retries}` : ''}
 
 *Métricas:*
 • Ganancia: +${alert.gainPercent.toFixed(1)}% en ${alert.timeElapsed.toFixed(1)}min
@@ -235,7 +239,7 @@ async function monitorToken(mint) {
         return;
       }
 
-      // Obtener precio actual con PumpDataFetcher
+      // Obtener precio actual
       const priceData = await getCurrentPrice(mint);
       
       if (!priceData || priceData.price === 0) {
@@ -287,7 +291,9 @@ async function monitorToken(mint) {
             stats.trades_success++;
             log.trade(`✅ COMPRA EXITOSA: ${token.symbol}`, { 
               txHash: tradeResult.txHash,
-              simulated: tradeResult.simulated
+              simulated: tradeResult.simulated,
+              executionTime: tradeResult.executionTime,
+              retries: tradeResult.retries
             });
 
             // INICIAR MONITOREO PARA VENTA
@@ -298,7 +304,8 @@ async function monitorToken(mint) {
           } else {
             stats.trades_failed++;
             log.trade(`❌ COMPRA FALLIDA: ${token.symbol}`, { 
-              reason: tradeResult.reason 
+              reason: tradeResult.reason,
+              resetIn: tradeResult.resetIn
             });
           }
 
@@ -308,14 +315,16 @@ async function monitorToken(mint) {
             success: tradeResult.success,
             txHash: tradeResult.txHash,
             reason: tradeResult.reason,
-            simulated: tradeResult.simulated
+            simulated: tradeResult.simulated,
+            executionTime: tradeResult.executionTime,
+            retries: tradeResult.retries
           });
         }
       }
 
       // Log de progreso cada 10 checks
       if (token.checksCount % 10 === 0) {
-        log.debug(`📊 ${token.symbol}: $${token.currentPrice.toFixed(8)} (+${token.gainPercent.toFixed(1)}%) | MC: $${Math.round(token.currentMarketCap)} | ${token.elapsedMinutes.toFixed(1)}min | BC: ${token.bondingCurve}%`);
+        log.debug(`📊 ${token.symbol}: ${token.currentPrice.toFixed(8)} (+${token.gainPercent.toFixed(1)}%) | MC: ${Math.round(token.currentMarketCap)} | ${token.elapsedMinutes.toFixed(1)}min | BC: ${token.bondingCurve}%`);
       }
 
       await sleep(CONFIG.PRICE_CHECK_INTERVAL_SEC * 1000);
@@ -378,9 +387,9 @@ async function handleNewToken(data) {
 
     log.info(`📊 Datos obtenidos:`, {
       symbol: symbol,
-      price: `$${tokenData.price.toFixed(8)}`,
-      marketCap: `$${Math.round(tokenData.marketCap)}`,
-      liquidity: `$${Math.round(tokenData.liquidity)}`,
+      price: `${tokenData.price.toFixed(8)}`,
+      marketCap: `${Math.round(tokenData.marketCap)}`,
+      liquidity: `${Math.round(tokenData.liquidity)}`,
       bondingCurve: `${tokenData.bondingCurve}%`,
       source: tokenData.source
     });
@@ -399,9 +408,9 @@ async function handleNewToken(data) {
                     'datos inválidos';
                     
       log.info(`🚫 Filtrado: ${symbol} - ${reason}`, {
-        marketCap: `$${Math.round(tokenData.marketCap)}`,
+        marketCap: `${Math.round(tokenData.marketCap)}`,
         bondingCurve: `${tokenData.bondingCurve}%`,
-        minMCap: `$${CONFIG.MIN_INITIAL_LIQUIDITY_USD}`,
+        minMCap: `${CONFIG.MIN_INITIAL_LIQUIDITY_USD}`,
         maxBC: `${CONFIG.MAX_BONDING_CURVE_PROGRESS}%`
       });
       
@@ -427,8 +436,8 @@ async function handleNewToken(data) {
     stats.monitored++;
 
     log.info(`✅ MONITOREANDO: ${symbol}`, {
-      price: `$${tokenData.price.toFixed(8)}`,
-      marketCap: `$${Math.round(tokenData.marketCap)}`,
+      price: `${tokenData.price.toFixed(8)}`,
+      marketCap: `${Math.round(tokenData.marketCap)}`,
       bondingCurve: `${tokenData.bondingCurve}%`,
       source: tokenData.source
     });
@@ -451,13 +460,15 @@ async function handleNewToken(data) {
   }
 }
 
-// Health Server
+// Health Server mejorado
 function startHealthServer() {
   const http = require('http');
   
   const server = http.createServer((req, res) => {
     if (req.url === '/health') {
       const activeTrades = tradingEngine ? tradingEngine.getActiveTrades() : [];
+      const engineStats = tradingEngine ? tradingEngine.getStats() : {};
+      const fetcherStats = dataFetcher ? dataFetcher.getStats() : {};
       
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -466,17 +477,33 @@ function startHealthServer() {
         websocket_connected: true,
         monitored_tokens: monitoredTokens.size,
         active_trades: activeTrades.length,
-        stats: stats
+        stats: stats,
+        engine: engineStats,
+        fetcher: fetcherStats
       }));
     } else if (req.url === '/metrics') {
+      const engineStats = tradingEngine ? tradingEngine.getStats() : {};
+      
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         monitored_tokens: monitoredTokens.size,
-        ...stats
+        ...stats,
+        performance: engineStats.performance || {},
+        circuit_breaker: engineStats.circuitBreaker || {}
       }));
+    } else if (req.url === '/report') {
+      // Endpoint para reporte detallado
+      if (tradingEngine) {
+        const report = tradingEngine.getDetailedReport();
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(report, null, 2));
+      } else {
+        res.writeHead(503, { 'Content-Type': 'text/plain' });
+        res.end('Trading engine not initialized');
+      }
     } else {
       res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('🤖 Pump.fun ULTIMATE Bot 🚀');
+      res.end('🤖 Pump.fun ULTIMATE Bot 🚀\n\nEndpoints:\n  /health\n  /metrics\n  /report');
     }
   });
   
@@ -485,22 +512,68 @@ function startHealthServer() {
   });
 }
 
+// Reporte periódico automático
+function startPeriodicReports() {
+  reportInterval = setInterval(() => {
+    log.info('📊 ═══════════════════════════════════════════════════════════');
+    log.info('📊 REPORTE PERIÓDICO (cada 10 minutos)');
+    log.info('📊 ═══════════════════════════════════════════════════════════');
+    
+    // Stats generales
+    log.info(`📈 Tokens detectados: ${stats.detected}`);
+    log.info(`✅ Monitoreando: ${monitoredTokens.size}`);
+    log.info(`🚫 Filtrados: ${stats.filtered}`);
+    log.info(`🚨 Alertas: ${stats.alerts}`);
+    log.info(`💼 Trades ejecutados: ${stats.trades_executed} (✅ ${stats.trades_success} | ❌ ${stats.trades_failed})`);
+    
+    // Trading Engine stats
+    if (tradingEngine) {
+      const engineStats = tradingEngine.getStats();
+      
+      log.info('');
+      log.info('🎯 TRADING ENGINE:');
+      log.info(`  • Trades activos: ${engineStats.activeTrades}`);
+      log.info(`  • Circuit Breaker: ${engineStats.circuitBreaker.isOpen ? '🔴 ABIERTO' : '🟢 CERRADO'}`);
+      
+      if (engineStats.performance.totalTrades > 0) {
+        log.info(`  • Success Rate: ${engineStats.performance.successRate}%`);
+        log.info(`  • Win Rate: ${engineStats.performance.winRate}%`);
+        log.info(`  • Avg Execution Time: ${engineStats.performance.avgExecutionTime}ms`);
+        log.info(`  • Avg PnL: ${engineStats.performance.avgPnL}%`);
+      }
+    }
+    
+    // Data Fetcher stats
+    if (dataFetcher) {
+      const fetcherStats = dataFetcher.getStats();
+      log.info('');
+      log.info('🔍 DATA FETCHER:');
+      log.info(`  • Cache size: ${fetcherStats.cacheSize}`);
+      log.info(`  • Queue size: ${fetcherStats.queueSize}`);
+      log.info(`  • Requests/sec: ${fetcherStats.requestsPerSecond}`);
+      log.info(`  • SOL Price: ${fetcherStats.solPrice}`);
+    }
+    
+    log.info('📊 ═══════════════════════════════════════════════════════════');
+  }, 600000); // 10 minutos
+}
+
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // Main
 async function main() {
-  log.info('🚀 INICIANDO PUMP.FUN ULTIMATE BOT');
-  log.info('💡 Arquitectura robusta + PumpDataFetcher optimizado');
-  log.info('🔗 Usando datos on-chain directos de Bonding Curve');
+  log.info('🚀 INICIANDO PUMP.FUN ULTIMATE BOT - VERSIÓN MEJORADA');
+  log.info('💡 Características: Circuit Breaker, Rate Limiting, Métricas Avanzadas');
+  log.info('🔗 Datos on-chain directos de Bonding Curve');
   
   // Validaciones
   if (!CONFIG.TELEGRAM_BOT_TOKEN || !CONFIG.TELEGRAM_CHAT_ID) {
     log.warn('⚠️ Telegram no configurado - alertas deshabilitadas');
   }
 
-  if (CONFIG.TRADING_MODE === 'LIVE' && !CONFIG.SOLANA_WALLET_PATH) {
+  if (CONFIG.TRADING_MODE === 'LIVE' && !CONFIG.SOLANA_WALLET_PATH && !process.env.SOLANA_PRIVATE_KEY) {
     log.warn('⚠️ MODO LIVE sin wallet - cambiando a DRY_RUN');
     CONFIG.TRADING_MODE = 'DRY_RUN';
     CONFIG.DRY_RUN = true;
@@ -516,42 +589,111 @@ async function main() {
   }
 
   // Inicializar componentes
+  log.info('🔧 Inicializando componentes...');
   await initDB();
+  
   dataFetcher = new PumpDataFetcher(rpcUrl);
+  
+  // Health check del RPC
+  const rpcHealth = await dataFetcher.healthCheck();
+  if (rpcHealth.healthy) {
+    log.info(`✅ RPC Health Check: OK (latency: ${rpcHealth.latency}ms)`);
+  } else {
+    log.error(`❌ RPC Health Check: FAILED (${rpcHealth.error})`);
+  }
+  
   tradingEngine = new TradingEngine(CONFIG);
   telegramBot = setupTelegramBot(monitoredTokens, stats, sendTelegramAlert);
   startHealthServer();
+  startPeriodicReports();
   
   // Conectar WebSocket
   connectWebSocket(CONFIG.PUMPPORTAL_WSS, handleNewToken, log);
   
   log.info('✅ BOT INICIADO EXITOSAMENTE!');
+  log.info('');
+  log.info('═══════════════════════════════════════════════════════════');
   log.info(`📊 Reglas: ${CONFIG.ALERT_RULES.map(r => r.description).join(', ')}`);
   log.info(`🧪 MODO: ${CONFIG.TRADING_MODE}`);
   log.info(`💰 TRADING: ${CONFIG.DRY_RUN ? '🧪 DRY_RUN' : '🔴 LIVE'}`);
-  log.info(`🎯 ESTRATEGIA: TreeCityWes (TP 25%/50%, SL -10%, Moon 25%)`);
+  log.info(`🎯 ESTRATEGIA: TreeCityWes (TP 25%/50%, SL -10%, Trailing -15%)`);
   log.info(`📈 FILTROS: MCap>${CONFIG.MIN_INITIAL_LIQUIDITY_USD}, BC<${CONFIG.MAX_BONDING_CURVE_PROGRESS}%`);
+  log.info(`🛡️ PROTECCIONES: Circuit Breaker (3 fallos), Rate Limiting (10 req/s)`);
+  log.info('═══════════════════════════════════════════════════════════');
 
-  // Verificar balance
+  // Verificar balance si es LIVE
   if (CONFIG.TRADING_MODE === 'LIVE') {
-    const balance = await tradingEngine.trading.checkBalance();
-    if (balance < CONFIG.MINIMUM_BUY_AMOUNT) {
-      log.error(`❌ Balance insuficiente: ${balance} SOL (min: ${CONFIG.MINIMUM_BUY_AMOUNT})`);
-    } else {
-      log.info(`💰 Balance: ${balance} SOL`);
+    try {
+      const balance = await tradingEngine.trading.checkBalance();
+      if (balance < CONFIG.MINIMUM_BUY_AMOUNT) {
+        log.error(`❌ Balance insuficiente: ${balance} SOL (min: ${CONFIG.MINIMUM_BUY_AMOUNT})`);
+      } else {
+        log.info(`💰 Balance disponible: ${balance} SOL`);
+      }
+    } catch (error) {
+      log.error(`⚠️ No se pudo verificar balance: ${error.message}`);
     }
   }
+  
+  // Comando manual para reporte
+  log.info('');
+  log.info('💡 TIP: Envía SIGUSR1 para reporte detallado: kill -SIGUSR1 ' + process.pid);
 }
 
 // Manejo de señales
 process.on('SIGTERM', () => {
   log.info('🛑 SIGTERM - apagando...');
+  if (reportInterval) clearInterval(reportInterval);
+  
+  // Reporte final
+  if (tradingEngine) {
+    tradingEngine.getDetailedReport();
+  }
+  
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
   log.info('🛑 SIGINT - apagando...');
+  if (reportInterval) clearInterval(reportInterval);
+  
+  // Reporte final
+  if (tradingEngine) {
+    tradingEngine.getDetailedReport();
+  }
+  
   process.exit(0);
+});
+
+// Señal personalizada para reporte bajo demanda
+process.on('SIGUSR1', () => {
+  log.info('📊 Reporte solicitado manualmente (SIGUSR1)');
+  if (tradingEngine) {
+    tradingEngine.getDetailedReport();
+  }
+  
+  if (dataFetcher) {
+    const fetcherStats = dataFetcher.getStats();
+    log.info('🔍 Fetcher Stats:', fetcherStats);
+  }
+});
+
+// Manejo de errores no capturados
+process.on('unhandledRejection', (reason, promise) => {
+  log.error('❌ Unhandled Rejection:', { reason, promise });
+});
+
+process.on('uncaughtException', (error) => {
+  log.error('❌ Uncaught Exception:', { error: error.message, stack: error.stack });
+  
+  // Reporte final antes de crash
+  if (tradingEngine) {
+    try {
+      tradingEngine.getDetailedReport();
+    } catch {}
+  }
+  
+  process.exit(1);
 });
 
 // Iniciar
