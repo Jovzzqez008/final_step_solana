@@ -1,31 +1,48 @@
 {
-  "name": "pump-fun-elite-bot",
+  "name": "pump-trading-bot-improved",
   "version": "2.0.0",
-  "description": "Bot élite de trading para Pump.fun - Fusión TreeCityWes + Infrastructure",
-  "main": "bot.js",
+  "description": "Bot de trading mejorado para Pump.fun - Sin Selenium, datos on-chain reales",
+  "main": "improved-bot.js",
   "scripts": {
-    "start": "node bot.js",
-    "export": "node export.js",
-    "dev": "LOG_LEVEL=DEBUG node bot.js",
-    "dry-run": "TRADING_MODE=DRY_RUN node bot.js",
-    "live": "TRADING_MODE=LIVE node bot.js"
+    "start": "node improved-bot.js",
+    "dev": "LOG_LEVEL=DEBUG node improved-bot.js",
+    "test:fetcher": "node test-fetcher.js",
+    "sell:all": "node sell-all.js",
+    "check:balance": "node check-balance.js"
   },
-  "keywords": ["solana", "pump.fun", "trading", "bot", "treecitywes", "ml"],
-  "author": "Jorge",
+  "keywords": [
+    "solana",
+    "pump.fun",
+    "trading",
+    "bot",
+    "treecitywes",
+    "crypto",
+    "defi"
+  ],
+  "author": "TreeCityWes.eth @ HashHead.io",
   "license": "MIT",
   "dependencies": {
-    "ws": "^8.14.2",
-    "ioredis": "^5.3.2",
-    "pg": "^8.11.3",
-    "node-telegram-bot-api": "^0.64.0",
+    "dotenv": "^16.3.1",
     "axios": "^1.6.2",
     "@solana/web3.js": "^1.87.6",
     "@solana/spl-token": "^0.3.9",
-    "@coral-xyz/borsh": "^0.6.0",
     "bs58": "^5.0.0",
-    "dotenv": "^16.3.1"
+    "ws": "^8.14.2",
+    "ioredis": "^5.3.2",
+    "pg": "^8.11.3",
+    "node-telegram-bot-api": "^0.64.0"
+  },
+  "devDependencies": {
+    "eslint": "^8.54.0"
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tu-usuario/pump-trading-bot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tu-usuario/pump-trading-bot/issues"
   }
 }
