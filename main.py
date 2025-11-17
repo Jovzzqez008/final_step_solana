@@ -10,6 +10,7 @@ from flintr_client import FlintrClient
 from trading_engine import TradingEngine
 from telegram_bot import build_application
 from price_monitor_dexscreener import DexscreenerPriceMonitor
+from pumpfun_executor import PumpFunExecutor
 
 
 def main() -> None:
@@ -27,8 +28,11 @@ def main() -> None:
     if not config.flintr_api_key:
         raise RuntimeError("FLINTR_API_KEY no configurado")
 
-    # ---- Motor de trading (DRY_RUN o REAL según MODE) ----
-    engine = TradingEngine(config=config)
+    # ---- Executor Pump.fun (por ahora DRY_RUN) ----
+    pumpfun_exec = PumpFunExecutor(config)
+
+    # ---- Motor de trading (DRY_RUN o futuro REAL) ----
+    engine = TradingEngine(config=config, executor=pumpfun_exec)
 
     # ---- Monitor de precios REAL (DexScreener) ----
     price_monitor = DexscreenerPriceMonitor(engine, interval_sec=5.0)
