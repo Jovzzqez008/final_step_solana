@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from config import BotConfig
 from models import Position, PositionStatus
+from pumpfun_executor import PumpFunExecutor
 
 
 class TradingEngine:
@@ -14,14 +15,15 @@ class TradingEngine:
     Motor principal de trading.
 
     - Recibe señales de Flintr (mints / graduations).
-    - Abre posiciones (por ahora SIMULADAS/DRY_RUN).
+    - Usa PumpFunExecutor para simular (y luego ejecutar) compras en Pump.fun.
     - Actualiza precios en base a un monitor externo (DexScreener, luego Helius/Jupiter).
     - Aplica Stop Loss y Trailing Stop.
     - Calcula P&L y estadísticas.
     """
 
-    def __init__(self, config: BotConfig) -> None:
+    def __init__(self, config: BotConfig, executor: Optional[PumpFunExecutor] = None) -> None:
         self.config = config
+        self.executor = executor
         self._lock = threading.Lock()
 
         # mint -> Position
@@ -78,29 +80,31 @@ class TradingEngine:
 
             size_sol = self.config.invest_amount_sol
 
-            if self.config.mode == "simulation":
-                # DRY_RUN: simulamos como si compráramos ahora mismo
-                self._open_simulated_position(
-                    mint=mint,
-                    symbol=symbol,
-                    name=name,
-                    entry_price_sol=entry_price,
-                    size_sol=size_sol,
-                )
-            else:
-                # FUTURO: aquí irá la compra REAL en Pump.fun (Helius + Phantom)
-                print(
-                    f"[Engine] (REAL FUTURO) Debería comprar {symbol} / {mint} "
-                    f"con {size_sol} SOL en Pump.fun"
-                )
-                # Aunque el modo sea REAL, mantenemos un espejo simulado para PnL interno
-                self._open_simulated_position(
-                    mint=mint,
-                    symbol=symbol,
-                    name=name,
-                    entry_price_sol=entry_price,
-                    size_sol=size_sol,
-                )
+            # Intentamos usar el executor de Pump.fun (DRY_RUN por ahora)
+            amount_tokens = 0.0
+            if self.executor is not None:
+                try:
+                    result = self.executor.buy_on_mint(event, size_sol)
+                    entry_price_from_exec = result.get("entry_price_sol")
+                    amount_from_exec = result.get("amount_tokens")
+                    if isinstance(entry_price_from_exec, (int, float)):
+                        entry_price = float(entry_price_from_exec)
+                    if isinstance(amount_from_exec, (int, float)):
+                        amount_tokens = float(amount_from_exec)
+                except Exception as exc:
+                    print("[Engine] Error en PumpFunExecutor.buy_on_mint:", repr(exc))
+
+            # SI MODE=simulation → DRY_RUN (paper trading)
+            # SI MODE=real → en el futuro, el executor hará compra real,
+            # y aquí seguiremos guardando la posición espejo para PnL interno.
+            self._open_simulated_position(
+                mint=mint,
+                symbol=symbol,
+                name=name,
+                entry_price_sol=entry_price,
+                size_sol=size_sol,
+                amount_tokens=amount_tokens if amount_tokens > 0 else None,
+            )
 
     # -------------------------------------------------------------------------
     # Apertura de posiciones (DRY_RUN)
@@ -113,6 +117,7 @@ class TradingEngine:
         name: str,
         entry_price_sol: float,
         size_sol: float,
+        amount_tokens: Optional[float] = None,
     ) -> None:
         """
         Crea una posición simulada. Si no tenemos precio todavía, lo fijaremos
@@ -120,9 +125,10 @@ class TradingEngine:
         """
         has_price = entry_price_sol > 0
 
-        amount_tokens = (
-            size_sol / entry_price_sol if entry_price_sol > 0 else 0.0
-        )
+        if amount_tokens is None:
+            amount_tokens = (
+                size_sol / entry_price_sol if entry_price_sol > 0 else 0.0
+            )
 
         pos = Position(
             mint=mint,
@@ -141,7 +147,8 @@ class TradingEngine:
 
         print(
             f"[Engine] (SIM) Nueva posición {pos.symbol} mint={mint} "
-            f"size={size_sol} SOL, entry_price={entry_price_sol}"
+            f"size={size_sol} SOL, entry_price={entry_price_sol}, "
+            f"tokens≈{amount_tokens}"
         )
 
     # -------------------------------------------------------------------------
