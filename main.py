@@ -1,6 +1,7 @@
 # main.py
 import logging
 import threading
+import asyncio
 
 from dotenv import load_dotenv
 
@@ -8,6 +9,7 @@ from config import load_config
 from flintr_client import FlintrClient
 from trading_engine import TradingEngine
 from telegram_bot import build_application
+from price_monitor_dexscreener import DexscreenerPriceMonitor
 
 
 def main() -> None:
@@ -25,7 +27,12 @@ def main() -> None:
     if not config.flintr_api_key:
         raise RuntimeError("FLINTR_API_KEY no configurado")
 
+    # ---- Motor de trading (DRY_RUN o REAL según MODE) ----
     engine = TradingEngine(config=config)
+
+    # ---- Monitor de precios REAL (DexScreener) ----
+    price_monitor = DexscreenerPriceMonitor(engine, interval_sec=5.0)
+    price_monitor.start()
 
     # ---- Flintr en thread aparte ----
     flintr = FlintrClient(
@@ -43,8 +50,6 @@ def main() -> None:
     t.start()
 
     # ---- Telegram en hilo principal ----
-    import asyncio
-
     async def run_telegram() -> None:
         app = await build_application(config, engine)
         print("✅ Telegram bot arrancando (polling)...")
