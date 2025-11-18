@@ -96,21 +96,19 @@ class TradingEngine:
         amount_tokens = 0.0
         mode = self.config.mode
 
-        # Para evitar bloquear el lock mientras hacemos RPC, repetimos checks
-        # fuera del lock. No tocamos self._positions aquí.
         if self.executor is not None:
-            # SIMULACIÓN: simular TX en Helius si se puede
             if mode == "simulation":
+                # DRY_RUN on-chain contra Helius si hay RPC + wallet
                 if self.config.helius_rpc_url and self.config.wallet_private_key:
                     try:
                         sim_result = asyncio.run(
                             self.executor.simulate_buy_from_event(event)
                         )
-                        # Puedes loguear alguna info de la simulación aquí si quieres
                         print(
                             f"[Engine] simulate_buy_from_event OK para {symbol}, "
                             f"mint={mint}"
                         )
+                        # Aquí podrías leer logs / error de la simulación si quieres.
                     except Exception as exc:
                         print(
                             "[Engine] Error al simular buy en PumpFunExecutor:",
@@ -122,8 +120,8 @@ class TradingEngine:
                         "solo DRY_RUN interno."
                     )
 
-            # REAL: enviar TX a la red vía Helius
             elif mode == "real":
+                # En modo REAL mandamos la TX a la red
                 try:
                     tx_sig = asyncio.run(self.executor.send_buy_from_event(event))
                     print(
@@ -135,10 +133,9 @@ class TradingEngine:
                         "[Engine] ERROR al enviar TX real en PumpFunExecutor:",
                         repr(exc),
                     )
-                    # Si falla la TX real, aún así podemos decidir NO abrir posición
-                    # interna; aquí por seguridad sí abrimos solo si quieres simular
-                    # el comportamiento. De momento seguimos, pero podrías hacer:
-                    # return
+                    # Si quieres ser ultra conservador, podrías hacer return aquí
+                    # para NO abrir posición interna si la TX falló.
+                    # Por ahora seguimos y la tratamos como posición simulada.
 
         # ------------------------------------------------------------------
         # Independientemente de simulation/real, abrimos posición interna
@@ -168,6 +165,56 @@ class TradingEngine:
                 size_sol=size_sol,
                 amount_tokens=amount_tokens if amount_tokens > 0 else None,
             )
+
+    def handle_flintr_graduation(self, event: Dict[str, Any]) -> None:
+        """
+        Llamado por FlintrClient cuando llega un GRADUATION de pump.fun.
+
+        - Si tenemos posición abierta para ese mint:
+            - MODE=simulation → cerramos inmediatamente (GRADUATION (SIM)).
+            - MODE=real       → por ahora solo logueamos; luego se integrará
+                                un JupiterExecutor para vender en AMM.
+        """
+        data = event.get("data", {}) or {}
+        mint = data.get("mint")
+
+        if not mint:
+            return
+
+        signature = event.get("signature", "")
+        meta = data.get("metaData") or {}
+        symbol = meta.get("symbol") or mint[:6]
+
+        with self._lock:
+            pos = self._positions.get(mint)
+            if not pos or pos.status != PositionStatus.OPEN:
+                print(
+                    f"[Engine] Graduation recibido para {symbol} mint={mint}, "
+                    "pero no hay posición OPEN."
+                )
+                return
+
+            mode = self.config.mode
+            print(
+                f"[Engine] GRADUATION detectado para {symbol} mint={mint} "
+                f"(signature={signature}) — mode={mode}"
+            )
+
+            # En modo simulación: cerramos ya con el último precio conocido.
+            if mode == "simulation":
+                self._close_position_simulated(pos, reason="GRADUATION (SIM)")
+                return
+
+            # En modo REAL: todavía no tenemos integrado JupiterExecutor.
+            # Aquí simplemente marcamos el evento y dejamos el cierre
+            # para futura lógica de venta en AMM.
+            # Podrías escoger cerrar también a precio actual si quieres.
+            print(
+                "[Engine] MODE=real: pendiente integrar venta automática vía "
+                "JupiterExecutor en handle_flintr_graduation."
+            )
+            # Ej: si quisieras cerrar igual en real por ahora (simulación interna):
+            # self._close_position_simulated(pos, reason="GRADUATION (REAL, SIM PnL)")
 
     # -------------------------------------------------------------------------
     # Apertura de posiciones (DRY_RUN)
