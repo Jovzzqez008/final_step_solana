@@ -1,4 +1,8 @@
-python-telegram-bot==21.4
-websocket-client==1.8.0
-python-dotenv==1.0.1
-httpx==0.27.2
+python-dotenv
+httpx
+python-telegram-bot>=21.0.0,<22.0.0
+websocket-client
+jup-python-sdk
+solana
+solders
+base58
