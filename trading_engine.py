@@ -1,6 +1,7 @@
 # trading_engine.py
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -15,15 +16,21 @@ class TradingEngine:
     Motor principal de trading.
 
     - Recibe señales de Flintr (mints / graduations).
-    - Usa PumpFunExecutor para simular (y luego ejecutar) compras en Pump.fun.
+    - Usa PumpFunExecutor para simular y/o ejecutar compras en Pump.fun.
     - Actualiza precios en base a un monitor externo (DexScreener, luego Helius/Jupiter).
     - Aplica Stop Loss y Trailing Stop.
     - Calcula P&L y estadísticas.
     """
 
-    def __init__(self, config: BotConfig, executor: Optional[PumpFunExecutor] = None) -> None:
+    def __init__(
+        self,
+        config: BotConfig,
+        executor: Optional[PumpFunExecutor] = None,
+    ) -> None:
         self.config = config
-        self.executor = executor
+        # Si no te pasan un executor desde fuera, lo creamos aquí
+        self.executor = executor or PumpFunExecutor(config)
+
         self._lock = threading.Lock()
 
         # mint -> Position
@@ -80,23 +87,79 @@ class TradingEngine:
 
             size_sol = self.config.invest_amount_sol
 
-            # Intentamos usar el executor de Pump.fun (DRY_RUN por ahora)
-            amount_tokens = 0.0
-            if self.executor is not None:
-                try:
-                    result = self.executor.buy_on_mint(event, size_sol)
-                    entry_price_from_exec = result.get("entry_price_sol")
-                    amount_from_exec = result.get("amount_tokens")
-                    if isinstance(entry_price_from_exec, (int, float)):
-                        entry_price = float(entry_price_from_exec)
-                    if isinstance(amount_from_exec, (int, float)):
-                        amount_tokens = float(amount_from_exec)
-                except Exception as exc:
-                    print("[Engine] Error en PumpFunExecutor.buy_on_mint:", repr(exc))
+        # ------------------------------------------------------------------
+        # Integración con PumpFunExecutor
+        #   - MODE=simulation → intentamos simulate_buy_from_event (DRY_RUN on-chain).
+        #   - MODE=real       → intentamos send_buy_from_event (TX real en Helius).
+        #   Luego, SIEMPRE abrimos una posición interna para PnL/SL/TS.
+        # ------------------------------------------------------------------
+        amount_tokens = 0.0
+        mode = self.config.mode
 
-            # SI MODE=simulation → DRY_RUN (paper trading)
-            # SI MODE=real → en el futuro, el executor hará compra real,
-            # y aquí seguiremos guardando la posición espejo para PnL interno.
+        # Para evitar bloquear el lock mientras hacemos RPC, repetimos checks
+        # fuera del lock. No tocamos self._positions aquí.
+        if self.executor is not None:
+            # SIMULACIÓN: simular TX en Helius si se puede
+            if mode == "simulation":
+                if self.config.helius_rpc_url and self.config.wallet_private_key:
+                    try:
+                        sim_result = asyncio.run(
+                            self.executor.simulate_buy_from_event(event)
+                        )
+                        # Puedes loguear alguna info de la simulación aquí si quieres
+                        print(
+                            f"[Engine] simulate_buy_from_event OK para {symbol}, "
+                            f"mint={mint}"
+                        )
+                    except Exception as exc:
+                        print(
+                            "[Engine] Error al simular buy en PumpFunExecutor:",
+                            repr(exc),
+                        )
+                else:
+                    print(
+                        "[Engine] MODE=simulation sin Helius/WALLET configurados, "
+                        "solo DRY_RUN interno."
+                    )
+
+            # REAL: enviar TX a la red vía Helius
+            elif mode == "real":
+                try:
+                    tx_sig = asyncio.run(self.executor.send_buy_from_event(event))
+                    print(
+                        f"[Engine] TX real enviada a Pump.fun para {symbol}, "
+                        f"mint={mint}, signature={tx_sig}"
+                    )
+                except Exception as exc:
+                    print(
+                        "[Engine] ERROR al enviar TX real en PumpFunExecutor:",
+                        repr(exc),
+                    )
+                    # Si falla la TX real, aún así podemos decidir NO abrir posición
+                    # interna; aquí por seguridad sí abrimos solo si quieres simular
+                    # el comportamiento. De momento seguimos, pero podrías hacer:
+                    # return
+
+        # ------------------------------------------------------------------
+        # Independientemente de simulation/real, abrimos posición interna
+        # para seguir PnL, SL y trailing stop.
+        # ------------------------------------------------------------------
+        with self._lock:
+            # Revalidar que no se haya llenado o creado posición en paralelo
+            if not self.active:
+                print(f"[Engine] Ignorando {symbol} (bot desactivado) [post-tx]")
+                return
+
+            if mint in self._positions:
+                print(
+                    f"[Engine] (post-tx) Ya existe posición para mint {mint}, ignorando."
+                )
+                return
+
+            if len(self._positions) >= self.config.max_active_trades:
+                print("[Engine] (post-tx) Max active trades alcanzado, ignorando.")
+                return
+
             self._open_simulated_position(
                 mint=mint,
                 symbol=symbol,
