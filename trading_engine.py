@@ -1,14 +1,16 @@
 # trading_engine.py
 from __future__ import annotations
 
-import asyncio
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from config import BotConfig
 from models import Position, PositionStatus
 from pumpfun_executor import PumpFunExecutor
+
+if TYPE_CHECKING:
+    from jupiter_executor import JupiterExecutor
 
 
 class TradingEngine:
@@ -16,7 +18,7 @@ class TradingEngine:
     Motor principal de trading.
 
     - Recibe señales de Flintr (mints / graduations).
-    - Usa PumpFunExecutor para simular y/o ejecutar compras en Pump.fun.
+    - Usa PumpFunExecutor para simular (y luego ejecutar) compras en Pump.fun.
     - Actualiza precios en base a un monitor externo (DexScreener, luego Helius/Jupiter).
     - Aplica Stop Loss y Trailing Stop.
     - Calcula P&L y estadísticas.
@@ -26,11 +28,11 @@ class TradingEngine:
         self,
         config: BotConfig,
         executor: Optional[PumpFunExecutor] = None,
+        jupiter_executor: "Optional[JupiterExecutor]" = None,
     ) -> None:
         self.config = config
-        # Si no te pasan un executor desde fuera, lo creamos aquí
-        self.executor = executor or PumpFunExecutor(config)
-
+        self.executor = executor
+        self.jupiter_executor = jupiter_executor
         self._lock = threading.Lock()
 
         # mint -> Position
@@ -87,76 +89,23 @@ class TradingEngine:
 
             size_sol = self.config.invest_amount_sol
 
-        # ------------------------------------------------------------------
-        # Integración con PumpFunExecutor
-        #   - MODE=simulation → intentamos simulate_buy_from_event (DRY_RUN on-chain).
-        #   - MODE=real       → intentamos send_buy_from_event (TX real en Helius).
-        #   Luego, SIEMPRE abrimos una posición interna para PnL/SL/TS.
-        # ------------------------------------------------------------------
-        amount_tokens = 0.0
-        mode = self.config.mode
-
-        if self.executor is not None:
-            if mode == "simulation":
-                # DRY_RUN on-chain contra Helius si hay RPC + wallet
-                if self.config.helius_rpc_url and self.config.wallet_private_key:
-                    try:
-                        sim_result = asyncio.run(
-                            self.executor.simulate_buy_from_event(event)
-                        )
-                        print(
-                            f"[Engine] simulate_buy_from_event OK para {symbol}, "
-                            f"mint={mint}"
-                        )
-                        # Aquí podrías leer logs / error de la simulación si quieres.
-                    except Exception as exc:
-                        print(
-                            "[Engine] Error al simular buy en PumpFunExecutor:",
-                            repr(exc),
-                        )
-                else:
-                    print(
-                        "[Engine] MODE=simulation sin Helius/WALLET configurados, "
-                        "solo DRY_RUN interno."
-                    )
-
-            elif mode == "real":
-                # En modo REAL mandamos la TX a la red
+            # Intentamos usar el executor de Pump.fun (DRY_RUN o real)
+            amount_tokens = 0.0
+            if self.executor is not None:
                 try:
-                    tx_sig = asyncio.run(self.executor.send_buy_from_event(event))
-                    print(
-                        f"[Engine] TX real enviada a Pump.fun para {symbol}, "
-                        f"mint={mint}, signature={tx_sig}"
-                    )
+                    result = self.executor.buy_on_mint(event, size_sol)
+                    entry_price_from_exec = result.get("entry_price_sol")
+                    amount_from_exec = result.get("amount_tokens")
+                    if isinstance(entry_price_from_exec, (int, float)):
+                        entry_price = float(entry_price_from_exec)
+                    if isinstance(amount_from_exec, (int, float)):
+                        amount_tokens = float(amount_from_exec)
                 except Exception as exc:
-                    print(
-                        "[Engine] ERROR al enviar TX real en PumpFunExecutor:",
-                        repr(exc),
-                    )
-                    # Si quieres ser ultra conservador, podrías hacer return aquí
-                    # para NO abrir posición interna si la TX falló.
-                    # Por ahora seguimos y la tratamos como posición simulada.
+                    print("[Engine] Error en PumpFunExecutor.buy_on_mint:", repr(exc))
 
-        # ------------------------------------------------------------------
-        # Independientemente de simulation/real, abrimos posición interna
-        # para seguir PnL, SL y trailing stop.
-        # ------------------------------------------------------------------
-        with self._lock:
-            # Revalidar que no se haya llenado o creado posición en paralelo
-            if not self.active:
-                print(f"[Engine] Ignorando {symbol} (bot desactivado) [post-tx]")
-                return
-
-            if mint in self._positions:
-                print(
-                    f"[Engine] (post-tx) Ya existe posición para mint {mint}, ignorando."
-                )
-                return
-
-            if len(self._positions) >= self.config.max_active_trades:
-                print("[Engine] (post-tx) Max active trades alcanzado, ignorando.")
-                return
-
+            # SI MODE=simulation → DRY_RUN (paper trading)
+            # SI MODE=real → el executor hace compra real,
+            # y aquí seguimos guardando la posición espejo para PnL interno.
             self._open_simulated_position(
                 mint=mint,
                 symbol=symbol,
@@ -168,53 +117,63 @@ class TradingEngine:
 
     def handle_flintr_graduation(self, event: Dict[str, Any]) -> None:
         """
-        Llamado por FlintrClient cuando llega un GRADUATION de pump.fun.
-
-        - Si tenemos posición abierta para ese mint:
-            - MODE=simulation → cerramos inmediatamente (GRADUATION (SIM)).
-            - MODE=real       → por ahora solo logueamos; luego se integrará
-                                un JupiterExecutor para vender en AMM.
+        Llamado por FlintrClient cuando llega una GRADUATION de pump.fun.
+        - SIMULATION: cerramos la posición simulada al precio que tengamos.
+        - REAL + JupiterExecutor: intentamos vender vía Jupiter Ultra API y luego
+          cerramos la posición en nuestras estadísticas internas.
         """
-        data = event.get("data", {}) or {}
+        data = event.get("data") or {}
         mint = data.get("mint")
-
         if not mint:
             return
 
-        signature = event.get("signature", "")
-        meta = data.get("metaData") or {}
-        symbol = meta.get("symbol") or mint[:6]
+        token_data = data.get("tokenData") or {}
+        decimals_raw = token_data.get("decimals")
+
+        try:
+            decimals = int(decimals_raw) if decimals_raw is not None else 6
+        except (TypeError, ValueError):
+            decimals = 6
 
         with self._lock:
             pos = self._positions.get(mint)
             if not pos or pos.status != PositionStatus.OPEN:
-                print(
-                    f"[Engine] Graduation recibido para {symbol} mint={mint}, "
-                    "pero no hay posición OPEN."
-                )
+                print(f"[Engine] Graduation para {mint}, pero no hay posición OPEN. Ignorando.")
                 return
 
-            mode = self.config.mode
-            print(
-                f"[Engine] GRADUATION detectado para {symbol} mint={mint} "
-                f"(signature={signature}) — mode={mode}"
-            )
+            symbol = pos.symbol
+            amount_tokens = pos.amount_tokens
 
-            # En modo simulación: cerramos ya con el último precio conocido.
-            if mode == "simulation":
+        print(f"[Engine] 🎓 Graduation detectada para {symbol} ({mint})")
+
+        # Si estamos en modo simulación o no hay JupiterExecutor → sólo cerramos simulando
+        if self.config.mode != "real" or self.jupiter_executor is None:
+            with self._lock:
                 self._close_position_simulated(pos, reason="GRADUATION (SIM)")
-                return
+            return
 
-            # En modo REAL: todavía no tenemos integrado JupiterExecutor.
-            # Aquí simplemente marcamos el evento y dejamos el cierre
-            # para futura lógica de venta en AMM.
-            # Podrías escoger cerrar también a precio actual si quieres.
-            print(
-                "[Engine] MODE=real: pendiente integrar venta automática vía "
-                "JupiterExecutor en handle_flintr_graduation."
+        # Modo REAL + JupiterExecutor → vender token -> SOL
+        try:
+            result = self.jupiter_executor.sell_to_sol(
+                mint=mint,
+                amount_tokens=amount_tokens,
+                decimals=decimals,
             )
-            # Ej: si quisieras cerrar igual en real por ahora (simulación interna):
-            # self._close_position_simulated(pos, reason="GRADUATION (REAL, SIM PnL)")
+
+            status = result.get("status", "UNKNOWN")
+            signature = str(result.get("signature", ""))
+
+            print(
+                f"[Engine] Jupiter sell ejecutado para {symbol} ({mint}) "
+                f"status={status}, sig={signature}"
+            )
+
+            # Cierre espejo en nuestras estadísticas internas
+            with self._lock:
+                self._close_position_simulated(pos, reason="GRADUATION (REAL SELL)")
+
+        except Exception as exc:
+            print("[Engine] Error al vender en Jupiter en graduation:", repr(exc))
 
     # -------------------------------------------------------------------------
     # Apertura de posiciones (DRY_RUN)
