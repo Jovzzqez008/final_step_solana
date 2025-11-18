@@ -9,8 +9,7 @@ from config import load_config
 from flintr_client import FlintrClient
 from trading_engine import TradingEngine
 from telegram_bot import build_application
-from price_monitor_dexscreener import DexscreenerPriceMonitor
-from pumpfun_executor import PumpFunExecutor
+from price_monitor import PriceMonitor
 
 
 def main() -> None:
@@ -28,30 +27,35 @@ def main() -> None:
     if not config.flintr_api_key:
         raise RuntimeError("FLINTR_API_KEY no configurado")
 
-    # ---- Executor Pump.fun (por ahora DRY_RUN) ----
-    pumpfun_exec = PumpFunExecutor(config)
-
-    # ---- Motor de trading (DRY_RUN o futuro REAL) ----
-    engine = TradingEngine(config=config, executor=pumpfun_exec)
-
-    # ---- Monitor de precios REAL (DexScreener) ----
-    price_monitor = DexscreenerPriceMonitor(engine, interval_sec=5.0)
-    price_monitor.start()
+    # Motor de trading
+    engine = TradingEngine(config=config)
 
     # ---- Flintr en thread aparte ----
     flintr = FlintrClient(
         api_key=config.flintr_api_key,
         platform_filter="pump.fun",
         on_mint=engine.handle_flintr_mint,
-        on_graduation=None,  # luego conectamos graduations para ventas
+        on_graduation=engine.handle_flintr_graduation,
         debug=True,
     )
 
     def flintr_thread() -> None:
         flintr.run_forever()
 
-    t = threading.Thread(target=flintr_thread, daemon=True)
-    t.start()
+    t_flintr = threading.Thread(target=flintr_thread, daemon=True)
+    t_flintr.start()
+
+    # ---- PriceMonitor en otro thread ----
+    price_monitor = PriceMonitor(
+        engine=engine,
+        poll_interval_seconds=5.0,  # puedes ajustar a tu gusto
+    )
+
+    def price_thread() -> None:
+        asyncio.run(price_monitor.run_forever())
+
+    t_price = threading.Thread(target=price_thread, daemon=True)
+    t_price.start()
 
     # ---- Telegram en hilo principal ----
     async def run_telegram() -> None:
