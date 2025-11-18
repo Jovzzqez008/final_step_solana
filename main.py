@@ -10,6 +10,9 @@ from flintr_client import FlintrClient
 from trading_engine import TradingEngine
 from telegram_bot import build_application
 from price_monitor import price_monitor_loop
+from jupiter_executor import JupiterExecutor
+# Si ya tienes PumpFunExecutor para compras reales:
+# from pumpfun_executor import PumpFunExecutor
 
 
 def main() -> None:
@@ -31,18 +34,29 @@ def main() -> None:
         raise RuntimeError("FLINTR_API_KEY no configurado")
 
     # -------------------------------------------------------------------------
-    # Crear TradingEngine (modo simulation/real)
+    # Crear TradingEngine + executors
     # -------------------------------------------------------------------------
-    engine = TradingEngine(config=config)
+
+    # Si aún no tienes PumpFunExecutor, puedes dejar executor=None
+    # pump_executor = PumpFunExecutor(config=config)
+    pump_executor = None
+
+    jupiter_executor = JupiterExecutor(config=config)
+
+    engine = TradingEngine(
+        config=config,
+        executor=pump_executor,
+        jupiter_executor=jupiter_executor,
+    )
 
     # -------------------------------------------------------------------------
-    # Flintr WebSocket en un thread aparte (mints en tiempo real)
+    # Flintr WebSocket en un thread aparte (mints + graduations en tiempo real)
     # -------------------------------------------------------------------------
     flintr = FlintrClient(
         api_key=config.flintr_api_key,
         platform_filter="pump.fun",
         on_mint=engine.handle_flintr_mint,
-        on_graduation=None,  # luego conectamos handle_flintr_graduation
+        on_graduation=engine.handle_flintr_graduation,
         debug=True,
     )
 
@@ -72,6 +86,12 @@ def main() -> None:
         asyncio.run(run_telegram_and_price_monitor())
     except KeyboardInterrupt:
         logger.info("⏹️  Bot detenido por el usuario (Ctrl+C).")
+    finally:
+        # Cerrar el cliente de Jupiter al apagar
+        try:
+            jupiter_executor.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
