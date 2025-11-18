@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from config import BotConfig
 from models import Position, PositionStatus
-from pumpfun_executor import PumpFunExecutor
+from pumpfun_executor import PumpFunExecutor  # si aún no tienes este archivo, puedes dejarlo sin usar
 
 if TYPE_CHECKING:
     from jupiter_executor import JupiterExecutor
@@ -118,6 +118,7 @@ class TradingEngine:
     def handle_flintr_graduation(self, event: Dict[str, Any]) -> None:
         """
         Llamado por FlintrClient cuando llega una GRADUATION de pump.fun.
+
         - SIMULATION: cerramos la posición simulada al precio que tengamos.
         - REAL + JupiterExecutor: intentamos vender vía Jupiter Ultra API y luego
           cerramos la posición en nuestras estadísticas internas.
