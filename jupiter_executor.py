@@ -7,7 +7,7 @@ from jup_python_sdk.models.ultra_api.ultra_order_request_model import UltraOrder
 
 from config import BotConfig
 
-# WSOL mint en Solana mainnet
+# Mint de WSOL en Solana mainnet (target de salida)
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
 
@@ -34,7 +34,7 @@ class JupiterExecutor:
         # Ultra API client: no necesitas RPC explícito, lo hace la API por dentro
         self.client = UltraApiClient(**kwargs)
 
-        # Guardamos slippage por si luego lo usamos cuando UltraOrderRequest lo exponga
+        # Guardamos slippage en bps por si luego queremos usarlo
         self.slippage_bps = config.slippage_bps
 
     def sell_to_sol(self, mint: str, amount_tokens: float, decimals: int) -> Dict[str, Any]:
@@ -70,7 +70,8 @@ class JupiterExecutor:
             output_mint=WSOL_MINT,
             amount=amount,
             taker=taker,
-            # Cuando el SDK expone más campos (slippage, etc.) los podemos añadir aquí.
+            # Más adelante podemos añadir slippage, dex preferidos, etc.,
+            # conforme el modelo de UltraOrderRequest exponga más campos.
         )
 
         # Esto ya:
